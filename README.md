@@ -2,10 +2,18 @@
 
 OSWorld GUI Agent 框架。
 
-当前版本：**0.2.0**（[v0.2.0 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.2.0)）。
+当前版本：**0.1.0**（[v0.1.0 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.1.0)）。
 
-- 当前版本源码：[osworld_agent_1010](osworld_agent_1010/)
-- 前次上传源码：[osworld_agent_1009](osworld_agent_1009/)
-- 环境搭建指南：[本地环境搭建指南](osworld_agent_1010/docs/本地环境搭建指南.md)
+源码直接位于仓库根目录，不同版本通过 Git 标签保存。
 
-入口与测试沿用 `osworld_agent` 包名；运行前可将当前版本目录复制为 `osworld_agent`。
+| 版本 | 对应源码 |
+| --- | --- |
+| [v0.1.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.1.0) | 原 osworld_agent_1009 代码 |
+
+环境搭建：[本地环境搭建指南](docs/本地环境搭建指南.md)。
+
+入口和测试使用 osworld_agent 包名。克隆时可将仓库目录命名为 osworld_agent：
+
+~~~powershell
+git clone https://github.com/BAYMAXer/Agent_frame.git osworld_agent
+~~~
