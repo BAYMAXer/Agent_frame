@@ -1,0 +1,41 @@
+# =============================================================
+# skill 注册表 —— 确定性技能（本地精确计算，不是 GUI 动作）
+# =============================================================
+# 每个 skill 一个条目：
+#   description: 中文描述，会写进 system prompt 的「可用技能」小节
+#   params:      模型输出 JSON 时需提供的参数列表
+#   enabled:     是否启用（false 则从 prompt 和解析里移除）
+#
+# 注意：除了在这里声明，还必须在 skills.py 的 SKILL_HANDLERS 里给同名
+#       skill 写一个 handler 函数（签名 handler(args: dict) -> str）。
+# =============================================================
+
+skills:
+  calculate:
+    description: "精确计算数学表达式（把完整式子写出来即可，程序替你算，【不要心算】）。算术 +-*/ // % **；聚合 sum/min/max/mean/median/stdev；其他 product/factorial/sqrt/pow/round。如 \"1500+2300\"、\"mean([10,20,30])\"、\"10*0.2+20*0.3+30*0.5\""
+    params: [expression]
+    enabled: true
+
+  get_current_time:
+    description: "获取今天的日期和时间（含星期），用于日期/相对时间类任务"
+    params: []
+    enabled: true
+
+  verify_file:
+    description: "检查文件或目录是否存在（关键动作前的客观前置验证）"
+    params: [path]
+    enabled: true
+
+
+# =============================================================
+# 额外 skill（扩展区）
+# =============================================================
+# 新增确定性技能在这里注册，并在 skills.py 里补一个 handler。例如：
+#
+# extra_skills:
+#   web_search:
+#     description: "..."
+#     params: [query]
+#     enabled: true
+# =============================================================
+extra_skills: {}

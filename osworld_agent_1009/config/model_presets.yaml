@@ -1,0 +1,26 @@
+# 模型预设：前端启动界面的可选项。URL / key 集中在这里维护，前端只负责选择。
+# - decision_models：决策模型候选（agent 决策 / 对话）
+# - grounding_models：grounding 模型候选（定位）
+#   其中 type 决定 grounding 协议：ui-tars（像素坐标）/ ui-venus2（[0,1000] 归一化）
+
+decision_models:
+  - name: "Qwen3.5-9B"
+    provider: "vllm"
+    url: "http://7.246.80.237:9028/v1"
+    api_key: "EMPTY"
+  - name: "UI-Venus-2-9B"
+    provider: "vllm"
+    url: "http://7.246.80.189:8001/v1"
+    api_key: "EMPTY"
+
+grounding_models:
+  - name: "UI-TARS-1.5-7B"
+    provider: "vllm"
+    url: "http://7.246.80.237:49999/v1"
+    api_key: "EMPTY"
+    type: "ui-tars"
+  - name: "UI-Venus-2-9B"
+    provider: "vllm"
+    url: "http://7.246.80.189:8001/v1"
+    api_key: "EMPTY"
+    type: "ui-venus2"
