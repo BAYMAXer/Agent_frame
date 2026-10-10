@@ -1,0 +1,2126 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Agent S3 实时可视化</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --panel: #ffffff;
+    --panel2: #eef1f6;
+    --border: #dde3ec;
+    --text: #1c2733;
+    --dim: #6b7c8f;
+    --accent: #2f7df6;
+    --accent-decision: #2f7df6;
+    --accent-grounding: #12a64d;
+    --accent-status: #e08c00;
+    --code-bg: #1c2733;      /* 代码块保持深色，易读 */
+    --code-text: #d6dfe9;
+    --mono: "SFMono-Regular", Consolas, "Courier New", monospace;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ===== 顶部导航栏 ===== */
+  #topnav {
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 14px 20px; display: flex; align-items: center; gap: 22px;
+    flex-shrink: 0; box-shadow: 0 2px 10px rgba(30,50,80,.06); z-index: 20;
+  }
+  #topnav .brand { font-size: 17px; font-weight: 800; letter-spacing: .3px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+  #topnav .brand .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  #topnav .navbtn {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    padding: 9px 18px; border-radius: var(--radius); cursor: pointer; font-size: 14px; font-weight: 600;
+    transition: all .15s; display: flex; align-items: center; gap: 6px;
+  }
+  #topnav .navbtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  #topnav .navbtn.active { background: linear-gradient(135deg, #dceafe, #cfe1ff); border-color: var(--accent); color: var(--accent); }
+  #topnav .conn { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--dim); }
+  #topnav .conn .led { width: 8px; height: 8px; border-radius: 50%; }
+  #topnav .conn.on .led { background: #12a64d; box-shadow: 0 0 6px #12a64d; }
+  #topnav .conn.off .led { background: #e05252; box-shadow: 0 0 6px #e05252; }
+
+  /* ===== 状态栏 ===== */
+  #statusbar {
+    background: var(--panel2); border-bottom: 1px solid var(--border);
+    padding: 12px 20px; display: flex; flex-wrap: wrap; gap: 12px 30px; align-items: center; flex-shrink: 0;
+  }
+  #statusbar .item { display: flex; flex-direction: column; gap: 3px; min-width: 120px; }
+  #statusbar .label { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  #statusbar .value { font-size: 15px; font-weight: 600; }
+  #statusbar .instruction { flex: 1 1 320px; }
+  #statusbar .instruction .value { font-size: 14px; line-height: 1.45; }
+  .badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+  .badge.running { background: #d9f2e3; color: #128a41; }
+  .badge.ended { background: #fdeed0; color: #b56d00; }
+  .badge.done { background: #dceafe; color: #1c6de0; }
+  .badge.failed { background: #fbdddd; color: #c93636; }
+
+  /* ===== 视图切换 ===== */
+  #view-live, #view-history, #view-run, #view-debug, #view-chat, #view-local { display: none; flex-direction: column; flex: 1; min-height: 0; }
+  #view-live.active, #view-history.active, #view-run.active, #view-debug.active, #view-chat.active, #view-local.active { display: flex; }
+
+  /* ===== 时间线 / 历史列表 滚动容器 ===== */
+  .scroll { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 18px; }
+  .empty { color: var(--dim); text-align: center; margin-top: 60px; font-size: 15px; }
+
+  /* ===== 卡片 ===== */
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; flex-shrink: 0; box-shadow: 0 1px 3px rgba(30,50,80,.05); }
+  .card-head { display: flex; align-items: center; gap: 10px; padding: 11px 15px; border-bottom: 1px solid var(--border); background: var(--panel2); }
+  .card-head .tag { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; padding: 3px 10px; border-radius: 6px; }
+  .tag.decision { background: #dceafe; color: #1c6de0; }
+  .tag.grounding { background: #d9f2e3; color: #128a41; }
+  .tag.status { background: #fdeed0; color: #b56d00; }
+  .card-head .step { font-size: 13px; font-weight: 700; color: #b56d00; background: #fdeed0; padding: 3px 10px; border-radius: 6px; }
+  .card-head .elapsed { font-size: 13px; font-weight: 700; color: var(--accent); background: #dceafe; padding: 3px 10px; border-radius: 6px; font-family: var(--mono); }
+  .card-head .time { margin-left: auto; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .card-body { padding: 14px 15px; display: flex; gap: 18px; }
+  .shot { flex: 0 0 790px; position: relative; cursor: zoom-in; align-self: flex-start; }
+  .shot img { width: 790px; border-radius: 6px; border: 1px solid var(--border); display: block; }
+  /* grounding 坐标绿色圆圈标注 */
+  .marker { position: absolute; width: 34px; height: 34px; border: 3px solid var(--accent-grounding); border-radius: 50%; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 0 10px rgba(18,166,77,.8); }
+  .marker::after { content: ''; position: absolute; left: 50%; top: 50%; width: 6px; height: 6px; background: var(--accent-grounding); border-radius: 50%; transform: translate(-50%, -50%); }
+  .texts { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+  .sec-title { font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .prompt { font-size: 14px; line-height: 1.6; color: var(--code-text); white-space: pre-wrap; max-height: 460px; overflow-y: auto; font-family: var(--mono); background: var(--code-bg); padding: 11px; border-radius: 6px; }
+  .response { font-size: 14px; line-height: 1.6; white-space: pre-wrap; max-height: 320px; overflow-y: auto; font-family: var(--mono); background: var(--code-bg); color: var(--code-text); padding: 11px; border-radius: 6px; border-left: 3px solid var(--accent-decision); }
+  .card.grounding .response { border-left-color: var(--accent-grounding); }
+  .coord-note { font-size: 14px; font-weight: 700; color: var(--accent-grounding); }
+  .prompt.reflection { border-left: 3px solid var(--accent-status); }
+
+  /* 模型思考中动画 + 流式填充 + 截图淡入 */
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .response.loading { color: var(--dim); }
+  .shot img.fade-in { animation: fadeIn 0.45s ease; }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .cursor-blink { display: inline-block; width: 2px; height: 14px; background: var(--accent); vertical-align: -2px; animation: blink 0.7s step-end infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* 历史运行列表 */
+  .run-item { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; cursor: pointer; transition: border-color .15s, box-shadow .15s; box-shadow: 0 1px 3px rgba(30,50,80,.04); }
+  .run-item:hover { border-color: var(--accent); box-shadow: 0 2px 8px rgba(47,125,246,.12); }
+  .run-head { display: flex; align-items: center; gap: 12px; margin-bottom: 7px; }
+  .run-domain { font-size: 13px; font-weight: 700; color: var(--accent); text-transform: uppercase; }
+  .run-result { font-size: 12px; font-weight: 600; padding: 3px 11px; border-radius: 12px; }
+  .run-result.ok { background: #d9f2e3; color: #128a41; }
+  .run-result.fail { background: #fbdddd; color: #c93636; }
+  .run-result.unknown { background: #fdeed0; color: #b56d00; }
+  .run-steps { font-size: 12px; color: var(--dim); margin-left: auto; }
+  .run-del { margin-left: 10px; background: transparent; border: 1px solid var(--border); color: #c93636; padding: 2px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .run-del:hover { background: #fbdddd; border-color: #c93636; }
+  .run-instr { font-size: 14px; color: #41505f; margin-bottom: 5px; line-height: 1.45; }
+  .run-meta { font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .run-note { font-size: 12px; color: #8a6d3b; margin-top: 6px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* 历史返回按钮 */
+  #history-backbtn { align-self: flex-start; background: var(--panel); color: var(--text); border: 1px solid var(--border); padding: 8px 16px; border-radius: var(--radius); cursor: pointer; font-size: 13px; font-weight: 600; }
+  .run-note-area { width: 100%; min-height: 80px; resize: vertical; background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 12px; font: 13px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  .debug-open-btn { flex-shrink: 0; padding: 3px 10px; border: 1px solid var(--accent); border-radius: 8px; background: #dceafe; color: var(--accent); font-size: 11px; font-weight: 600; cursor: pointer; }
+  .debug-open-btn:hover { background: #cfe1ff; }
+  #history-backbtn:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* 运行视图 */
+  #run-body.scroll { padding: clamp(20px, 2.2vw, 44px); }
+  #run-form { width: 100%; min-height: 760px; background: transparent; border: none; padding: 0; display: grid; grid-template-columns: minmax(300px, .78fr) minmax(420px, 1.08fr) minmax(620px, 1.72fr); gap: clamp(18px, 1.5vw, 30px); align-items: stretch; }
+  .run-panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: clamp(20px, 1.5vw, 28px); min-height: 760px; box-shadow: 0 1px 3px rgba(30,50,80,.05); }
+  @media (max-width: 1450px) { #run-form { grid-template-columns: minmax(280px, .8fr) minmax(360px, 1fr) minmax(520px, 1.45fr); } }
+  @media (max-width: 1080px) { #run-form { grid-template-columns: repeat(2, minmax(320px, 1fr)); } .run-panel:last-child { grid-column: 1 / -1; } }
+  @media (max-width: 720px) { #run-form { grid-template-columns: 1fr; } .run-panel:last-child { grid-column: auto; } .run-panel { min-height: auto; } .experiment-text { height: 440px; min-height: 440px; } }
+  .run-sec-title { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; margin: 16px 0 10px; }
+  .run-sec-title:first-child { margin-top: 0; }
+  .experiment-text { width: 100%; min-height: 590px; height: 590px; resize: vertical; background: var(--code-bg); color: var(--code-text); border: 1px solid var(--border); border-radius: 6px; padding: 14px; font: 13px/1.6 var(--mono); }
+  .experiment-note { font-size: 12px; color: var(--dim); margin: 7px 0; }
+  .roi-canvas { display: none; width: 100%; max-height: 210px; object-fit: contain; border: 1px dashed var(--border); cursor: crosshair; background: var(--panel2); }
+  .roi-canvas.active { display: block; }
+  .run-row { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .run-row label { width: 165px; font-size: 14px; color: var(--dim); }
+  .run-row select, .run-row input { flex: 1; min-height: 38px; background: var(--panel2); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 14px; font-family: var(--mono); }
+  .run-btn { background: var(--accent); color: #fff; border: none; padding: 10px 20px; border-radius: var(--radius); cursor: pointer; font-size: 14px; font-weight: 600; margin-top: 12px; width: 100%; }
+  .run-btn:hover { opacity: .92; }
+  .run-btn.stop { background: #c93636; margin-top: 8px; }
+  .run-btn#btn-to-live { background: var(--panel2); color: var(--text); border: 1px solid var(--border); margin-top: 8px; }
+  .tab-btn { flex: 1; padding: 9px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); cursor: pointer; font-size: 13px; font-weight: 600; color: var(--dim); }
+  .tab-btn.active { background: linear-gradient(135deg, #dceafe, #cfe1ff); border-color: var(--accent); color: var(--accent); font-weight: 700; }
+  .run-note { margin-top: 12px; font-size: 12px; color: var(--dim); }
+  #run-status-card { max-width: 480px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+  .run-status-line { display: flex; gap: 12px; margin-bottom: 8px; font-size: 14px; align-items: baseline; }
+  .run-status-line .label { width: 130px; color: var(--dim); flex-shrink: 0; }
+  .run-output { background: var(--code-bg); color: var(--code-text); border-radius: var(--radius); padding: 12px; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; max-height: 400px; overflow-y: auto; white-space: pre-wrap; }
+
+  .history-step-body { align-items: flex-start; }
+  .history-shots { flex: 0 0 46%; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+  .history-shots .shot { flex: 0 0 auto; width: 100%; }
+  .history-shots .shot img { width: 100%; }
+  .history-step-text { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+  .history-grounding { border: 1px solid #c8ead5; border-radius: 7px; padding: 10px; background: #f6fcf8; }
+  .history-grounding .response { max-height: none; }
+  .history-codeagent { border: 1px solid #f0d9b5; border-radius: 7px; background: #fdf8ef; margin-top: 10px; overflow: hidden; }
+  .history-codeagent summary { cursor: pointer; padding: 10px; font-weight: 700; list-style: none; user-select: none; }
+  .history-codeagent summary::-webkit-details-marker { display: none; }
+  .history-codeagent summary::before { content: '▸ '; }
+  .history-codeagent[open] summary::before { content: '▾ '; }
+  .codeagent-toggle { margin-left: 8px; font-weight: 400; color: var(--dim); font-size: 12px; }
+  .codeagent-step { padding: 8px 10px; border-top: 1px dashed #f0d9b5; }
+  .codeagent-step-head { font-size: 12px; color: #b56d00; font-weight: 700; margin-bottom: 4px; }
+  .codeagent-step .response { max-height: none; white-space: pre-wrap; }
+  @media (max-width: 980px) { .history-step-body { flex-direction: column; } .history-shots { flex-basis: auto; width: 100%; } }
+  #overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.88); z-index: 100; align-items: center; justify-content: center; cursor: zoom-out; }
+  #overlay img { max-width: 96vw; max-height: 96vh; }
+
+  /* 模型调试：三栏精确请求重放界面 */
+  #debug-body { padding: 20px; overflow: auto; }
+  #debug-grid { display: grid; grid-template-columns: minmax(260px,.65fr) minmax(420px,1.25fr) minmax(330px,.9fr); gap: 16px; align-items: start; }
+  .debug-panel { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); padding:16px; min-width:0; }
+  .debug-panel h3 { font-size:14px; margin-bottom:12px; }
+  .debug-panel label { display:block; color:var(--dim); font-size:12px; margin:10px 0 4px; }
+  .debug-panel input,.debug-panel select,.debug-panel textarea { width:100%; padding:8px; border:1px solid var(--border); border-radius:6px; font:12px var(--mono); background:var(--panel2); color:var(--text); }
+  .debug-panel textarea { min-height:100px; resize:vertical; white-space:pre; }
+  .debug-editor { min-height:720px !important; background:var(--code-bg) !important; color:var(--code-text) !important; line-height:1.5; }
+  .debug-btn { width:100%; margin-top:12px; padding:10px; border:0; border-radius:6px; background:var(--accent); color:white; font-weight:700; cursor:pointer; }
+  .debug-btn.secondary { background:var(--panel2); color:var(--text); border:1px solid var(--border); }
+  .debug-warning { padding:10px; border-radius:6px; background:#fff4d6; color:#805300; font-size:12px; line-height:1.45; }
+  .debug-result { min-height:250px; max-height:520px; overflow:auto; background:var(--code-bg); color:var(--code-text); white-space:pre-wrap; font:13px/1.55 var(--mono); padding:12px; border-radius:6px; }
+  .debug-thumb { position:relative; margin-top:12px; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+  .debug-thumb img { display:block; width:100%; }
+  .debug-coord { position:absolute; border:3px solid #12a64d; width:30px; height:30px; border-radius:50%; transform:translate(-50%,-50%); box-shadow:0 0 8px #12a64d; }
+  .debug-meta { margin-top:10px; color:var(--dim); font:12px var(--mono); white-space:pre-wrap; }
+  @media (max-width: 1180px) { #debug-grid { grid-template-columns:1fr 1fr; } #debug-grid .debug-panel:last-child { grid-column:1/-1; } }
+
+  /* 会话调试：ChatGPT 式聊天界面（多会话） */
+  #chat-app { display: flex; height: 100%; }
+  #chat-sidebar { flex-shrink: 0; width: 220px; background: var(--panel2); border-right: 1px solid var(--border); display: flex; flex-direction: column; padding: 12px; gap: 10px; }
+  #chat-new { padding: 10px; border: 1px dashed var(--accent); border-radius: 10px; background: #dceafe; color: var(--accent); font-size: 13.5px; font-weight: 700; cursor: pointer; }
+  #chat-new:hover { background: #cfe1ff; }
+  #chat-session-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .chat-sess { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); cursor: pointer; transition: all .12s; }
+  .chat-sess:hover { border-color: var(--accent); }
+  .chat-sess.active { border-color: var(--accent); background: #dceafe; }
+  .chat-sess .name { flex: 1; font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat-sess .type-badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 8px; }
+  .type-badge.decision { background: #dceafe; color: #1c6de0; }
+  .type-badge.grounding { background: #d9f2e3; color: #128a41; }
+  .chat-sess .del { border: none; background: transparent; color: var(--dim); cursor: pointer; font-size: 14px; padding: 0 2px; }
+  .chat-sess .del:hover { color: #c93636; }
+  #chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  #chat-settings { flex-shrink: 0; display: flex; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; background: var(--panel2); }
+  #chat-settings .set-label { font-size: 12px; color: var(--dim); font-weight: 700; }
+  #chat-model-type { font-weight: 700; }
+  #chat-settings select, #chat-settings input { min-height: 34px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); font: 12.5px var(--mono); }
+  #chat-settings #chat-model { width: 160px; }
+  #chat-settings #chat-url { width: 240px; flex: 1; min-width: 160px; }
+  #chat-settings #chat-key { width: 130px; }
+  #chat-clear { margin-left: auto; padding: 7px 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text); cursor: pointer; font-size: 12.5px; }
+  #chat-clear:hover { border-color: #c93636; color: #c93636; }
+  #chat-messages { flex: 1; overflow-y: auto; padding: 26px 20px; display: flex; flex-direction: column; gap: 18px; }
+  .chat-empty { color: var(--dim); text-align: center; margin-top: 80px; font-size: 14px; line-height: 1.8; }
+  .chat-msg { display: flex; gap: 10px; max-width: 82%; align-items: flex-start; }
+  .chat-msg.user { align-self: flex-end; flex-direction: row-reverse; }
+  .chat-msg.assistant { align-self: flex-start; }
+  .chat-avatar { flex-shrink: 0; width: 30px; height: 30px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-size: 15px; }
+  .chat-msg.user .chat-avatar { background: linear-gradient(135deg,#2f7df6,#7cb0ff); }
+  .chat-msg.assistant .chat-avatar { background: linear-gradient(135deg,#12a64d,#7ed3a2); }
+  .chat-bubble { padding: 11px 15px; border-radius: 14px; font-size: 14px; line-height: 1.65; min-width: 0; overflow-wrap: break-word; }
+  .chat-msg.user .chat-bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .chat-msg.assistant .chat-bubble { background: var(--panel); border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
+  .chat-bubble .chat-text { white-space: pre-wrap; word-break: break-word; }
+  .chat-bubble img { display: block; max-width: 260px; max-height: 200px; border-radius: 10px; margin: 4px 0; border: 1px solid rgba(0,0,0,.12); cursor: zoom-in; }
+  .chat-bubble .chat-imgs { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chat-img-wrap { position: relative; display: inline-block; }
+  .chat-img-wrap .chat-img { display: block; max-width: 260px; max-height: 200px; border-radius: 10px; border: 1px solid rgba(0,0,0,.12); }
+  .chat-point { position: absolute; width: 18px; height: 18px; border: 3px solid #12a64d; border-radius: 50%; transform: translate(-50%,-50%); box-shadow: 0 0 10px rgba(18,166,77,.85); pointer-events: none; display: none; z-index: 2; }
+  .chat-point::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px; background: #12a64d; border-radius: 50%; transform: translate(-50%,-50%); }
+  .chat-point.show { display: block; }
+  .chat-point-btn { display: block; margin-top: 4px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2); color: var(--accent-grounding, #12a64d); font-size: 11px; cursor: pointer; }
+  .chat-point-btn:hover { border-color: #12a64d; background: #d9f2e3; }
+  .chat-point-btn.on { background: #d9f2e3; border-color: #12a64d; font-weight: 700; }
+  .chat-bubble .chat-meta { font-size: 11px; opacity: .6; margin-top: 6px; }
+  .chat-msg.assistant .chat-bubble code, .chat-msg.assistant .chat-bubble pre { background: var(--code-bg); color: var(--code-text); border-radius: 6px; font-family: var(--mono); }
+  .chat-msg.assistant .chat-bubble code { padding: 1px 5px; font-size: 12.5px; }
+  .chat-msg.assistant .chat-bubble pre { padding: 10px; overflow-x: auto; margin: 8px 0; white-space: pre-wrap; }
+  .chat-typing { display: inline-flex; gap: 4px; align-items: center; color: var(--dim); font-size: 13px; }
+  .chat-typing .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dim); animation: chatBlink 1.2s infinite; }
+  .chat-typing .dot:nth-child(2) { animation-delay: .2s; }
+  .chat-typing .dot:nth-child(3) { animation-delay: .4s; }
+  @keyframes chatBlink { 0%,80%,100% { opacity:.25; } 40% { opacity:1; } }
+  #chat-input-bar { flex-shrink: 0; display: flex; gap: 10px; padding: 14px 16px; border-top: 1px solid var(--border); align-items: flex-end; background: var(--panel); }
+  #chat-img-btn { flex-shrink: 0; width: 40px; height: 40px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); cursor: pointer; font-size: 18px; }
+  #chat-img-btn:hover { border-color: var(--accent); }
+  #chat-img-btn.active { border-color: var(--accent); background: #dceafe; }
+  #chat-input { flex: 1; min-height: 42px; max-height: 160px; resize: none; padding: 11px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel2); color: var(--text); font: 14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  #chat-input:focus { outline: none; border-color: var(--accent); }
+  #chat-send { flex-shrink: 0; padding: 0 20px; height: 42px; border: none; border-radius: 12px; background: var(--accent); color: #fff; font-size: 14px; font-weight: 700; cursor: pointer; }
+  #chat-send:hover { opacity: .92; }
+  #chat-send:disabled { opacity: .5; cursor: not-allowed; }
+  #chat-preview-imgs { display: flex; gap: 8px; padding: 0 16px 8px; flex-wrap: wrap; }
+  #chat-preview-imgs .pv { position: relative; }
+  #chat-preview-imgs img { height: 52px; border-radius: 8px; border: 1px solid var(--border); }
+  #chat-preview-imgs .rm { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; background: #c93636; color: #fff; border: none; cursor: pointer; font-size: 11px; line-height: 18px; }
+  /* 新建会话弹窗 */
+  #chat-new-modal { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 90; display: flex; align-items: center; justify-content: center; }
+  .chat-modal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px; min-width: 300px; box-shadow: 0 10px 40px rgba(0,0,0,.2); }
+  .chat-modal-box h3 { margin: 0 0 4px; font-size: 16px; }
+  .chat-modal-box p { margin: 0 0 16px; color: var(--dim); font-size: 13px; }
+  .chat-new-type { display: block; width: 100%; margin-bottom: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel2); color: var(--text); cursor: pointer; font-size: 14px; font-weight: 700; text-align: left; }
+  .chat-new-type small { font-weight: 400; color: var(--dim); }
+  .chat-new-type:hover { border-color: var(--accent); background: #dceafe; }
+  #chat-new-cancel { width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--dim); cursor: pointer; font-size: 13px; }
+  #chat-new-cancel:hover { color: var(--text); }
+  /* 训练轨迹 JSON 弹窗 */
+  #traj-modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 95; display: none; align-items: center; justify-content: center; }
+  .traj-modal-box { background: #1e1e2e; border: 1px solid #333; border-radius: 14px; width: 92vw; height: 90vh; display: flex; flex-direction: column; box-shadow: 0 12px 48px rgba(0,0,0,.45); overflow: hidden; }
+  .traj-modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid #333; flex-shrink: 0; }
+  .traj-modal-head h3 { margin: 0; color: #eee; font-size: 15px; font-weight: 700; }
+  .traj-modal-head .actions { display: flex; gap: 8px; }
+  .traj-modal-head button { padding: 6px 14px; border: 1px solid #444; border-radius: 8px; background: #2a2a3a; color: #ccc; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .traj-modal-head button:hover { background: #34344a; color: #fff; }
+  .traj-modal-body { flex: 1; overflow: auto; padding: 16px 20px; margin: 0; font-family: 'JetBrains Mono', Consolas, 'Courier New', monospace; font-size: 12.5px; line-height: 1.6; color: #d4d4d4; white-space: pre; }
+  .json-key { color: #569cd6; }
+  .json-string { color: #ce9178; }
+  .json-number { color: #b5cea8; }
+  .json-bool { color: #569cd6; }
+  .json-null { color: #808080; font-style: italic; }
+</style>
+</head>
+<body>
+  <!-- 顶部导航栏 -->
+  <div id="topnav">
+    <div class="brand"><span class="dot"></span>Agent S3 可视化</div>
+    <button class="navbtn active" id="nav-run">⚡ 运行配置</button>
+    <button class="navbtn" id="nav-live">▶ 实时监控</button>
+    <button class="navbtn" id="nav-history">📁 虚拟轨迹</button>
+    <button class="navbtn" id="nav-local">🖥 本机轨迹</button>
+    <button class="navbtn" id="nav-debug">🧪 模型调试</button>
+    <button class="navbtn" id="nav-chat">💬 会话调试</button>
+    <span class="conn off" id="conn"><span class="led"></span><span id="conn-text">连接中…</span></span>
+  </div>
+
+  <!-- 状态栏（实时视图专用） -->
+  <div id="statusbar">
+    <div class="item"><span class="label">任务编号</span><span class="value" id="st-taskno" style="display:flex;align-items:center;gap:8px">
+      <button id="btn-prev" style="border:1px solid var(--border);background:var(--panel2);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:13px">‹</button>
+      <span id="st-taskno-text">—</span>
+      <button id="btn-next" style="border:1px solid var(--border);background:var(--panel2);border-radius:6px;padding:2px 10px;cursor:pointer;font-size:13px">›</button>
+    </span></div>
+    <div class="item instruction"><span class="label">任务指令</span><span class="value" id="st-instruction">—</span></div>
+    <div class="item"><span class="label">任务ID</span><span class="value" id="st-example">—</span></div>
+    <div class="item"><span class="label">当前步</span><span class="value" id="st-step">—</span></div>
+    <div class="item"><span class="label">状态</span><span class="value" id="st-status"><span class="badge running">等待中</span></span></div>
+    <div class="item"><span class="label">累计 Reward</span><span class="value" id="st-reward">—</span></div>
+    <div class="item"><span class="label">最终结果</span><span class="value" id="st-result">—</span></div>
+    <div class="item" style="margin-left: auto;"><button id="btn-interrupt" class="run-btn stop" style="margin-top:0;padding:6px 14px;font-size:12px;width:auto;display:none">⏹ 中断运行</button></div>
+  </div>
+
+  <!-- 实时视图 -->
+  <div id="view-live">
+    <div id="timeline" class="scroll"><div class="empty">等待 agent 启动…</div></div>
+  </div>
+
+  <!-- 运行视图 -->
+  <div id="view-run" class="active">
+    <div id="run-body" class="scroll">
+      <div id="run-form">
+        <div class="run-panel">
+        <div class="run-sec-title">启动任务</div>
+        <div style="display:flex;gap:8px;margin:0 0 14px">
+          <button class="tab-btn active" id="tab-local">🖥 本机 Windows</button>
+          <button class="tab-btn" id="tab-vm">🖥 虚拟机 OSWorld</button>
+        </div>
+
+        <div id="panel-local">
+          <div class="run-row">
+            <label>任务描述</label>
+            <textarea id="local-task" rows="4" style="width:100%;font-family:var(--mono);font-size:13px;padding:10px;border:1px solid var(--border);border-radius:8px;resize:vertical;line-height:1.5" placeholder="例如：用浏览器打开谷歌学术 scholar.google.com，搜索论文 'Attention Is All You Need'，然后点击第一个搜索结果的 PDF 链接下载它"></textarea>
+          </div>
+          <div class="run-row">
+            <label>最大步数</label>
+            <input id="local-maxsteps" type="number" value="15" min="1" max="50">
+          </div>
+          <div class="run-row">
+            <button id="btn-local-start" class="run-btn">▶ 本机启动</button>
+          </div>
+          <div class="run-note">在本机 Windows 上运行（浏览器操作走 CDP 虚拟输入不动真实鼠标；桌面应用会真控鼠标）。模型默认用 189 的决策(9028) + grounding(8001)。启动后自动切到「实时监控」边跑边看。</div>
+        </div>
+
+        <div id="panel-vm" style="display:none">
+        <div class="run-sec-title">任务</div>
+        <div class="run-row">
+          <label>测试集</label>
+          <select id="run-testset">
+            <option value="evaluation_examples/test_small.json" selected>test_small（39 任务）</option>
+            <option value="evaluation_examples/test_one.json">test_one（3 任务）</option>
+            <option value="evaluation_examples/test_all.json">test_all（369 任务）</option>
+          </select>
+        </div>
+        <div class="run-row">
+          <label>域名</label>
+          <select id="run-domain"></select>
+        </div>
+        <div class="run-row">
+          <label>任务</label>
+          <select id="run-task"></select>
+        </div>
+        <div class="run-sec-title">配置</div>
+        <div class="run-row" style="display:none">
+          <label>决策模型 provider</label>
+          <select id="run-model-provider">
+            <option value="openai">openai（API 兼容）</option>
+            <option value="anthropic">anthropic</option>
+            <option value="vllm" selected>vllm（本地部署）</option>
+            <option value="gemini">gemini</option>
+            <option value="open_router">open_router</option>
+          </select>
+        </div>
+        <div class="run-row">
+          <label>决策模型</label>
+          <select id="run-model"></select>
+        </div>
+        <div class="run-row" style="display:none">
+          <label>决策模型 URL</label>
+          <input id="run-model-url" value="http://7.246.80.237:9028/v1">
+        </div>
+        <div class="run-row" style="display:none">
+          <label>决策模型 API Key</label>
+          <input id="run-model-apikey" type="password" value="EMPTY" placeholder="留空则用 OPENAI_API_KEY 环境变量">
+        </div>
+        <div class="run-row">
+          <label>grounding 模型</label>
+          <select id="run-ground"></select>
+        </div>
+        <div class="run-row" style="display:none">
+          <label>grounding URL</label>
+          <input id="run-ground-url" value="http://7.246.80.237:49999/v1">
+        </div>
+        <div class="run-row" style="display:none">
+          <label>grounding API Key</label>
+          <input id="run-ground-apikey" type="password" value="EMPTY">
+        </div>
+        <div class="run-row">
+          <label>最大步数</label>
+          <input id="run-maxsteps" type="number" value="20" min="1" max="50">
+        </div>
+        <div class="run-row">
+          <label>轨迹长度（max_trajectory_length）</label>
+          <input id="run-maxtraj" type="number" value="3" min="1" max="16">
+        </div>
+        <div class="run-row" style="flex-direction:row;align-items:center;gap:10px">
+          <input id="run-manual" type="checkbox" style="width:auto;flex:0 0 auto">
+          <label for="run-manual" style="margin:0;cursor:pointer">🧑 手动模式：人工操作 VM，完成后点「评估结果」</label>
+        </div>
+        <div class="run-row" style="gap:10px">
+          <button id="btn-test" class="run-btn" style="background:var(--panel2);color:var(--text);border:1px solid var(--border);flex:1">🔌 测试连接</button>
+          <button id="btn-start" class="run-btn" style="flex:2">启动</button>
+        </div>
+        <div id="test-result" class="run-note" style="display:none"></div>
+        <div class="run-note">启动后自动切到「实时监控」查看模型调用与耗时</div>
+        </div>
+        </div>
+
+        <div class="run-panel">
+          <div class="run-sec-title">Memory（实验变量）</div>
+          <div class="run-row"><label>记忆策略</label><select id="run-memory"></select></div>
+          <div id="run-memory-desc" class="experiment-note"></div>
+          <div id="run-memory-image-count" class="experiment-note"></div>
+          <div class="run-row"><label>保留步数</label><input id="run-memory-limit" type="number" value="8" min="1" max="32"></div>
+          <div class="run-sec-title">Visual input（实验变量）</div>
+          <div class="run-row"><label>视觉策略</label><select id="run-vision"></select></div>
+          <div id="run-vision-desc" class="experiment-note"></div>
+          <div class="run-row"><label>关注说明</label><input id="run-roi-note" placeholder="例如：重点观察工具栏"></div>
+          <canvas id="run-roi-canvas" class="roi-canvas" width="960" height="540" title="拖拽画出关注框"></canvas>
+          <div class="experiment-note">仅手动 ROI / 注意框启用画框。框的坐标会随实验快照保存；不会改变 UI-TARS grounding 的完整屏幕坐标。</div>
+          <div class="run-sec-title">模型后端</div>
+          <div class="run-row"><label>动作适配</label><select id="run-backend"><option value="native">原生 AgentS3</option><option value="scalecua">ScaleCUA SFT</option></select></div>
+          <div class="run-row"><label>ScaleCUA 坐标</label><select id="run-scalecua-mode"><option value="semantic">语义 + UI-TARS（推荐）</option><option value="direct">直接坐标（实验性）</option></select></div>
+        </div>
+
+        <div class="run-panel">
+          <div class="run-sec-title">System Prompt（实验变量）</div>
+          <div class="run-row"><label>已保存预设</label><select id="run-prompt-preset"><option value="">原始框架模板</option></select></div>
+          <textarea id="run-system-prompt" class="experiment-text" spellcheck="false"></textarea>
+          <div id="run-prompt-state" class="experiment-note">正在加载原始模板…</div>
+          <div id="run-prompt-tokens" class="experiment-note">System prompt token：计算中…</div>
+          <div class="run-row" style="gap:8px"><button id="btn-prompt-reset" class="run-btn" style="margin-top:0;background:var(--panel2);color:var(--text);border:1px solid var(--border)">Reset 模板</button><button id="btn-prompt-save" class="run-btn" style="margin-top:0">Save YAML</button></div>
+          <div class="run-row"><label>保存名</label><input id="run-prompt-name" placeholder="prompt-v1-short"></div>
+          <div class="run-row"><label>说明</label><input id="run-prompt-description" placeholder="本次修改目的"></div>
+        </div>
+      </div>
+
+      <div id="run-running" style="display:none">
+        <div id="run-status-card">
+          <div class="run-sec-title">运行状态</div>
+          <div class="run-status-line"><span class="label">任务</span><span id="run-cur-task">—</span></div>
+          <div class="run-status-line"><span class="label">状态</span><span id="run-cur-status">—</span></div>
+          <div class="run-status-line"><span class="label">进度</span><span id="run-cur-step">—</span></div>
+          <div class="run-status-line"><span class="label">已用时间</span><span id="run-cur-elapsed">—</span></div>
+          <div class="run-status-line"><span class="label">PID</span><span id="run-cur-pid">—</span></div>
+          <button id="btn-manual-eval" class="run-btn" style="background:var(--accent-grounding,#12a64d);display:none">✅ 评估结果</button>
+          <button id="btn-stop" class="run-btn stop">停止</button>
+          <button id="btn-to-live" class="run-btn">查看实时监控</button>
+        </div>
+        <div class="run-sec-title">agent 输出日志</div>
+        <div id="run-output" class="run-output"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模型调试视图：重放精确模型请求，不执行 Agent 动作 -->
+  <div id="view-debug">
+    <div id="debug-body" class="scroll">
+      <div id="debug-grid">
+        <section class="debug-panel">
+          <h3>1. 导入真实调用</h3>
+          <div class="debug-warning">重放只调用模型接口，<b>不会</b>启动任务、连接 VM 或执行任何 GUI 动作。</div>
+          <label>调用类型</label><select id="debug-type"><option value="">全部</option><option value="decision">决策模型</option><option value="grounding">Grounding / UI-TARS</option></select>
+          <label>已捕获调用（新运行后可用）</label><select id="debug-snapshot"><option value="">加载中…</option></select>
+          <button id="debug-load" class="debug-btn secondary">载入完整真实输入</button>
+          <label>Provider</label><select id="debug-provider"><option value="vllm">vllm</option><option value="openai">openai</option><option value="anthropic">anthropic</option><option value="gemini">gemini</option><option value="open_router">open_router</option></select>
+          <label>模型</label><input id="debug-model" list="debug-model-options">
+          <datalist id="debug-model-options">
+            <option value="Qwen3.5-9B"></option>
+            <option value="UI-TARS-1.5-7B"></option>
+          </datalist>
+          <label>模型 URL</label><input id="debug-url">
+          <label>API Key（仅本次请求，不保存）</label><input id="debug-key" type="password" placeholder="留空使用进程环境变量">
+          <label>Temperature</label><input id="debug-temperature" type="number" min="0" max="2" step="0.1" value="0.3">
+          <label>Max tokens</label><input id="debug-tokens" type="number" min="1" max="16384" value="4096">
+          <button id="debug-run" class="debug-btn">▶ 仅推理并显示输出</button>
+          <div id="debug-status" class="debug-meta"></div>
+        </section>
+        <section class="debug-panel">
+          <h3>2. 精确 API messages（可编辑）</h3>
+          <div class="debug-warning">按真实调用时的 role、文字、记忆/历史与图片内容块顺序保存。编辑后，下面 JSON 就是重放给模型的完整 messages。</div>
+          <label>完整 messages JSON</label><textarea id="debug-messages" class="debug-editor" spellcheck="false">[]</textarea>
+          <label>向最后一条 user 消息追加图片</label><input id="debug-image-upload" type="file" accept="image/png,image/jpeg,image/webp">
+          <button id="debug-format" class="debug-btn secondary">格式化 JSON</button>
+        </section>
+        <section class="debug-panel">
+          <h3>3. 模型输出与定位结果</h3>
+          <div id="debug-result" class="debug-result">选择一条真实调用后载入，或手动填写 messages。</div>
+          <button id="debug-copy" class="debug-btn secondary">复制输出</button>
+          <div id="debug-image" class="debug-thumb" style="display:none"></div>
+          <div id="debug-result-meta" class="debug-meta"></div>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <!-- 会话调试视图：ChatGPT 式自由对话，多会话 -->
+  <div id="view-chat">
+    <div id="chat-app">
+      <div id="chat-sidebar">
+        <button id="chat-new">＋ 新建会话</button>
+        <div id="chat-session-list"></div>
+      </div>
+      <div id="chat-main">
+        <div id="chat-settings">
+          <select id="chat-model-type" title="模型类型（切换会自动填充对应默认模型）">
+            <option value="decision">决策模型</option>
+            <option value="grounding">Grounding 模型</option>
+            <option value="ui-venus2">UI-Venus-2 Grounding</option>
+          </select>
+          <select id="chat-provider">
+            <option value="vllm">vllm</option>
+            <option value="openai">openai</option>
+            <option value="anthropic">anthropic</option>
+            <option value="gemini">gemini</option>
+            <option value="open_router">open_router</option>
+          </select>
+          <input id="chat-model" list="chat-model-options" placeholder="模型名">
+          <datalist id="chat-model-options">
+            <option value="Qwen3.5-9B"></option>
+            <option value="UI-TARS-1.5-7B"></option>
+          </datalist>
+          <input id="chat-url" placeholder="模型 URL">
+          <input id="chat-key" type="password" placeholder="API Key">
+          <button id="chat-clear">清空本会话</button>
+        </div>
+        <div id="chat-messages"><div class="chat-empty">点左侧「＋ 新建会话」开始<br>可以输入文字、上传图片，或直接 Ctrl+V 粘贴图片</div></div>
+        <div id="chat-preview-imgs"></div>
+        <div id="chat-input-bar">
+          <button id="chat-img-btn" title="上传图片">🖼</button>
+          <textarea id="chat-input" placeholder="输入消息，Enter 发送，Shift+Enter 换行，可直接粘贴图片"></textarea>
+          <button id="chat-send">发送</button>
+        </div>
+        <input type="file" id="chat-file-input" accept="image/*" style="display:none" multiple>
+      </div>
+    </div>
+    <div id="chat-new-modal" style="display:none">
+      <div class="chat-modal-box">
+        <h3>新建会话</h3>
+        <p>请选择初始模型类型（顶部可随时切换）</p>
+        <button class="chat-new-type" data-type="decision">决策模型<br><small>Qwen3.5-9B</small></button>
+        <button class="chat-new-type" data-type="grounding">Grounding 模型<br><small>UI-TARS-1.5-7B</small></button>
+        <button class="chat-new-type" data-type="ui-venus2">UI-Venus-2 Grounding<br><small>UI-Venus-2-9B</small></button>
+        <button id="chat-new-cancel">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 历史运行视图 -->
+  <div id="view-history">
+    <div id="history-body" class="scroll"></div>
+  </div>
+
+  <!-- 本机轨迹视图（Windows 本机任务，local_runs/） -->
+  <div id="view-local">
+    <div id="local-body" class="scroll"></div>
+  </div>
+
+  <div id="overlay"><img id="overlay-img" src=""></div>
+
+  <div id="traj-modal">
+    <div class="traj-modal-box">
+      <div class="traj-modal-head">
+        <h3>🧬 训练轨迹 JSON</h3>
+        <div class="actions">
+          <button id="traj-copy">复制</button>
+          <button id="traj-close">关闭</button>
+        </div>
+      </div>
+      <pre class="traj-modal-body" id="traj-content"></pre>
+    </div>
+  </div>
+
+<script>
+let statusState = {};
+const seenKeys = new Set();
+
+/* ===== 视图切换 ===== */
+const navLive = document.getElementById('nav-live');
+const navHistory = document.getElementById('nav-history');
+const navDebug = document.getElementById('nav-debug');
+const navChat = document.getElementById('nav-chat');
+const navLocal = document.getElementById('nav-local');
+function switchView(view) {
+  const isLive = view === 'live';
+  const isRun = view === 'run';
+  document.getElementById('view-live').classList.toggle('active', isLive);
+  document.getElementById('view-history').classList.toggle('active', view === 'history');
+  document.getElementById('view-run').classList.toggle('active', isRun);
+  document.getElementById('view-debug').classList.toggle('active', view === 'debug');
+  document.getElementById('view-chat').classList.toggle('active', view === 'chat');
+  document.getElementById('view-local').classList.toggle('active', view === 'local');
+  navLive.classList.toggle('active', isLive);
+  navHistory.classList.toggle('active', view === 'history');
+  navDebug.classList.toggle('active', view === 'debug');
+  navChat.classList.toggle('active', view === 'chat');
+  navLocal.classList.toggle('active', view === 'local');
+  document.getElementById('nav-run').classList.toggle('active', isRun);
+  document.getElementById('statusbar').style.display = isLive ? 'flex' : 'none';
+  if (view === 'history') loadRuns();
+  if (view === 'local') loadLocalRuns();
+  if (view === 'debug') initDebugView();
+  if (view === 'chat') initChatView();
+  if (isRun) initRunView();
+}
+navLive.addEventListener('click', () => switchView('live'));
+navHistory.addEventListener('click', () => switchView('history'));
+navDebug.addEventListener('click', () => switchView('debug'));
+navChat.addEventListener('click', () => switchView('chat'));
+navLocal.addEventListener('click', () => switchView('local'));
+document.getElementById('nav-run').addEventListener('click', () => switchView('run'));
+
+/* ===== 状态栏 ===== */
+function renderStatus(s) {
+  if (s.event === 'task_start') {
+    statusState.instruction = s.instruction;
+    statusState.example = s.example_id;
+    statusState.max_steps = s.max_steps;
+    statusState.step = 0; statusState.done = false; statusState.result = null;
+    setText('st-instruction', s.instruction);
+    setText('st-example', s.example_id);
+    setText('st-step', '0 / ' + s.max_steps);
+    setStatus('running', '运行中');
+    setText('st-reward', '—'); setText('st-result', '—');
+  } else if (s.event === 'step') {
+    statusState.step = s.step;
+    setText('st-step', s.step + ' / ' + (statusState.max_steps || '?'));
+    if (s.reward != null) setText('st-reward', s.reward);
+    // done=true 只代表 episode 结束（可能主动放弃/超时/成功），不等于成功；
+    // 真正成功/失败要等 task_end 的 result，故用中性态"已结束（待评分）"。
+    if (s.done) { statusState.done = true; setStatus('ended', '已结束（待评分）'); }
+  } else if (s.event === 'task_end') {
+    statusState.result = s.result;
+    statusState.done = true;
+    if (s.success === true) {
+      // 本地任务无独立评测器（score 恒 0），以 success 为准
+      setStatus('done', '成功');
+      setText('st-result', '成功');
+    } else if (s.result == null) {
+      setStatus('failed', '异常终止');
+      setText('st-result', '—');
+    } else {
+      setStatus(s.result >= 1 ? 'done' : 'failed', s.result >= 1 ? '成功' : '失败');
+      setText('st-result', s.result);
+    }
+  } else if (s.event === 'error') {
+    statusState.done = true;
+    setStatus('failed', '出错终止');
+  }
+}
+function setText(id, v) { document.getElementById(id).textContent = (v == null ? '—' : v); }
+function setStatus(cls, txt) {
+  const map = {running: 'running', ended: 'ended', done: 'done', failed: 'failed'};
+  document.getElementById('st-status').innerHTML = '<span class="badge ' + (map[cls]||'running') + '">' + txt + '</span>';
+  // 中断按钮：运行中时显示，其他状态隐藏
+  const interruptBtn = document.getElementById('btn-interrupt');
+  if (interruptBtn) interruptBtn.style.display = (cls === 'running') ? '' : 'none';
+}
+
+// 中断按钮点击
+document.getElementById('btn-interrupt').addEventListener('click', () => {
+  if (!confirm('确定要中断当前运行吗？')) return;
+  fetch('/run/stop', { method: 'POST' }).then(() => {
+    setStatus('failed', '已中断');
+  });
+});
+
+function esc(s) { if (s == null) return ''; const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML; }
+function nearBottom() { const tl = document.getElementById('timeline'); return tl.scrollHeight - tl.scrollTop - tl.clientHeight < 150; }
+function parseCoord(text) { const nums = String(text || '').match(/\d+/g); return (nums && nums.length >= 2) ? { x: parseInt(nums[0]), y: parseInt(nums[1]) } : null; }
+function formatElapsed(s) {
+  if (s == null) return '';
+  if (s < 1) return (s * 1000).toFixed(0) + ' ms';
+  return s.toFixed(2) + ' s';
+}
+
+// 把 grounding 坐标直接画进图片像素（画成绿圈+中心点），这样放大/缩放都不丢标注
+function annotateImg(img, coord) {
+  if (!img || !coord || coord.x == null || coord.y == null) return;
+  const draw = () => {
+    const w = img.naturalWidth, h = img.naturalHeight;
+    if (!w || !h) return;
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const x = coord.x, y = coord.y;  // grounding 坐标即屏幕像素，截图 naturalWidth 即屏幕分辨率
+    const r = Math.max(14, w * 0.022);
+    ctx.strokeStyle = '#12a64d';
+    ctx.lineWidth = Math.max(4, w * 0.004);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.fillStyle = '#12a64d';
+    ctx.beginPath(); ctx.arc(x, y, Math.max(3, w * 0.0035), 0, 2 * Math.PI); ctx.fill();
+    img.src = cv.toDataURL('image/png');
+  };
+  if (img.complete && img.naturalWidth) draw();
+  else img.onload = draw;
+}
+
+// 全尺寸截图缓存（只用于点开放大）；卡片显示用缩略图，避免 DOM 里堆几十张全尺寸 base64 导致前端卡死
+const fullSizeShots = new Map();  // shotId -> { b64, coord }
+let shotIdCounter = 0;
+const MAX_FULLSIZE_SHOTS = 40;
+
+function renderShotThumb(img, fullB64, coord) {
+  if (!img || !fullB64) return;
+  const id = ++shotIdCounter;
+  img.dataset.shotId = id;
+  fullSizeShots.set(id, { b64: fullB64, coord: coord || null });
+  while (fullSizeShots.size > MAX_FULLSIZE_SHOTS) {
+    const oldest = fullSizeShots.keys().next().value;
+    fullSizeShots.delete(oldest);
+  }
+  const tmp = new Image();
+  tmp.onload = () => {
+    const w = tmp.naturalWidth, h = tmp.naturalHeight;
+    if (!w || !h) return;
+    const maxW = 480;
+    const scale = Math.min(1, maxW / w);
+    const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+    const cv = document.createElement('canvas');
+    cv.width = cw; cv.height = ch;
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(tmp, 0, 0, cw, ch);
+    if (coord && coord.x != null && coord.y != null) {
+      const x = coord.x / w * cw, y = coord.y / h * ch;  // 按 naturalWidth→缩略图比例换算
+      const r = Math.max(8, cw * 0.022);
+      ctx.strokeStyle = '#12a64d';
+      ctx.lineWidth = Math.max(2, cw * 0.004);
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+      ctx.fillStyle = '#12a64d';
+      ctx.beginPath(); ctx.arc(x, y, Math.max(2, cw * 0.0035), 0, 2 * Math.PI); ctx.fill();
+    }
+    img.src = cv.toDataURL('image/jpeg', 0.72);
+  };
+  tmp.onerror = () => {};
+  tmp.src = 'data:image/png;base64,' + fullB64;
+}
+
+/* ===== 卡片构造（统一逻辑，实时/历史共用） ===== */
+const pendingCards = {};  // log_id -> {card, responseEl, shotWrap}
+
+function modelCardHtml(payload) {
+  const isGrounding = payload.type === 'grounding';
+  const isSubAgent = payload.type === 'code_agent';
+  const time = new Date(payload.ts * 1000).toLocaleTimeString();
+  const tag = isGrounding ? 'Grounding' : (isSubAgent ? '子 agent' : '决策模型');
+  const tagCls = isGrounding ? 'grounding' : (isSubAgent ? 'status' : 'decision');
+  const stepLabel = payload.step != null ? (isSubAgent && payload.substep != null ? (payload.step + '-' + payload.substep) : String(payload.step)) : null;
+  const stepHtml = stepLabel != null ? '<span class="step">Step ' + stepLabel + '</span>' : '';
+  const elapsedHtml = payload.elapsed != null ? '<span class="elapsed">⏱ ' + formatElapsed(payload.elapsed) + '</span>' : '';
+
+  // pending 占位：无截图无 response，显示 loading 动画
+  if (payload.pending) {
+    const promptHtml = payload.prompt ? '<div class="sec-title">输入 Prompt</div><div class="prompt">' + esc(payload.prompt) + '</div>' : '';
+    return '<div class="card ' + (isGrounding ? 'grounding' : 'decision') + '" data-id="' + payload.id + '" data-kind="model" data-mtype="' + payload.type + '">' +
+      '<div class="card-head"><span class="tag ' + tagCls + '">' + tag + '</span>' + stepHtml + '<span class="time">' + time + '</span></div>' +
+      '<div class="card-body"><div class="texts">' + promptHtml +
+      '<div class="sec-title">输出 Response</div><div class="response loading"><span class="spinner"></span>模型思考中…</div>' +
+      '</div></div></div>';
+  }
+
+  let shotHtml = payload.screenshot ? '<div class="shot"><img src="data:image/png;base64,' + payload.screenshot + '" title="点击放大" class="fade-in"></div>' : '';
+  const promptHtml = payload.prompt ? '<div class="sec-title">输入 Prompt</div><div class="prompt">' + esc(payload.prompt) + '</div>' : '';
+  let coordNote = '';
+  if (isGrounding) {
+    const c = parseCoord(payload.response);
+    if (c) coordNote = '<div class="coord-note">📍 定位坐标：( ' + c.x + ' , ' + c.y + ' )</div>';
+  }
+  const respHtml = '<div class="sec-title">输出 Response</div><div class="response">' + esc(payload.response) + '</div>';
+  return '<div class="card ' + (isGrounding ? 'grounding' : 'decision') + '" data-id="' + (payload.id || '') + '" data-kind="model" data-mtype="' + payload.type + '">' +
+    '<div class="card-head"><span class="tag ' + tagCls + '">' + tag + '</span>' + stepHtml + elapsedHtml +
+    '<span class="time">' + time + '</span></div>' +
+    '<div class="card-body">' + shotHtml + '<div class="texts">' + coordNote + promptHtml + respHtml + '</div></div></div>';
+}
+
+function statusCardHtml(payload) {
+  const time = new Date(payload.ts * 1000).toLocaleTimeString();
+  let detail = '';
+  if (payload.event === 'task_start') detail = '开始任务：' + esc(payload.instruction);
+  else if (payload.event === 'step') detail = 'Step ' + payload.step + ' 执行完成，reward=' + payload.reward + '，done=' + payload.done;
+  else if (payload.event === 'manual_mode') detail = '🧑 手动模式：请在 VMware 窗口中手动完成任务，完成后点「评估结果」';
+  else if (payload.event === 'error') detail = '⚠️ Step ' + payload.step + ' 出错：' + esc(payload.error || '');
+  else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
+  else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
+  else if (payload.event === 'executed') detail = '✅ 执行完成：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
+  else detail = esc(payload.event || '');
+  return '<div class="card status" data-kind="status">' +
+    '<div class="card-head"><span class="tag status">状态</span>' +
+    (payload.step != null ? '<span class="step">Step ' + payload.step + '</span>' : '') +
+    '<span class="time">' + time + '</span></div>' +
+    '<div class="card-body"><div class="texts"><div class="prompt">' + detail + '</div></div></div></div>';
+}
+
+// ===== 任务分组 + 翻页 =====
+let taskGroups = [];   // 每个: {example_id, instruction, config, sectionEl, result}
+let currentGroup = -1;
+let totalTasks = 0;
+
+function createTaskGroup(payload) {
+  const tl = document.getElementById('timeline');
+  const empty = tl.querySelector('.empty');
+  if (empty) empty.remove();
+  const section = document.createElement('div');
+  section.className = 'task-section';
+  section.style.display = 'none';
+  tl.appendChild(section);
+  const group = {
+    example_id: payload.example_id,
+    instruction: payload.instruction,
+    config: payload,
+    sectionEl: section,
+    result: null,
+  };
+  taskGroups.push(group);
+  renderConfigCard(section, payload);
+  switchToGroup(taskGroups.length - 1);
+}
+
+function renderConfigCard(section, cfg) {
+  const lines = [
+    ['模型 ID', cfg.model],
+    ['grounding 模型', cfg.ground_model],
+    ['最大步数', cfg.max_steps],
+    ['轨迹长度', cfg.max_trajectory_length],
+  ].filter(l => l[1] != null);
+  const html = lines.map(l =>
+    '<div class="run-status-line"><span class="label">' + esc(l[0]) + '</span><span style="font-weight:600">' + esc(l[1]) + '</span></div>'
+  ).join('');
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<div class="card-head"><span class="tag decision">任务配置</span></div>' +
+    '<div class="card-body"><div class="texts"><div class="prompt" style="background:transparent;padding:0;max-height:none">' + html + '</div></div></div>';
+  section.appendChild(card);
+}
+
+function switchToGroup(idx) {
+  if (idx < 0 || idx >= taskGroups.length) return;
+  currentGroup = idx;
+  taskGroups.forEach((g, i) => { g.sectionEl.style.display = (i === idx) ? '' : 'none'; });
+  document.getElementById('st-taskno-text').textContent = (idx + 1) + ' / ' + (totalTasks || taskGroups.length);
+  const g = taskGroups[idx];
+  setText('st-instruction', g.instruction);
+  setText('st-example', g.example_id);
+  document.getElementById('btn-prev').disabled = (idx === 0);
+  document.getElementById('btn-next').disabled = (idx >= taskGroups.length - 1);
+}
+
+document.getElementById('btn-prev').addEventListener('click', () => switchToGroup(currentGroup - 1));
+document.getElementById('btn-next').addEventListener('click', () => switchToGroup(currentGroup + 1));
+
+function addCard(payload) {
+  // task_start：创建新任务组
+  if (payload.kind === 'status' && payload.event === 'task_start') {
+    renderStatus(payload);
+    createTaskGroup(payload);
+    return;
+  }
+  // 其他日志加到当前（最新）任务组
+  if (taskGroups.length === 0) return;
+  const group = taskGroups[taskGroups.length - 1];
+  const tl = group.sectionEl;
+  const shouldFollow = (group === taskGroups[currentGroup]) && nearBottom();
+
+  if (payload.kind === 'model') {
+    if (payload.pending) {
+      const temp = document.createElement('div');
+      temp.innerHTML = modelCardHtml(payload);
+      const card = temp.firstElementChild;
+      tl.appendChild(card);
+      pendingCards[payload.id] = card;
+    } else if (payload.id && pendingCards[payload.id]) {
+      fillPendingCard(pendingCards[payload.id], payload);
+      delete pendingCards[payload.id];
+    } else {
+      const temp = document.createElement('div');
+      temp.innerHTML = modelCardHtml(payload);
+      const card = temp.firstElementChild;
+      addShotThumb(card, payload);
+      tl.appendChild(card);
+    }
+  } else if (payload.kind === 'status') {
+    renderStatus(payload);
+    if (payload.event === 'task_end') group.result = payload.result;
+    const temp = document.createElement('div');
+    temp.innerHTML = statusCardHtml(payload);
+    tl.appendChild(temp.firstElementChild);
+  }
+  // 实时监控默认始终跟随最新卡片；用户可通过切换历史任务页查看旧轨迹。
+  // 先等 DOM 布局完成再滚动，避免图片异步插入时 scrollHeight 尚未更新。
+  if (group === taskGroups[currentGroup]) {
+    const timeline = document.getElementById('timeline');
+    requestAnimationFrame(() => {
+      timeline.scrollTop = timeline.scrollHeight;
+      setTimeout(() => { timeline.scrollTop = timeline.scrollHeight; }, 80);
+    });
+  }
+}
+
+function addShotThumb(card, payload) {
+  if (payload.kind !== 'model' || !payload.screenshot) return;
+  const shot = card.querySelector('.shot');
+  const img = shot && shot.querySelector('img');
+  if (!img) return;
+  let coord = null;
+  if (payload.type === 'grounding' && payload.response) {
+    coord = parseCoord(payload.response);
+  }
+  renderShotThumb(img, payload.screenshot, coord);
+}
+
+function fillPendingCard(card, payload) {
+  const isGrounding = payload.type === 'grounding';
+  // 更新 head：加 elapsed
+  if (payload.elapsed != null) {
+    const head = card.querySelector('.card-head');
+    const timeSpan = head.querySelector('.time');
+    const elapsedEl = document.createElement('span');
+    elapsedEl.className = 'elapsed';
+    elapsedEl.textContent = '⏱ ' + formatElapsed(payload.elapsed);
+    head.insertBefore(elapsedEl, timeSpan);
+  }
+  // 流式填充 response（打印机效果）
+  const responseEl = card.querySelector('.response');
+  if (responseEl) {
+    responseEl.classList.remove('loading');
+    const text = payload.response || '';
+    responseEl.textContent = '';
+    // grounding 坐标注释
+    if (isGrounding) {
+      const c = parseCoord(text);
+      if (c) {
+        const coordNote = document.createElement('div');
+        coordNote.className = 'coord-note';
+        coordNote.textContent = '📍 定位坐标：( ' + c.x + ' , ' + c.y + ' )';
+        const texts = card.querySelector('.texts');
+        texts.insertBefore(coordNote, texts.firstChild);
+      }
+    }
+    let i = 0;
+    const step = 3;  // 每次填充 3 字
+    const timer = setInterval(() => {
+      i += step;
+      responseEl.textContent = text.slice(0, i);
+      if (i >= text.length) {
+        clearInterval(timer);
+        responseEl.textContent = text;
+      }
+    }, 12);
+  }
+  // 截图淡入
+  if (payload.screenshot) {
+    const body = card.querySelector('.card-body');
+    const shot = document.createElement('div');
+    shot.className = 'shot';
+    shot.innerHTML = '<img src="data:image/png;base64,' + payload.screenshot + '" title="点击放大" class="fade-in">';
+    body.insertBefore(shot, body.firstChild);
+    addShotThumb(card, payload);
+  }
+}
+
+/* ===== 运行视图 ===== */
+let runTasks = {};
+let runStatusTimer = null;
+
+function initRunView() {
+  loadTaskList();
+  loadExperimentControls();
+  pollRunStatus();
+}
+
+let memoryStrategies = [], visionStrategies = [], roiBox = null;
+function loadExperimentControls() {
+  Promise.all([
+    fetch('/experiments/memory-strategies').then(r => r.json()),
+    fetch('/experiments/vision-strategies').then(r => r.json()),
+    fetch('/experiments/prompts').then(r => r.json()),
+  ]).then(([m, v, p]) => {
+    memoryStrategies = m.strategies || []; visionStrategies = v.strategies || [];
+    const memory = document.getElementById('run-memory'), vision = document.getElementById('run-vision');
+    memory.innerHTML = memoryStrategies.map(s => '<option value="' + esc(s.id) + '">' + esc(s.label) + '</option>').join('');
+    vision.innerHTML = visionStrategies.map(s => '<option value="' + esc(s.id) + '">' + esc(s.label) + '</option>').join('');
+    const presets = document.getElementById('run-prompt-preset');
+    presets.innerHTML = '<option value="">原始框架模板</option>' + (p.presets || []).map(x => '<option value="' + esc(x.id) + '">' + esc(x.name) + '</option>').join('');
+    updateStrategyHelp(); loadDefaultPrompt();
+  }).catch(e => { document.getElementById('run-prompt-state').textContent = '实验控件加载失败：' + e; });
+}
+function updateStrategyHelp() {
+  const mem = memoryStrategies.find(x => x.id === document.getElementById('run-memory').value);
+  const vis = visionStrategies.find(x => x.id === document.getElementById('run-vision').value);
+  const limit = parseInt(document.getElementById('run-memory-limit').value) || 8;
+  const memoryImages = mem && mem.id === 'recent_turns' ? limit : (mem && mem.id === 'sliding_summary' ? Math.min(limit, 2) : 0);
+  const visionImages = vis && ['manual_roi', 'change_roi'].includes(vis.id) ? 2 : 1;
+  const perImageTokens = 2043;
+  const text = `历史图片：${memoryImages} 张；本轮视觉输入：${visionImages} 张（约 ${(visionImages * perImageTokens).toLocaleString()} image tokens / 轮）。`;
+  document.getElementById('run-memory-desc').textContent = mem ? mem.description : '';
+  document.getElementById('run-vision-desc').textContent = vis ? vis.description : '';
+  document.getElementById('run-memory-image-count').textContent = text;
+  const canvas = document.getElementById('run-roi-canvas');
+  canvas.classList.toggle('active', ['manual_roi', 'annotated_full_screen'].includes(document.getElementById('run-vision').value));
+}
+function updatePromptTokens() {
+  const el = document.getElementById('run-prompt-tokens');
+  const prompt = document.getElementById('run-system-prompt').value;
+  const model = document.getElementById('run-model').value || 'Qwen3.5-9B';
+  const url = document.getElementById('run-model-url').value || 'http://7.246.80.237:9028/v1';
+  if (!prompt) { el.textContent = 'System prompt token：0'; return; }
+  el.textContent = 'System prompt token：计算中…';
+  clearTimeout(window.promptTokenTimer);
+  window.promptTokenTimer = setTimeout(() => fetch('/experiments/token-count?model=' + encodeURIComponent(model) + '&model_url=' + encodeURIComponent(url) + '&text=' + encodeURIComponent(prompt))
+    .then(r => r.json()).then(d => { el.textContent = d.ok ? `System prompt token：${Number(d.tokens).toLocaleString()}（Qwen tokenizer）` : 'System prompt token：当前服务不可计算'; })
+    .catch(() => { el.textContent = 'System prompt token：当前服务不可计算'; }), 350);
+}
+function loadDefaultPrompt() {
+  const backend = document.getElementById('run-backend').value;
+  const isLocal = document.getElementById('tab-local').classList.contains('active');
+  fetch('/experiments/default-prompt?backend=' + encodeURIComponent(backend) + '&browser_only=' + isLocal).then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.error || '未知错误');
+    document.getElementById('run-system-prompt').value = d.prompt;
+    updatePromptTokens();
+    document.getElementById('run-prompt-preset').value = '';
+    document.getElementById('run-prompt-state').textContent = isLocal ? '本机浏览器模板（DOM 优先，已精简）' : '虚拟机 OSWorld 模板（完整，含表格/子Agent）';
+  }).catch(e => document.getElementById('run-prompt-state').textContent = '模板加载失败：' + e);
+}
+document.getElementById('run-memory').addEventListener('change', updateStrategyHelp);
+document.getElementById('run-memory-limit').addEventListener('input', updateStrategyHelp);
+document.getElementById('run-vision').addEventListener('change', updateStrategyHelp);
+document.getElementById('run-system-prompt').addEventListener('input', updatePromptTokens);
+document.getElementById('run-model').addEventListener('change', updatePromptTokens);
+document.getElementById('run-model-url').addEventListener('change', updatePromptTokens);
+document.getElementById('run-backend').addEventListener('change', loadDefaultPrompt);
+document.getElementById('run-prompt-preset').addEventListener('change', e => {
+  if (!e.target.value) return loadDefaultPrompt();
+  fetch('/experiments/prompts/' + encodeURIComponent(e.target.value)).then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.error || '读取失败');
+    document.getElementById('run-system-prompt').value = d.preset.prompt;
+    updatePromptTokens();
+    document.getElementById('run-prompt-state').textContent = '已载入预设：' + d.preset.name;
+  }).catch(err => alert('读取 prompt 失败：' + err));
+});
+document.getElementById('btn-prompt-reset').addEventListener('click', loadDefaultPrompt);
+document.getElementById('btn-prompt-save').addEventListener('click', () => {
+  const name = document.getElementById('run-prompt-name').value.trim();
+  if (!name) return alert('请填写保存名（小写字母、数字、_、-）。');
+  const payload = { name, prompt: document.getElementById('run-system-prompt').value,
+    description: document.getElementById('run-prompt-description').value,
+    backend_compatibility: [document.getElementById('run-backend').value] };
+  const send = overwrite => fetch('/experiments/prompts', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({...payload, overwrite})}).then(r => r.json());
+  send(false).then(d => { if (d.conflict && confirm('同名预设已存在，是否覆盖？')) return send(true); return d; }).then(d => {
+    if (!d.ok) throw new Error(d.error || '保存失败');
+    document.getElementById('run-prompt-state').textContent = '已保存：viz/exps/prompts/' + d.preset.id + '.yaml'; loadExperimentControls();
+  }).catch(e => alert('保存失败：' + e));
+});
+
+function loadTaskList() {
+  const testset = document.getElementById('run-testset').value;
+  const oldDomain = document.getElementById('run-domain').value;
+  fetch('/tasks?test_all_meta_path=' + encodeURIComponent(testset)).then(r => r.json()).then(d => {
+    runTasks = d.tasks || {};
+    const domainSel = document.getElementById('run-domain');
+    domainSel.innerHTML = '<option value="all">（全部域名）</option>' +
+      Object.keys(runTasks).map(d => '<option value="' + esc(d) + '">' + esc(d) + '</option>').join('');
+    // 切换测试集后，只有旧域仍在新集合中才保留，避免 task 选择器显示过期任务。
+    domainSel.value = Object.prototype.hasOwnProperty.call(runTasks, oldDomain) ? oldDomain : 'all';
+    updateTaskOptions();
+  }).catch(() => {});
+}
+
+// 被封站点的任务（网络不可达，跳过不计分）
+const BLOCKED_TASKS = ['82279c77','47543840','cabb3bae','1704f00f','a96b564e','2888b4e6','9f3f70fc','fc6d8143','0d8b7de3','da46d875'];
+
+function updateTaskOptions() {
+  const domain = document.getElementById('run-domain').value;
+  const taskSel = document.getElementById('run-task');
+  if (domain === 'all') {
+    // 全部域名：任务选择器禁用（跑所有任务）
+    taskSel.innerHTML = '<option value="">（跑所有域名全部任务）</option>';
+    taskSel.disabled = true;
+    return;
+  }
+  taskSel.disabled = false;
+  const tasks = runTasks[domain] || [];
+  taskSel.innerHTML = '<option value="">(全部 ' + tasks.length + ' 个)</option>' +
+    tasks.map(t => {
+      const prefix = t.slice(0, 8);
+      const mark = BLOCKED_TASKS.includes(prefix) ? ' 🔒被封' : '';
+      return '<option value="' + esc(t) + '">' + esc(prefix) + mark + '</option>';
+    }).join('');
+}
+
+document.getElementById('run-testset').addEventListener('change', loadTaskList);
+const roiCanvas = document.getElementById('run-roi-canvas');
+let roiStart = null;
+function drawRoi() { const c = roiCanvas.getContext('2d'); c.clearRect(0, 0, c.canvas.width, c.canvas.height); if (roiBox) { c.strokeStyle='#e63737'; c.lineWidth=5; c.fillStyle='rgba(230,55,55,.14)'; c.fillRect(roiBox.x,roiBox.y,roiBox.width,roiBox.height); c.strokeRect(roiBox.x,roiBox.y,roiBox.width,roiBox.height); } }
+function canvasPoint(e) { const r=roiCanvas.getBoundingClientRect(); return {x:(e.clientX-r.left)*roiCanvas.width/r.width,y:(e.clientY-r.top)*roiCanvas.height/r.height}; }
+roiCanvas.addEventListener('pointerdown', e => { roiStart=canvasPoint(e); roiCanvas.setPointerCapture(e.pointerId); });
+roiCanvas.addEventListener('pointermove', e => { if (!roiStart) return; const p=canvasPoint(e); roiBox={x:Math.min(roiStart.x,p.x),y:Math.min(roiStart.y,p.y),width:Math.abs(p.x-roiStart.x),height:Math.abs(p.y-roiStart.y)}; drawRoi(); });
+roiCanvas.addEventListener('pointerup', () => { roiStart=null; });
+document.getElementById('run-domain').addEventListener('change', updateTaskOptions);
+
+/* ===== 模型预设：下拉选择，URL/key 自动填充（从后端 /model-presets 读取） ===== */
+let MODEL_PRESETS = { decision_models: [], grounding_models: [] };
+let currentGroundType = 'ui-tars';
+function applyDecisionPreset() {
+  const name = document.getElementById('run-model').value;
+  const m = (MODEL_PRESETS.decision_models || []).find(x => x.name === name);
+  if (m) {
+    document.getElementById('run-model-url').value = m.url || '';
+    document.getElementById('run-model-apikey').value = m.api_key || 'EMPTY';
+    if (m.provider) document.getElementById('run-model-provider').value = m.provider;
+  }
+}
+function applyGroundPreset() {
+  const name = document.getElementById('run-ground').value;
+  const m = (MODEL_PRESETS.grounding_models || []).find(x => x.name === name);
+  if (m) {
+    document.getElementById('run-ground-url').value = m.url || '';
+    document.getElementById('run-ground-apikey').value = m.api_key || 'EMPTY';
+    currentGroundType = m.type || 'ui-tars';
+  }
+}
+function loadModelPresets() {
+  fetch('/model-presets').then(r => r.json()).then(d => {
+    MODEL_PRESETS = d || MODEL_PRESETS;
+    const dm = document.getElementById('run-model');
+    dm.innerHTML = (MODEL_PRESETS.decision_models || []).map(m => '<option value="' + esc(m.name) + '">' + esc(m.name) + '</option>').join('');
+    const gm = document.getElementById('run-ground');
+    gm.innerHTML = (MODEL_PRESETS.grounding_models || []).map(m => '<option value="' + esc(m.name) + '">' + esc(m.name) + '</option>').join('');
+    applyDecisionPreset();
+    applyGroundPreset();
+  }).catch(() => {});
+}
+document.getElementById('run-model').addEventListener('change', applyDecisionPreset);
+document.getElementById('run-ground').addEventListener('change', applyGroundPreset);
+loadModelPresets();
+
+document.getElementById('btn-test').addEventListener('click', () => {
+  const result = document.getElementById('test-result');
+  result.style.display = '';
+  result.style.color = 'var(--dim)';
+  result.textContent = '测试中…';
+  const cfg = {
+    model: document.getElementById('run-model').value,
+    model_url: document.getElementById('run-model-url').value,
+    model_api_key: document.getElementById('run-model-apikey').value,
+  };
+  fetch('/run/test-connection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      result.style.color = '#128a41';
+      result.textContent = '✅ 连接成功（带图请求正常，支持视觉）：' + (d.content || '');
+    } else {
+      result.style.color = '#c93636';
+      result.textContent = '❌ 连接失败（HTTP ' + d.status + '）：' + (d.error || '');
+    }
+  }).catch(e => {
+    result.style.color = '#c93636';
+    result.textContent = '❌ 请求失败：' + e;
+  });
+});
+
+document.getElementById('btn-start').addEventListener('click', () => {
+  const cfg = {
+    test_all_meta_path: document.getElementById('run-testset').value,
+    domain: document.getElementById('run-domain').value,
+    task_id: document.getElementById('run-task').value || null,
+    model_provider: document.getElementById('run-model-provider').value,
+    model: document.getElementById('run-model').value,
+    model_url: document.getElementById('run-model-url').value,
+    model_api_key: document.getElementById('run-model-apikey').value,
+    ground_model: document.getElementById('run-ground').value,
+    ground_url: document.getElementById('run-ground-url').value,
+    ground_api_key: document.getElementById('run-ground-apikey').value,
+    ground_type: currentGroundType,
+    max_steps: parseInt(document.getElementById('run-maxsteps').value),
+    max_trajectory_length: parseInt(document.getElementById('run-maxtraj').value),
+    manual: document.getElementById('run-manual').checked,
+    experiment: {
+      name: (document.getElementById('run-prompt-name').value || 'adhoc').trim(),
+      prompt: { preset_id: document.getElementById('run-prompt-preset').value || 'unsaved', text: document.getElementById('run-system-prompt').value },
+      memory: { strategy: document.getElementById('run-memory').value, params: { max_turns: parseInt(document.getElementById('run-memory-limit').value) || 8, max_actions: parseInt(document.getElementById('run-memory-limit').value) || 8, recent_turns: parseInt(document.getElementById('run-memory-limit').value) || 2 } },
+      vision: { strategy: document.getElementById('run-vision').value, params: { box: roiBox ? {x:roiBox.x/roiCanvas.width, y:roiBox.y/roiCanvas.height, width:roiBox.width/roiCanvas.width, height:roiBox.height/roiCanvas.height} : null, note: document.getElementById('run-roi-note').value } },
+      backend: { name: document.getElementById('run-backend').value, coordinate_mode: document.getElementById('run-scalecua-mode').value }
+    },
+  };
+  fetch('/run/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      document.getElementById('run-form').style.display = 'none';
+      document.getElementById('run-running').style.display = '';
+      // 手动模式显示「评估结果」按钮
+      document.getElementById('btn-manual-eval').style.display = cfg.manual ? '' : 'none';
+      // 记录任务总数
+      if (d.task_total) totalTasks = d.task_total;
+      // 清空之前的实时视图状态（刷新一页，只显示本次运行）
+      resetLiveView();
+      pollRunStatus();
+      // 手动模式留在运行页（能看到「评估结果」按钮），普通模式自动切到实时监控
+      if (!cfg.manual) setTimeout(() => switchView('live'), 800);
+    } else {
+      alert('启动失败: ' + (d.error || 'unknown'));
+    }
+  }).catch(e => alert('启动请求失败: ' + e));
+});
+
+document.getElementById('btn-local-start').addEventListener('click', () => {
+  const task = document.getElementById('local-task').value.trim();
+  if (!task) { alert('请输入任务描述'); return; }
+  const cfg = {
+    mode: 'local',
+    task: task,
+    max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
+  };
+  fetch('/run/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      document.getElementById('run-form').style.display = 'none';
+      document.getElementById('run-running').style.display = '';
+      document.getElementById('btn-manual-eval').style.display = 'none';
+      totalTasks = 1;
+      resetLiveView();
+      pollRunStatus();
+      setTimeout(() => switchView('live'), 800);
+    } else {
+      alert('启动失败: ' + (d.error || 'unknown'));
+    }
+  }).catch(e => alert('启动请求失败: ' + e));
+});
+
+function switchLocalTab(local) {
+  document.getElementById('panel-local').style.display = local ? '' : 'none';
+  document.getElementById('panel-vm').style.display = local ? 'none' : '';
+  document.getElementById('tab-local').classList.toggle('active', local);
+  document.getElementById('tab-vm').classList.toggle('active', !local);
+  loadDefaultPrompt();  // 切换 tab 后刷新 system prompt 模板（本机精简版 / 虚拟机完整版）
+}
+document.getElementById('tab-local').addEventListener('click', () => switchLocalTab(true));
+document.getElementById('tab-vm').addEventListener('click', () => switchLocalTab(false));
+
+function resetLiveView() {
+  taskGroups = [];
+  currentGroup = -1;
+  Object.keys(pendingCards).forEach(k => delete pendingCards[k]);
+  seenKeys.clear();
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '<div class="empty">等待 agent 启动…</div>';
+  setText('st-taskno-text', '—');
+  setText('st-instruction', '—');
+  setText('st-example', '—');
+  setText('st-step', '—');
+  setStatus('running', '等待中');
+  setText('st-reward', '—');
+  setText('st-result', '—');
+}
+
+document.getElementById('btn-stop').addEventListener('click', () => {
+  fetch('/run/stop', { method: 'POST' }).then(() => {
+    document.getElementById('run-form').style.display = '';
+    document.getElementById('run-running').style.display = 'none';
+    document.getElementById('btn-manual-eval').style.display = 'none';
+  });
+});
+
+document.getElementById('btn-manual-eval').addEventListener('click', () => {
+  fetch('/run/manual-eval', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      document.getElementById('btn-manual-eval').textContent = '⏳ 评估中…';
+      document.getElementById('btn-manual-eval').disabled = true;
+    } else {
+      alert('评估失败: ' + (d.error || 'unknown'));
+    }
+  });
+});
+
+document.getElementById('btn-to-live').addEventListener('click', () => switchView('live'));
+
+function pollRunStatus() {
+  if (runStatusTimer) clearInterval(runStatusTimer);
+  fetch('/run/status').then(r => r.json()).then(d => {
+    if (d.status === 'running' || d.status === 'starting') {
+      document.getElementById('run-form').style.display = 'none';
+      document.getElementById('run-running').style.display = '';
+      document.getElementById('run-cur-task').textContent = d.task || '—';
+      const stMap = {starting: '启动中', running: '运行中', done: '已完成', failed: '异常终止', idle: '空闲'};
+      document.getElementById('run-cur-status').textContent = stMap[d.status] || d.status;
+      document.getElementById('run-cur-step').textContent = (d.current_step || 0) + ' / ' + (d.max_steps || '?');
+      document.getElementById('run-cur-elapsed').textContent = d.elapsed + ' s';
+      document.getElementById('run-cur-pid').textContent = d.pid || '—';
+      runStatusTimer = setInterval(pollRunStatus, 2000);
+      fetch('/run/output').then(r => r.json()).then(d2 => {
+        document.getElementById('run-output').textContent = (d2.output || []).join('\n');
+      });
+    } else {
+      document.getElementById('run-form').style.display = '';
+      document.getElementById('run-running').style.display = 'none';
+      if (runStatusTimer) { clearInterval(runStatusTimer); runStatusTimer = null; }
+      // 进程已结束但从未收到 task_end（如超时异常中断）：补一个失败态，避免卡在"待评分"
+      if (!statusState.done) {
+        statusState.done = true;
+        setStatus('failed', '异常终止');
+      }
+    }
+  }).catch(() => {});
+}
+
+/* ===== 历史运行 ===== */
+function loadRuns() {
+  const body = document.getElementById('history-body');
+  body.innerHTML = '<div class="empty">加载中…</div>';
+  fetch('/runs').then(r => r.json()).then(d => renderRunList(d.runs || [])).catch(() => { body.innerHTML = '<div class="empty">加载失败</div>'; });
+}
+function renderRunList(runs) {
+  const body = document.getElementById('history-body');
+  if (!runs.length) { body.innerHTML = '<div class="empty">暂无虚拟轨迹</div>'; return; }
+  body.innerHTML = runs.map(r => {
+    const time = new Date(r.mtime * 1000).toLocaleString();
+    // 有 error 的失败任务标红，纯未完成（无 error）标黄
+    const cls = r.error ? 'fail' : (r.result == null ? 'unknown' : (r.result >= 1 ? 'ok' : 'fail'));
+    const txt = r.error ? '失败' : (r.result == null ? '未完成' : (r.result >= 1 ? '成功' : '失败'));
+    const instrHtml = r.instruction ? '<div class="run-instr">' + esc(r.instruction) + '</div>' : '';
+    const errHtml = r.error ? '<div class="run-instr" style="color:#c93636">' + esc(r.error) + '</div>' : '';
+    const idText = r.example_id ? r.example_id.slice(0, 8) : r.task_id.slice(0, 8);
+    const runText = r.run_ts ? ' · 运行于 ' + r.run_ts.replace('@', ' ') : '';
+    const exp = r.experiment || {};
+    const expText = exp.id ? (' · ' + (exp.memory?.strategy || 'recent_turns') + ' / ' + (exp.vision?.strategy || 'full_screen') + ' / ' + (exp.backend?.name || 'native')) : '';
+    // 笔记（若有）显示前一部分，右下角
+    let noteHtml = '';
+    try {
+      const note = localStorage.getItem('run_note|' + r.model + '|' + r.domain + '|' + r.task_id) || '';
+      if (note) noteHtml = '<div class="run-note" title="' + esc(note) + '">📝 ' + esc(note.slice(0, 40)) + (note.length > 40 ? '…' : '') + '</div>';
+    } catch (e) {}
+    return '<div class="run-item" data-model="' + esc(r.model) + '" data-domain="' + esc(r.domain) + '" data-task="' + esc(r.task_id) + '">' +
+      '<div class="run-head"><span class="run-domain">' + esc(r.domain) + '</span>' +
+      '<span class="run-result ' + cls + '">' + txt + '</span><span class="run-steps">' + r.steps + ' 步</span>' +
+      '<button class="run-del" data-model="' + esc(r.model) + '" data-domain="' + esc(r.domain) + '" data-task="' + esc(r.task_id) + '" title="删除这条轨迹">🗑 删除</button></div>' +
+      instrHtml + errHtml +
+      '<div class="run-meta">' + esc(r.model) + ' · ' + esc(idText) + expText + runText + ' · ' + time + '</div>' + noteHtml + '</div>';
+  }).join('');
+  body.querySelectorAll('.run-item').forEach(item => {
+    item.addEventListener('click', (e) => {
+      // 点删除按钮不触发打开详情
+      if (e.target.closest('.run-del')) return;
+      loadRunDetail(item.dataset.model, item.dataset.domain, item.dataset.task);
+    });
+  });
+  // 删除按钮事件：点击后原位展开内联确认
+  body.querySelectorAll('.run-del').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const { model, domain, task } = btn.dataset;
+      const wrap = document.createElement('span');
+      wrap.style.cssText = 'display:inline-flex;gap:6px;align-items:center;margin-left:10px';
+      wrap.innerHTML = '<span style="color:#c93636;font-size:12px;font-weight:600">确认删除？</span>' +
+        '<button class="run-del-yes" style="background:#c93636;color:#fff;border:none;border-radius:6px;padding:2px 12px;cursor:pointer;font-size:12px">删除</button>' +
+        '<button class="run-del-no" style="background:transparent;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:2px 12px;cursor:pointer;font-size:12px">取消</button>';
+      btn.replaceWith(wrap);
+      wrap.querySelector('.run-del-yes').addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        fetch('/run/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, domain, task_id: task }),
+        }).then(r => r.json()).then(d => {
+          if (d.ok) loadRuns();
+          else alert('删除失败: ' + (d.error || 'unknown'));
+        }).catch(err => alert('删除请求失败: ' + err));
+      });
+      wrap.querySelector('.run-del-no').addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        loadRuns();
+      });
+    });
+  });
+}
+/* ===== 本机轨迹（Windows 本机任务，local_runs/） ===== */
+function loadLocalRuns() {
+  const body = document.getElementById('local-body');
+  body.innerHTML = '<div class="empty">加载中…</div>';
+  fetch('/local/runs').then(r => r.json()).then(d => renderLocalList(d.runs || [])).catch(() => { body.innerHTML = '<div class="empty">加载失败</div>'; });
+}
+function renderLocalList(runs) {
+  const body = document.getElementById('local-body');
+  if (!runs.length) { body.innerHTML = '<div class="empty">暂无本机轨迹（local_runs/ 目录为空）</div>'; return; }
+  body.innerHTML = runs.map(r => {
+    const time = new Date(r.mtime * 1000).toLocaleString();
+    // 优先看 success（本地任务无独立评测器，score 恒 0）；否则按 score
+    let cls, txt;
+    if (r.success === true) { cls = 'ok'; txt = '成功'; }
+    else if (r.success === false) { cls = 'fail'; txt = '失败'; }
+    else if (r.score == null) { cls = 'unknown'; txt = '无评测'; }
+    else { cls = r.score >= 1 ? 'ok' : 'fail'; txt = r.score >= 1 ? '成功' : '失败'; }
+    const instr = r.instruction ? '<div class="run-instr">' + esc(r.instruction) + '</div>' : '';
+    let noteHtml = '';
+    try {
+      const note = localStorage.getItem('local_note|' + r.id) || '';
+      if (note) noteHtml = '<div class="run-note" title="' + esc(note) + '">📝 ' + esc(note.slice(0, 40)) + (note.length > 40 ? '…' : '') + '</div>';
+    } catch (e) {}
+    return '<div class="run-item" data-id="' + esc(r.id) + '">' +
+      '<div class="run-head"><span class="run-domain">本地</span>' +
+      '<span class="run-result ' + cls + '">' + txt + '</span>' +
+      '<span class="run-steps">' + r.steps + ' 步 / ' + r.shots + ' 截图</span></div>' +
+      instr +
+      '<div class="run-meta">' + esc(r.id) + ' · ' + time + '</div>' + noteHtml + '</div>';
+  }).join('');
+  body.querySelectorAll('.run-item').forEach(item => {
+    item.addEventListener('click', () => loadLocalDetail(item.dataset.id));
+  });
+}
+function loadLocalDetail(runId) {
+  const body = document.getElementById('local-body');
+  body.innerHTML = '<div class="empty">加载轨迹…</div>';
+  fetch('/local/traj?run=' + encodeURIComponent(runId))
+    .then(r => r.json()).then(d => renderLocalDetail(runId, d.traj || [], d.instruction || '', d.plan))
+    .catch(() => { body.innerHTML = '<div class="empty">加载失败</div>'; });
+}
+function formatAction(actionStr) {
+  // 把动作 JSON 转成简洁形式：click('65') / click('搜索按钮') / type('65', 'text')
+  if (!actionStr) return '';
+  try {
+    const a = JSON.parse(actionStr);
+    const name = a.action || '';
+    const args = a.args || {};
+    const ref = args.element_id || args.target_ref;
+    if (name === 'request_finish') return "request_finish('" + (args.answer || '') + "')";
+    if (name === 'fail') return 'fail()';
+    if (name === 'goto') return "goto('" + (args.url || '') + "')";
+    if (ref) {
+      // DOM 定位：click('65')
+      if (name === 'type') return "type('" + ref + "', '" + (args.text || '') + "')";
+      if (name === 'select') return "select('" + ref + "', '" + (args.option || '') + "')";
+      return name + "('" + ref + "')";
+    }
+    // 视觉定位：click('语义描述')
+    if (name === 'type') return "type('" + (args.text || '') + "') → " + (args.target || '');
+    return name + "('" + (args.target || args.url || '') + "')";
+  } catch (e) {
+    return actionStr;
+  }
+}
+
+function renderLocalDetail(runId, traj, instruction, plan) {
+  const body = document.getElementById('local-body');
+  const backBtn = '<div style="display:flex;gap:8px;align-items:center"><button id="local-backbtn" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:8px 16px;border-radius:var(--radius);cursor:pointer;font-size:13px;font-weight:600">← 返回列表</button><span style="font-size:13px;color:var(--dim);font-family:var(--mono)">编号 ' + esc(runId) + '</span></div>';
+  const instrCard = instruction ? '<div class="card"><div class="card-body"><div style="font-size:14px;line-height:1.6">' + esc(instruction) + '</div></div></div>' : '';
+  // 任务计划卡片（planner 阶段0 产出）
+  let planCard = '';
+  if (plan && plan.steps && plan.steps.length) {
+    const stepsHtml = plan.steps.map(s => {
+      const mark = {'pending': '⬜', 'doing': '▶️', 'done': '✅'}[s.status] || '⬜';
+      return '<div style="padding:4px 0">' + mark + ' ' + esc((s.idx != null ? s.idx + '. ' : '') + s.goal) + '</div>';
+    }).join('');
+    const kwHtml = (plan.keywords && plan.keywords.length) ? '<div style="margin-top:8px;color:var(--dim)">🔑 关键词: ' + esc(plan.keywords.join(', ')) + '</div>' : '';
+    const fcHtml = plan.final_check ? '<div style="color:var(--dim)">🎯 完成判据: ' + esc(plan.final_check) + '</div>' : '';
+    planCard = '<div class="card"><div class="card-head"><span class="tag status">📋 任务计划（planner）</span></div>' +
+      '<div class="card-body"><div class="texts" style="flex:1">' + stepsHtml + kwHtml + fcHtml + '</div></div></div>';
+  }
+  let savedNote = '';
+  try { savedNote = localStorage.getItem('local_note|' + runId) || ''; } catch (e) {}
+  const noteCard = '<div class="card"><div class="card-head"><span class="tag status">📝 运行备注</span></div>' +
+    '<div class="card-body"><div class="texts" style="flex:1"><textarea id="local-note" class="run-note-area" placeholder="记录这次运行的情况、结论、问题…">' + esc(savedNote) + '</textarea></div></div></div>';
+  body.innerHTML = backBtn + noteCard + instrCard + planCard + traj.map(t => localStepCard(runId, t)).join('');
+  document.getElementById('local-backbtn').addEventListener('click', loadLocalRuns);
+  const noteEl = document.getElementById('local-note');
+  if (noteEl) noteEl.addEventListener('input', () => { try { localStorage.setItem('local_note|' + runId, noteEl.value); } catch (e) {} });
+}
+function localStepCard(runId, t) {
+  const stepNum = t.step_num;
+  const shotFile = t.screenshot_file || ('step_' + stepNum + '.png');
+  const shotHtml = '<div class="shot"><img src="/local/shot?run=' + encodeURIComponent(runId) + '&filename=' + encodeURIComponent(shotFile) + '" loading="lazy"></div>';
+  const routing = t.routing || {};
+  const channel = routing.channel || '';
+  const channelHtml = channel ? '<span class="step" style="background:#dceafe;color:#1c6de0">' + esc(channel) + '</span>' : '';
+  const promptHtml = t.prompt ? '<div class="sec-title">模型输入（prompt：任务+记忆+AX-Tree+工具结果）</div><div class="prompt">' + esc(t.prompt) + '</div>' : '';
+  const actionHtml = t.action ? '<div class="sec-title">动作</div><div class="response">' + esc(formatAction(t.action)) + '</div>' : '';
+  const planHtml = t.plan ? '<div class="sec-title">screen_analysis</div><div class="response">' + esc(t.plan) + '</div>' : '';
+  const expectHtml = t.expected_effect ? '<div class="sec-title">expected_effect</div><div class="response">' + esc(t.expected_effect) + '</div>' : '';
+  const outcomeHtml = t.outcome ? '<div class="sec-title">执行结果</div><div class="response">' + esc(String(t.outcome)) + '</div>' : '';
+  const assess = t.assessment || {};
+  // 判定 badge：放卡片头部（图片上方）
+  const status = assess.action_status;
+  let statusHtml = '';
+  if (status) {
+    const bg = status === 'success' ? '#e6f4ea' : (status === 'failure' ? '#fce8e6' : '#fef7e0');
+    const fg = status === 'success' ? '#1e8e3e' : (status === 'failure' ? '#d93025' : '#e37400');
+    statusHtml = '<span class="step" style="background:' + bg + ';color:' + fg + '">' + esc(status) + '</span>';
+  }
+  // observed_effect（判定的详细描述）保留在右侧
+  const observeHtml = assess.observed_effect ? '<div class="sec-title">observed_effect</div><div class="response">' + esc(assess.observed_effect) + '</div>' : '';
+  // grounding 定位坐标
+  let gHtml = '';
+  if (t.grounding && t.grounding.length) {
+    gHtml = '<div class="sec-title">Grounding 定位</div><div class="response">' + t.grounding.map(g => {
+      const c = g.coord ? ('(' + g.coord[0] + ', ' + g.coord[1] + ')') : '';
+      return '📍 ' + c + ' — ' + esc(g.query) + (g.elapsed != null ? ' <span style="color:var(--dim)">(' + Math.round(g.elapsed) + ' ms)</span>' : '');
+    }).join('') + '</div>';
+  }
+  // 耗时（决策 + 总）放卡片头部，和实时监控一致用 ⏱
+  const decMs = t.decision_elapsed_ms;
+  const totMs = (t.timing_ms || {}).total;
+  let elapsedHtml = '';
+  if (decMs != null || totMs != null) {
+    const parts = [];
+    if (decMs != null) {
+      const s = decMs / 1000;
+      parts.push('⏱ ' + (s < 1 ? Math.round(decMs) + ' ms' : s.toFixed(1) + 's'));
+    }
+    if (totMs != null) parts.push('总 ' + (totMs / 1000).toFixed(1) + 's');
+    elapsedHtml = '<span class="elapsed">' + esc(parts.join(' · ')) + '</span>';
+  }
+  // 子 Agent 调用
+  let subHtml = '';
+  if (t.subagent) {
+    subHtml = '<div class="sec-title">子 Agent 调用</div><div class="response">任务: ' + esc(t.subagent.task) + '</div>' +
+      (t.subagent.result ? '<div class="prompt">' + esc(t.subagent.result) + '</div>' : '');
+  }
+  return '<div class="card"><div class="card-head"><span class="step">Step ' + stepNum + '</span>' + channelHtml + elapsedHtml + statusHtml + '</div>' +
+    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + gHtml + subHtml + outcomeHtml + observeHtml + '</div></div></div>';
+}
+
+function loadRunDetail(model, domain, task) {
+  const body = document.getElementById('history-body');
+  body.innerHTML = '<div class="empty">加载轨迹…</div>';
+  fetch('/run/traj?model=' + encodeURIComponent(model) + '&domain=' + encodeURIComponent(domain) + '&task_id=' + encodeURIComponent(task))
+    .then(r => r.json()).then(d => renderRunDetail(model, domain, task, d.traj || [], d.instruction || '', d.config || {}, d.system_prompt || ''))
+    .catch(() => { body.innerHTML = '<div class="empty">加载失败</div>'; });
+}
+function histShot(model, domain, task, filename) {
+  return '<div class="shot"><img src="/run/shot?model=' + encodeURIComponent(model) + '&domain=' + encodeURIComponent(domain) + '&task_id=' + encodeURIComponent(task) + '&filename=' + encodeURIComponent(filename) + '" title="点击放大" loading="lazy"></div>';
+}
+function histGroundingShot(model, domain, task, filename, coord) {
+  const dataCoord = coord && coord.length >= 2 ? ' data-coord="' + coord[0] + ',' + coord[1] + '"' : '';
+  return '<div class="shot"><img src="/run/shot?model=' + encodeURIComponent(model) + '&domain=' + encodeURIComponent(domain) + '&task_id=' + encodeURIComponent(task) + '&filename=' + encodeURIComponent(filename) + '" title="Grounding 输入截图，点击放大" loading="lazy"' + dataCoord + '></div>';
+}
+function renderRunDetail(model, domain, task, traj, instruction, config, systemPrompt) {
+  const body = document.getElementById('history-body');
+  const cards = ['<div style="display:flex;gap:8px"><button id="history-backbtn">← 返回列表</button>' +
+    '<button id="traj-open-btn" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:8px 16px;border-radius:var(--radius);cursor:pointer;font-size:13px;font-weight:600">🧬 训练轨迹 JSON</button></div>'];
+  // 备注区（持久化到 localStorage，key 含 model/domain/task_id）
+  const noteKey = 'run_note|' + model + '|' + domain + '|' + task;
+  const runId = task.includes('__') ? task.split('__').pop() : '';
+  let savedNote = '';
+  try { savedNote = localStorage.getItem(noteKey) || ''; } catch (e) {}
+  cards.push('<div class="card"><div class="card-head"><span class="tag status">📝 运行备注</span>' +
+    (runId ? '<span class="time">编号 ' + esc(runId) + '</span>' : '') +
+    '<span class="time">自动保存</span></div>' +
+    '<div class="card-body"><div class="texts" style="flex:1"><textarea id="run-note" class="run-note-area" placeholder="记录这次运行的情况、结论、问题…">' + esc(savedNote) + '</textarea></div></div></div>');
+  // 配置卡片
+  if (config && Object.values(config).some(v => v != null)) {
+    const cfgLines = [
+      ['模型 ID', config.model],
+      ['grounding 模型', config.ground_model],
+      ['最大步数', config.max_steps],
+      ['轨迹长度', config.max_trajectory_length],
+    ].filter(l => l[1] != null);
+    const cfgHtml = cfgLines.map(l =>
+      '<div class="run-status-line"><span class="label">' + esc(l[0]) + '</span><span style="font-weight:600">' + esc(l[1]) + '</span></div>'
+    ).join('');
+    cards.push('<div class="card"><div class="card-head"><span class="tag decision">任务配置</span></div><div class="card-body"><div class="texts"><div class="prompt" style="background:transparent;padding:0;max-height:none">' + cfgHtml + '</div></div></div></div>');
+  }
+  // system prompt 卡片（紧挨配置卡片）
+  if (systemPrompt) {
+    cards.push('<div class="card"><div class="card-head"><span class="tag status">System Prompt</span></div><div class="card-body"><div class="texts"><div class="prompt">' + esc(systemPrompt) + '</div></div></div></div>');
+  }
+  // 任务描述卡片（全宽展示，和实时监控的状态栏一致）
+  if (instruction) {
+    cards.push('<div class="card"><div class="card-head"><span class="tag decision">任务描述</span></div><div class="card-body"><div class="texts"><div class="prompt">' + esc(instruction) + '</div></div></div></div>');
+  }
+  cards.push('<div class="card"><div class="card-head"><span class="tag decision">初始截图</span><span class="time">step_0.png</span></div><div class="card-body">' + histShot(model, domain, task, 'step_0.png') + '</div></div>');
+  traj.forEach(t => {
+    const stepNum = t.step_num, shotFile = t.screenshot_file || '', action = t.action || '';
+    const reward = t.reward, done = t.done, plan = t.plan || '', reflection = t.reflection || '';
+    const grounding = t.grounding || [];
+    const groundingScreenshot = t.input_screenshot_file || (stepNum === 1 ? 'step_0.png' : shotFile || 'step_0.png');
+    let reflectionHtml = reflection ? '<div class="sec-title">Reflection 反思</div><div class="prompt reflection">' + esc(reflection) + '</div>' : '';
+    let groundingHtml = '';
+    if (grounding.length) {
+      groundingHtml = grounding.map(g => {
+        const coord = (g.coord && g.coord.length >= 2) ? '(' + g.coord[0] + ', ' + g.coord[1] + ')' : '?';
+        const gElapsed = g.elapsed != null ? '<div style="font-size:12px;font-weight:700;color:#128a41;margin-top:5px">⏱ Grounding 耗时 ' + formatElapsed(g.elapsed) + '</div>' : '';
+        return '<div class="history-grounding"><div class="sec-title">Grounding 定位</div>' +
+          '<div class="response" style="border-left-color:var(--accent-grounding)"><div>Query: ' + esc(g.query || '') + '</div><div style="color:var(--accent-grounding);font-weight:700">📍 坐标: ' + coord + '</div>' + gElapsed + '</div></div>';
+      }).join('');
+    }
+    const codeAgent = t.code_agent || [];
+    let codeAgentHtml = '';
+    if (codeAgent.length) {
+      const items = codeAgent.map((ca, i) => {
+        const caElapsed = ca.elapsed != null ? ' <span style="color:var(--dim)">⏱ ' + formatElapsed(ca.elapsed) + '</span>' : '';
+        return '<div class="codeagent-step"><div class="codeagent-step-head">第 ' + (ca.substep != null ? ca.substep : (i + 1)) + ' 步' + caElapsed + '</div>' +
+          '<div class="response">' + esc(ca.response || '') + '</div></div>';
+      }).join('');
+      codeAgentHtml = '<details class="history-codeagent"><summary>🤖 子 agent（共 ' + codeAgent.length + ' 步）<span class="codeagent-toggle">点击展开/折叠</span></summary>' + items + '</details>';
+    }
+    const planElapsedHtml = t.plan_elapsed != null ? '<span class="elapsed">⏱ 决策 ' + formatElapsed(t.plan_elapsed) + '</span>' : '';
+    const doneBadge = done ? '<span class="step" style="background:#d9f2e3;color:#128a41">done=true</span>' : '<span class="step" style="background:#fdeed0;color:#b56d00">done=false</span>';
+    const snapshotBtn = t.decision_snapshot_id
+      ? '<button class="debug-open-btn" data-snapshot="' + esc(t.decision_snapshot_id) + '" title="在模型调试中打开这次决策调用的完整输入">🧪 模型调试</button>'
+      : '';
+    cards.push('<div class="card"><div class="card-head"><span class="tag decision">决策</span>' +
+      (stepNum != null ? '<span class="step">Step ' + stepNum + '</span>' : '') +
+      planElapsedHtml +
+      doneBadge +
+      '<span class="time">reward=' + reward + '</span></div>' +
+      '<div class="card-body history-step-body"><div class="history-shots">' +
+      (shotFile ? histShot(model, domain, task, shotFile) : '') +
+      (grounding.length ? histGroundingShot(model, domain, task, groundingScreenshot, grounding[0].coord) : '') +
+      '</div><div class="texts history-step-text">' + reflectionHtml + groundingHtml + codeAgentHtml +
+      '<div style="display:flex;align-items:center;gap:8px"><span class="sec-title" style="margin:0">决策 Plan</span>' + snapshotBtn + '</div><div class="prompt">' + esc(plan) + '</div>' +
+      '<div class="sec-title">执行动作</div><div class="response">' + esc(action) + '</div>' +
+      '</div></div></div>');
+  });
+  body.innerHTML = cards.join('');
+  // 把 grounding 坐标画进历史截图里（放大也不丢标注）
+  body.querySelectorAll('.shot img[data-coord]').forEach(img => {
+    const p = img.getAttribute('data-coord').split(',');
+    annotateImg(img, { x: parseInt(p[0], 10), y: parseInt(p[1], 10) });
+  });
+  document.getElementById('history-backbtn').addEventListener('click', loadRuns);
+  const trajBtn = document.getElementById('traj-open-btn');
+  if (trajBtn) trajBtn.addEventListener('click', () => openTrajectory(model, domain, task));
+  const noteEl = document.getElementById('run-note');
+  if (noteEl) noteEl.addEventListener('input', () => { try { localStorage.setItem(noteKey, noteEl.value); } catch (e) {} });
+  body.querySelectorAll('.debug-open-btn').forEach(b => b.addEventListener('click', () => {
+    switchView('debug');
+    initDebugView();
+    loadDebugSnapshotById(b.dataset.snapshot);
+  }));
+}
+
+/* ===== 训练轨迹 JSON 展示 ===== */
+function highlightJson(text) {
+  // 先转义 HTML，再给 JSON 各 token 上色（key/字符串/数字/布尔/null）
+  const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false)\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+\-]?\d+)?)/g, (m) => {
+    let cls = 'json-number';
+    if (/^"/.test(m)) {
+      cls = /:$/.test(m) ? 'json-key' : 'json-string';
+    } else if (/true|false/.test(m)) {
+      cls = 'json-bool';
+    } else if (/null/.test(m)) {
+      cls = 'json-null';
+    }
+    return '<span class="' + cls + '">' + m + '</span>';
+  });
+}
+
+function openTrajectory(model, domain, task) {
+  const modal = document.getElementById('traj-modal');
+  const content = document.getElementById('traj-content');
+  modal.style.display = 'flex';
+  content.innerHTML = '<span style="color:#888">加载中…</span>';
+  fetch('/run/trajectory?model=' + encodeURIComponent(model) + '&domain=' + encodeURIComponent(domain) + '&task_id=' + encodeURIComponent(task))
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        const pretty = JSON.stringify(d.trajectory, null, 2);
+        content.innerHTML = highlightJson(pretty);
+      } else {
+        content.innerHTML = '<span style="color:#ce9178">' + esc(d.error || '无轨迹') + '</span>';
+      }
+    })
+    .catch(err => { content.innerHTML = '<span style="color:#ce9178">加载失败：' + esc(String(err)) + '</span>'; });
+}
+
+document.getElementById('traj-close').addEventListener('click', () => { document.getElementById('traj-modal').style.display = 'none'; });
+document.getElementById('traj-modal').addEventListener('click', (e) => { if (e.target === e.currentTarget) document.getElementById('traj-modal').style.display = 'none'; });
+document.getElementById('traj-copy').addEventListener('click', () => {
+  const t = document.getElementById('traj-content').innerText;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(t).then(() => { const b = document.getElementById('traj-copy'); b.textContent = '已复制'; setTimeout(() => b.textContent = '复制', 1200); }).catch(() => {});
+  }
+});
+
+/* ===== 截图放大 ===== */
+document.getElementById('overlay').addEventListener('click', () => { document.getElementById('overlay').style.display = 'none'; });
+document.body.addEventListener('click', (e) => {
+  const img = e.target.closest('.shot img') || e.target.closest('.chat-img');
+  if (!img) return;
+  const overlayImg = document.getElementById('overlay-img');
+  const shot = fullSizeShots.get(Number(img.dataset.shotId));
+  if (shot) {
+    // 用缓存的全尺寸重绘（含 grounding 标注），避免放大时只有缩略图
+    const tmp = new Image();
+    tmp.onload = () => {
+      const w = tmp.naturalWidth, h = tmp.naturalHeight;
+      const cv = document.createElement('canvas');
+      cv.width = w; cv.height = h;
+      const ctx = cv.getContext('2d');
+      ctx.drawImage(tmp, 0, 0);
+      const c = shot.coord;
+      if (c && c.x != null && c.y != null) {
+        const x = c.x, y = c.y;  // 全尺寸截图，坐标即像素
+        const r = Math.max(14, w * 0.022);
+        ctx.strokeStyle = '#12a64d';
+        ctx.lineWidth = Math.max(4, w * 0.004);
+        ctx.beginPath(); ctx.arc(x, y, r, 0, 2 * Math.PI); ctx.stroke();
+        ctx.fillStyle = '#12a64d';
+        ctx.beginPath(); ctx.arc(x, y, Math.max(3, w * 0.0035), 0, 2 * Math.PI); ctx.fill();
+      }
+      overlayImg.src = cv.toDataURL('image/png');
+      document.getElementById('overlay').style.display = 'flex';
+    };
+    tmp.src = 'data:image/png;base64,' + shot.b64;
+  } else {
+    overlayImg.src = img.src;
+    document.getElementById('overlay').style.display = 'flex';
+  }
+});
+
+/* ===== 模型调试 ===== */
+let debugSnapshot = null;
+let debugOutput = '';
+function initDebugView() { loadDebugSnapshots(); if (!document.getElementById('debug-model').value) applyDebugDefaults('decision'); }
+function loadDebugSnapshots() {
+  const type = document.getElementById('debug-type').value;
+  fetch('/debug/snapshots?call_type=' + encodeURIComponent(type)).then(r => r.json()).then(d => {
+    const sel = document.getElementById('debug-snapshot');
+    const rows = d.snapshots || [];
+    sel.innerHTML = '<option value="">请选择一次已捕获的真实调用</option>' + rows.map(s => {
+      const when = s.created_at ? new Date(s.created_at * 1000).toLocaleString() : '';
+      const label = `${s.call_type || 'decision'} · ${s.engine?.model || '?'} · step ${s.context?.step || '?'} · ${when}`;
+      return '<option value="' + esc(s.id) + '">' + esc(label) + '</option>';
+    }).join('');
+    if (!rows.length) document.getElementById('debug-status').textContent = '尚未捕获完整调用。请先用新版可视化运行一次任务；旧轨迹仍可查看，但不能精确重放。';
+  }).catch(e => { document.getElementById('debug-status').textContent = '读取调试调用失败：' + e; });
+}
+function debugMessages() { return JSON.parse(document.getElementById('debug-messages').value); }
+function renderDebugImage(messages, coordinate) {
+  const host = document.getElementById('debug-image');
+  let url = null;
+  for (let mi = messages.length - 1; mi >= 0 && !url; mi--) for (const c of messages[mi].content || []) {
+    if (c.type === 'image_url') {
+      if (c.image_url?.url) url = c.image_url.url;
+      else if (c.image_url?.debug_image) url = '/debug/images/' + encodeURIComponent(c.image_url.debug_image);
+    }
+  }
+  if (!url) { host.style.display = 'none'; return; }
+  host.style.display = '';
+  const marker = coordinate ? '<span class="debug-coord" style="left:' + (coordinate[0]/1920*100) + '%;top:' + (coordinate[1]/1080*100) + '%"></span>' : '';
+  host.innerHTML = '<img src="' + esc(url) + '" title="提交给模型的最后一张图片">' + marker;
+}
+const DEBUG_DEFAULTS = {
+  decision:  { provider: 'vllm', model: 'Qwen3.5-9B', url: 'http://7.246.80.237:9028/v1', key: 'EMPTY' },
+  grounding: { provider: 'vllm', model: 'UI-TARS-1.5-7B', url: 'http://7.246.80.237:49999/v1', key: 'EMPTY' },
+};
+function applyDebugDefaults(type) {
+  const d = DEBUG_DEFAULTS[type];
+  if (!d) return;
+  document.getElementById('debug-provider').value = d.provider;
+  document.getElementById('debug-model').value = d.model;
+  document.getElementById('debug-url').value = d.url;
+  document.getElementById('debug-key').value = d.key;
+}
+document.getElementById('debug-type').addEventListener('change', e => {
+  loadDebugSnapshots();
+  applyDebugDefaults(e.target.value);
+});
+function loadDebugSnapshotById(id) {
+  if (!id) return;
+  fetch('/debug/snapshots/' + encodeURIComponent(id)).then(r => { if (!r.ok) throw new Error('snapshot 不存在'); return r.json(); }).then(s => {
+    debugSnapshot = s;
+    document.getElementById('debug-provider').value = s.engine?.engine_type || 'vllm';
+    document.getElementById('debug-model').value = s.engine?.model || '';
+    document.getElementById('debug-url').value = s.engine?.base_url || '';
+    document.getElementById('debug-temperature').value = s.generation?.temperature ?? 0;
+    document.getElementById('debug-tokens').value = s.generation?.max_new_tokens || s.generation?.max_tokens || 4096;
+    document.getElementById('debug-messages').value = JSON.stringify(s.messages || [], null, 2);
+    renderDebugImage(s.messages || [], null);
+    document.getElementById('debug-status').textContent = '已载入真实完整调用：' + s.call_type + '，可直接修改后重复测试。';
+  }).catch(e => { document.getElementById('debug-status').textContent = '载入失败：' + e; });
+}
+document.getElementById('debug-load').addEventListener('click', () => {
+  loadDebugSnapshotById(document.getElementById('debug-snapshot').value);
+});
+document.getElementById('debug-format').addEventListener('click', () => { try { document.getElementById('debug-messages').value = JSON.stringify(debugMessages(), null, 2); } catch (e) { alert('JSON 无效：' + e.message); } });
+document.getElementById('debug-image-upload').addEventListener('change', e => {
+  const file = e.target.files && e.target.files[0]; if (!file) return;
+  const reader = new FileReader(); reader.onload = () => {
+    try {
+      const messages = debugMessages();
+      const target = [...messages].reverse().find(m => m.role === 'user');
+      if (!target) throw new Error('请先添加至少一条 user message');
+      target.content.push({type:'image_url', image_url:{url:reader.result}});
+      document.getElementById('debug-messages').value = JSON.stringify(messages, null, 2); renderDebugImage(messages, null);
+    } catch (err) { alert('添加图片失败：' + err.message); }
+  }; reader.readAsDataURL(file);
+});
+document.getElementById('debug-run').addEventListener('click', () => {
+  let messages; try { messages = debugMessages(); } catch (e) { return alert('messages JSON 无效：' + e.message); }
+  const payload = { call_type: debugSnapshot?.call_type || document.getElementById('debug-type').value || 'decision', messages,
+    engine: { engine_type: document.getElementById('debug-provider').value, model: document.getElementById('debug-model').value, base_url: document.getElementById('debug-url').value },
+    generation: { temperature: Number(document.getElementById('debug-temperature').value), max_new_tokens: Number(document.getElementById('debug-tokens').value) },
+    api_key: document.getElementById('debug-key').value || undefined };
+  const result = document.getElementById('debug-result'); result.textContent = '模型推理中…（不会执行任何动作）';
+  fetch('/debug/replay', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.error || '未知错误');
+    debugOutput = d.response || ''; result.textContent = debugOutput;
+    document.getElementById('debug-result-meta').textContent = `耗时 ${d.elapsed}s\n${d.call_type || 'decision'} · ${d.engine?.model || ''}` + (d.coordinate ? `\n解析坐标：(${d.coordinate[0]}, ${d.coordinate[1]})` : '');
+    renderDebugImage(messages, d.coordinate || null);
+  }).catch(e => { result.textContent = '调用失败：' + e.message; document.getElementById('debug-result-meta').textContent = ''; });
+});
+document.getElementById('debug-copy').addEventListener('click', () => navigator.clipboard.writeText(debugOutput).then(() => { document.getElementById('debug-status').textContent = '已复制模型输出'; }).catch(() => {}));
+
+/* ===== 会话调试 ===== */
+let chatSessions = [];       // [{id,name,type,provider,model,url,key,messages:[]}]
+let chatActiveId = null;
+let chatPendingImgs = [];    // 待发送图片 data URL
+let chatSending = false;
+let chatSeq = 1;
+let chatLoaded = false;
+
+const CHAT_DEFAULTS = {
+  decision:  { type: 'decision', label: '决策模型', provider: 'vllm', model: 'Qwen3.5-9B', url: 'http://7.246.80.237:9028/v1', key: 'EMPTY' },
+  grounding: { type: 'grounding', label: 'Grounding 模型', provider: 'vllm', model: 'UI-TARS-1.5-7B', url: 'http://7.246.80.237:49999/v1', key: 'EMPTY' },
+  'ui-venus2': { type: 'ui-venus2', label: 'UI-Venus-2 Grounding', provider: 'vllm', model: 'UI-Venus-2-9B', url: 'http://7.246.80.189:8001/v1', key: 'EMPTY' },
+};
+const CHAT_LS_KEY = 'agent_chat_sessions_v1';
+
+function curSession() { return chatSessions.find(s => s.id === chatActiveId) || null; }
+function loadChatSessions() {
+  try { const raw = localStorage.getItem(CHAT_LS_KEY); if (raw) chatSessions = JSON.parse(raw) || []; } catch (e) {}
+  // 兼容旧数据 / 缺配置的会话：用对应类型的默认模型补上，避免用户每次手动输入
+  for (const s of chatSessions) {
+    const d = CHAT_DEFAULTS[s.type] || CHAT_DEFAULTS.decision;
+    if (!s.provider) s.provider = d.provider;
+    if (!s.model) s.model = d.model;
+    if (!s.url) s.url = d.url;
+    if (!s.key) s.key = d.key;
+    if (!s.label) s.label = d.label;
+  }
+  if (chatSessions.length) chatActiveId = chatSessions[chatSessions.length - 1].id;
+  chatSeq = chatSessions.length + 1;
+}
+function saveChatSessions() {
+  try { localStorage.setItem(CHAT_LS_KEY, JSON.stringify(chatSessions)); }
+  catch (e) {
+    try {
+      const slim = chatSessions.map(s => ({ ...s, messages: s.messages.map(m => ({ ...m, content: (m.content || []).filter(c => c.type !== 'image_url') })) }));
+      localStorage.setItem(CHAT_LS_KEY, JSON.stringify(slim));
+    } catch (e2) {}
+  }
+}
+function newChatSession(type) {
+  const d = CHAT_DEFAULTS[type] || CHAT_DEFAULTS.decision;
+  const s = { id: 's' + Date.now() + '_' + chatSeq, name: '会话 ' + chatSeq++, type: d.type, label: d.label,
+              provider: d.provider, model: d.model, url: d.url, key: d.key, messages: [] };
+  chatSessions.push(s); chatActiveId = s.id;
+  saveChatSessions(); renderChatSidebar(); syncSettingsFromSession(); renderChat();
+}
+function deleteChatSession(id) {
+  chatSessions = chatSessions.filter(s => s.id !== id);
+  if (chatActiveId === id) chatActiveId = chatSessions.length ? chatSessions[chatSessions.length - 1].id : null;
+  saveChatSessions(); renderChatSidebar();
+  if (chatActiveId) { syncSettingsFromSession(); renderChat(); } else { renderChat(); syncSettingsFromSession(); }
+}
+function renderChatSidebar() {
+  const box = document.getElementById('chat-session-list');
+  if (!chatSessions.length) { box.innerHTML = '<div class="chat-empty" style="margin-top:24px;font-size:12px">还没有会话</div>'; return; }
+  box.innerHTML = chatSessions.map(s =>
+    '<div class="chat-sess' + (s.id === chatActiveId ? ' active' : '') + '" data-id="' + esc(s.id) + '">' +
+    '<span class="name">' + esc(s.name) + '</span>' +
+    '<span class="type-badge ' + s.type + '">' + (s.type === 'decision' ? '决策' : 'Grounding') + '</span>' +
+    '<button class="del" data-del="' + esc(s.id) + '" title="删除">✕</button></div>').join('');
+  box.querySelectorAll('.chat-sess').forEach(el => el.addEventListener('click', () => {
+    if (el.dataset.id) { chatActiveId = el.dataset.id; renderChatSidebar(); syncSettingsFromSession(); renderChat(); }
+  }));
+  box.querySelectorAll('.del').forEach(b => b.addEventListener('click', e => {
+    e.stopPropagation(); if (confirm('删除这个会话？')) deleteChatSession(b.dataset.del);
+  }));
+}
+function syncSettingsFromSession() {
+  const s = curSession();
+  const typeSel = document.getElementById('chat-model-type');
+  if (!s) { typeSel.value = 'decision'; return; }
+  typeSel.value = s.type;
+  document.getElementById('chat-provider').value = s.provider;
+  document.getElementById('chat-model').value = s.model;
+  document.getElementById('chat-url').value = s.url;
+  document.getElementById('chat-key').value = s.key;
+}
+function syncSettingsToSession() {
+  const s = curSession(); if (!s) return;
+  s.provider = document.getElementById('chat-provider').value;
+  s.model = document.getElementById('chat-model').value;
+  s.url = document.getElementById('chat-url').value;
+  s.key = document.getElementById('chat-key').value;
+  saveChatSessions();
+}
+function initChatView() {
+  if (!chatLoaded) { loadChatSessions(); chatLoaded = true; }
+  renderChatSidebar();
+  if (chatActiveId) { syncSettingsFromSession(); renderChat(); }
+  else {
+    // 无会话时也预填默认决策模型，避免每次手动输入
+    const d = CHAT_DEFAULTS.decision;
+    document.getElementById('chat-model-type').value = d.type;
+    document.getElementById('chat-provider').value = d.provider;
+    document.getElementById('chat-model').value = d.model;
+    document.getElementById('chat-url').value = d.url;
+    document.getElementById('chat-key').value = d.key;
+  }
+}
+
+function chatTextOf(m) {
+  if (typeof m.content === 'string') return m.content;
+  if (!Array.isArray(m.content)) return '';
+  let t = '';
+  for (const c of m.content) { if (typeof c === 'string') t += c; else if (c && c.type === 'text') t += c.text; }
+  return t;
+}
+function chatImgsOf(m) {
+  if (!Array.isArray(m.content)) return [];
+  return m.content.filter(c => c && c.type === 'image_url' && c.image_url && c.image_url.url).map(c => c.image_url.url);
+}
+function renderChat() {
+  const s = curSession();
+  const box = document.getElementById('chat-messages');
+  if (!s || !s.messages.length) {
+    box.innerHTML = '<div class="chat-empty">' + (s ? '开始对话，测试「' + esc(s.label) + '」的能力<br>输入文字、上传图片，或 Ctrl+V 粘贴图片' : '点左侧「＋ 新建会话」开始') + '</div>';
+    return;
+  }
+  const coordByUserIdx = {};
+  for (let i = 0; i < s.messages.length; i++) {
+    if (s.messages[i].role !== 'assistant') continue;
+    const coord = parseCoord(chatTextOf(s.messages[i]));
+    if (!coord) continue;
+    for (let j = i - 1; j >= 0; j--) {
+      if (s.messages[j].role === 'user' && chatImgsOf(s.messages[j]).length) { coordByUserIdx[j] = coord; break; }
+    }
+  }
+  box.innerHTML = s.messages.map((m, i) => chatMsgHtml(m, coordByUserIdx[i])).join('');
+  box.querySelectorAll('.chat-point-btn').forEach(b => b.addEventListener('click', () => {
+    const pt = b.parentElement.querySelector('.chat-point');
+    if (pt) { pt.classList.toggle('show'); b.classList.toggle('on'); }
+  }));
+  box.scrollTop = box.scrollHeight;
+}
+function chatMsgHtml(m, coord) {
+  const isUser = m.role === 'user';
+  const text = chatTextOf(m);
+  const imgs = chatImgsOf(m);
+  const isGrounding = curSession() && (curSession().type === 'grounding' || curSession().type === 'ui-venus2');
+  const isNorm1000 = curSession() && curSession().type === 'ui-venus2';
+  let imgHtml = '';
+  if (imgs.length) {
+    imgHtml = '<div class="chat-imgs">' + imgs.map((u, k) => {
+      if (isUser && isGrounding && coord && k === 0) {
+        const px = isNorm1000
+          ? Math.max(0, Math.min(100, coord.x / 1000 * 100))
+          : Math.max(0, Math.min(100, coord.x / 1920 * 100));
+        const py = isNorm1000
+          ? Math.max(0, Math.min(100, coord.y / 1000 * 100))
+          : Math.max(0, Math.min(100, coord.y / 1080 * 100));
+        return '<div class="chat-img-wrap"><img class="chat-img" src="' + esc(u) + '">' +
+          '<span class="chat-point" style="left:' + px + '%;top:' + py + '%"></span>' +
+          '<button class="chat-point-btn">📍 定位点 (' + coord.x + ',' + coord.y + ')</button></div>';
+      }
+      return '<img class="chat-img" src="' + esc(u) + '">';
+    }).join('') + '</div>';
+  }
+  const bubble = imgHtml + (text ? '<div class="chat-text">' + esc(text) + '</div>' : '');
+  return '<div class="chat-msg ' + (isUser ? 'user' : 'assistant') + '">' +
+    '<div class="chat-avatar">' + (isUser ? '🧑' : '🤖') + '</div>' +
+    '<div class="chat-bubble">' + bubble + '</div></div>';
+}
+function appendChatMsg(role, text, imgs) {
+  const s = curSession(); if (!s) return;
+  const content = [];
+  if (imgs && imgs.length) for (const u of imgs) content.push({ type: 'image_url', image_url: { url: u } });
+  if (text) content.push({ type: 'text', text });
+  s.messages.push({ role, content });
+  saveChatSessions(); renderChat();
+}
+function renderChatPreview() {
+  const box = document.getElementById('chat-preview-imgs');
+  box.innerHTML = chatPendingImgs.map((u, i) =>
+    '<div class="pv"><img src="' + esc(u) + '"><button class="rm" data-i="' + i + '">×</button></div>').join('');
+  box.querySelectorAll('.rm').forEach(b => b.addEventListener('click', () => {
+    chatPendingImgs.splice(parseInt(b.dataset.i, 10), 1); renderChatPreview();
+  }));
+  document.getElementById('chat-img-btn').classList.toggle('active', chatPendingImgs.length > 0);
+}
+function addPendingImage(dataUrl) { chatPendingImgs.push(dataUrl); renderChatPreview(); }
+function sendChat() {
+  const s = curSession();
+  if (chatSending || !s) return;
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text && !chatPendingImgs.length) return;
+  const imgs = [...chatPendingImgs]; chatPendingImgs = []; renderChatPreview();
+  input.value = '';
+  appendChatMsg('user', text, imgs);
+  const box = document.getElementById('chat-messages');
+  box.insertAdjacentHTML('beforeend',
+    '<div class="chat-msg assistant" id="chat-typing"><div class="chat-avatar">🤖</div>' +
+    '<div class="chat-bubble"><span class="chat-typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span> 思考中…</span></div></div>');
+  box.scrollTop = box.scrollHeight;
+  chatSending = true; document.getElementById('chat-send').disabled = true;
+  const payload = {
+    engine: { engine_type: s.provider, model: s.model, base_url: s.url },
+    messages: s.messages,
+    generation: { temperature: 0.0, max_new_tokens: 4096 },
+    api_key: s.key || undefined,
+  };
+  fetch('/debug/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    .then(r => r.json()).then(d => {
+      const t = document.getElementById('chat-typing'); if (t) t.remove();
+      const imgs = (d.ok && d.annotation_image) ? [d.annotation_image] : null;
+      appendChatMsg('assistant', d.ok ? (d.response || '') : ('⚠️ 调用失败：' + (d.error || '未知错误')), imgs);
+      chatSending = false; document.getElementById('chat-send').disabled = false;
+      document.getElementById('chat-input').focus();
+    }).catch(e => {
+      const t = document.getElementById('chat-typing'); if (t) t.remove();
+      appendChatMsg('assistant', '⚠️ 请求失败：' + e, null);
+      chatSending = false; document.getElementById('chat-send').disabled = false;
+    });
+}
+// 新建会话弹窗
+document.getElementById('chat-new').addEventListener('click', () => {
+  document.getElementById('chat-new-modal').style.display = 'flex';
+});
+document.querySelectorAll('.chat-new-type').forEach(b => b.addEventListener('click', () => {
+  document.getElementById('chat-new-modal').style.display = 'none';
+  newChatSession(b.dataset.type);
+}));
+document.getElementById('chat-new-cancel').addEventListener('click', () => {
+  document.getElementById('chat-new-modal').style.display = 'none';
+});
+// 顶部模型类型切换：自动填充对应默认模型
+document.getElementById('chat-model-type').addEventListener('change', e => {
+  const type = e.target.value;
+  const d = CHAT_DEFAULTS[type] || CHAT_DEFAULTS.decision;
+  const s = curSession();
+  if (s) {
+    s.type = d.type; s.label = d.label;
+    s.provider = d.provider; s.model = d.model; s.url = d.url; s.key = d.key;
+    saveChatSessions(); renderChatSidebar();
+  }
+  document.getElementById('chat-provider').value = d.provider;
+  document.getElementById('chat-model').value = d.model;
+  document.getElementById('chat-url').value = d.url;
+  document.getElementById('chat-key').value = d.key;
+});
+// 图片上传 / 粘贴
+document.getElementById('chat-img-btn').addEventListener('click', () => document.getElementById('chat-file-input').click());
+document.getElementById('chat-file-input').addEventListener('change', e => {
+  for (const f of e.target.files) {
+    const reader = new FileReader();
+    reader.onload = () => addPendingImage(reader.result);
+    reader.readAsDataURL(f);
+  }
+  e.target.value = '';
+});
+document.getElementById('chat-input').addEventListener('paste', e => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const it of items) {
+    if (it.type && it.type.startsWith('image/')) {
+      const f = it.getAsFile(); if (!f) continue;
+      const reader = new FileReader();
+      reader.onload = () => addPendingImage(reader.result);
+      reader.readAsDataURL(f);
+    }
+  }
+});
+document.getElementById('chat-send').addEventListener('click', sendChat);
+document.getElementById('chat-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+document.getElementById('chat-clear').addEventListener('click', () => {
+  const s = curSession(); if (!s) return;
+  if (!confirm('清空本会话的全部消息？')) return;
+  s.messages = []; chatPendingImgs = [];
+  saveChatSessions(); renderChat(); renderChatPreview();
+});
+['chat-provider', 'chat-model', 'chat-url', 'chat-key'].forEach(id =>
+  document.getElementById(id).addEventListener('change', syncSettingsToSession));
+
+/* ===== 实时数据 ===== */
+function loadHistory() { fetch('/history').then(r => r.json()).then(d => { (d.logs || []).forEach(addCard); }).catch(() => {}); }
+function poll() {
+  fetch('/history').then(r => r.json()).then(d => {
+    (d.logs || []).forEach(l => {
+      const key = l.ts + '|' + l.kind + '|' + (l.type || l.event || '');
+      if (!seenKeys.has(key)) { seenKeys.add(key); addCard(l); }
+    });
+  }).catch(() => {});
+}
+function connect() {
+  const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => { document.getElementById('conn').className = 'conn on'; document.getElementById('conn-text').textContent = '已连接'; };
+  ws.onmessage = (e) => { try { const l = JSON.parse(e.data); const key = l.ts + '|' + l.kind + '|' + (l.type || l.event || ''); if (!seenKeys.has(key)) { seenKeys.add(key); addCard(l); } } catch (err) {} };
+  ws.onclose = () => { document.getElementById('conn').className = 'conn off'; document.getElementById('conn-text').textContent = '断开，重连中…'; setTimeout(connect, 2000); };
+  ws.onerror = () => ws.close();
+}
+loadHistory();
+connect();
+setInterval(poll, 2000);
+// 初始加载时切换到运行配置视图（正确隐藏状态栏 + 加载任务列表）
+switchView('run');
+</script>
+</body>
+</html>

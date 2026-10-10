@@ -1,0 +1,400 @@
+"""Windows 本地手动任务运行器：自由文本任务 → Agent + WindowsEnvironment。
+
+跑一个本地 GUI 任务（重点：浏览器任务），逐步回放 + 落盘轨迹/截图。
+
+用法：
+    python run_windows_local.py --task "用谷歌学术(scholar.google.com)搜索 'attention is all you need'，告诉我第一个搜索结果"
+
+说明：
+- 会自动启动一个带 remote-debugging 的无痕 Chrome（端口 9222），仅复用已确认的无痕实例；
+- 模型默认走 189 的决策(9028) + grounding(8001)，可用 --model-url / --ground-url 覆盖；
+- 屏幕分辨率自动检测（grounding 按它换算坐标），也可用 --width/--height 覆盖；
+- 运行时会【真】控制你的鼠标键盘，跑的时候别动鼠标。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_parent = os.path.dirname(_here)
+if _parent not in sys.path:
+    sys.path.insert(0, _parent)
+
+from osworld_agent.config import ModelConfig          # noqa: E402
+from osworld_agent.model import ChatModel             # noqa: E402
+from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
+from osworld_agent.adapters.windows_env import WindowsEnvironment        # noqa: E402
+from osworld_agent.agent import Agent                 # noqa: E402
+from osworld_agent.viz.logging import (LoggingChatModel, LoggingGrounding,  # noqa: E402
+                                       set_results_dir, log_status, reset_collected)
+
+CHROME_DEFAULT = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+_PROFILE_PREFIX = "osworld_agent_chrome_incognito_"
+
+
+def _validated_profile(port: int, user_data_dir: str):
+    """只接受临时根目录下、本端口的专用 profile，拒绝链接或越界路径。"""
+    if not user_data_dir:
+        return None
+    try:
+        original = os.path.abspath(user_data_dir)
+        if os.path.islink(original) or getattr(os.path, "isjunction", lambda _: False)(original):
+            return None
+        profile = os.path.realpath(original)
+        root = os.path.realpath(tempfile.gettempdir())
+        prefix = f"{_PROFILE_PREFIX}{int(port)}_"
+        name = os.path.basename(profile)
+        if (os.path.normcase(os.path.dirname(profile)) != os.path.normcase(root)
+                or not name.startswith(prefix) or len(name) == len(prefix)):
+            return None
+        return profile
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _profile_command_pattern(profile: str) -> str:
+    """匹配完整 user-data-dir 参数，兼容含空格的 Windows 命令行。"""
+    path = re.escape(profile)
+    alternatives = [rf'"--user-data-dir={path}"', rf'--user-data-dir="{path}"']
+    if not re.search(r"\s", profile):
+        alternatives.append(rf'--user-data-dir={path}')
+    return r'(?:^|\s)(?:' + "|".join(alternatives) + r')(?=\s|$)'
+
+
+def _chrome_processes():
+    """读取 Chrome 进程及其监听端口；无法确认时返回 None，禁止扩大清理范围。"""
+    script = """
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$taskListeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+$taskRows = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object {
+    $taskPid = [int]$_.ProcessId
+    $taskPorts = @($taskListeners | Where-Object { $_.OwningProcess -eq $taskPid } |
+                  Select-Object -ExpandProperty LocalPort -Unique)
+    [pscustomobject]@{
+        pid = $taskPid
+        command_line = $_.CommandLine
+        ports = @($taskPorts | Where-Object {
+            $taskPort = $_
+            -not ($taskListeners | Where-Object {
+                $_.LocalPort -eq $taskPort -and $_.OwningProcess -ne $taskPid
+            })
+        })
+    }
+})
+ConvertTo-Json -InputObject $taskRows -Compress -Depth 3
+"""
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=20)
+        if result.returncode:
+            return None
+        rows = json.loads(result.stdout)
+        return rows if isinstance(rows, list) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _profile_processes(profile: str, processes):
+    pattern = _profile_command_pattern(profile)
+    return [proc for proc in (processes or [])
+            if re.search(pattern, proc.get("command_line") or "", flags=re.IGNORECASE)]
+
+
+def _stop_profile_processes(profile: str) -> bool:
+    processes = _chrome_processes()
+    if processes is None:
+        return False
+    if not _profile_processes(profile, processes):
+        return True
+    # 路径通过环境变量传给 PowerShell，避免把路径内容拼成 shell 代码。
+    task_env = os.environ.copy()
+    task_env["OSWORLD_AGENT_PROFILE_PATTERN"] = _profile_command_pattern(profile)
+    script = """
+$ErrorActionPreference = 'Stop'
+Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+    Where-Object { $_.CommandLine -match $env:OSWORLD_AGENT_PROFILE_PATTERN } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+"""
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                env=task_env, capture_output=True, timeout=20)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _owned_endpoint_pids(port: int, profile: str):
+    """仅在该端口的监听者全部属于指定 profile 时返回它们的 PID。"""
+    processes = _chrome_processes()
+    owners = {proc["pid"] for proc in _profile_processes(profile, processes)
+              if port in (proc.get("ports") or [])}
+    listeners = [proc for proc in (processes or []) if port in (proc.get("ports") or [])]
+    if not owners or any(proc["pid"] not in owners for proc in listeners):
+        return set()
+    return owners
+
+
+def _close_owned_cdp(port: int, profile: str) -> bool:
+    owners = _owned_endpoint_pids(port, profile)
+    if not owners:
+        return False
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://localhost:{port}", timeout=4000)
+            try:
+                # 连接期间端口可能已被重新占用；发送关闭命令前再次核对 PID 和 profile。
+                current = _owned_endpoint_pids(port, profile)
+                if not current or not current.issubset(owners):
+                    return False
+                browser.new_browser_cdp_session().send("Browser.close")
+                return True
+            finally:
+                try:
+                    browser.close()  # 仅断开临时连接；真正退出由 Browser.close 完成。
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _remove_profile(port: int, profile: str) -> bool:
+    verified = _validated_profile(port, profile)
+    if verified is None:
+        return False
+    processes = _chrome_processes()
+    if (processes is None or any(not proc.get("command_line") for proc in processes)
+            or _profile_processes(verified, processes)):
+        return False
+    try:
+        if os.path.exists(verified):
+            # 递归删除前再次确认绝对路径和临时根目录范围。
+            if _validated_profile(port, verified) != verified:
+                return False
+            shutil.rmtree(verified)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_chrome(port: int, chrome_path: str):
+    """确保可连接无痕 Chrome，返回 (是否新建, 本次专用 profile 目录)。"""
+    from osworld_agent.utils import cdp_pages_are_incognito, list_cdp_pages
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError("浏览器调试端口必须在 1 到 65535 之间")
+    if list_cdp_pages("localhost", port):
+        if not cdp_pages_are_incognito("localhost", port):
+            raise RuntimeError(
+                f"调试端口 {port} 已被普通或无法确认无痕模式的浏览器占用。"
+                "请关闭该调试浏览器，或使用 --browser-port 指定空闲端口。")
+        print(f"[chrome] 检测到 {port} 端口已有无痕 Chrome，直接复用")
+        return False, None
+    if not os.path.isfile(chrome_path):
+        raise FileNotFoundError(f"找不到 Chrome：{chrome_path}（可用 --chrome 指定路径）")
+    print(f"[chrome] 启动带 remote-debugging 的无痕 Chrome（端口 {port}）...")
+    user_data_dir = tempfile.mkdtemp(prefix=f"{_PROFILE_PREFIX}{port}_",
+                                    dir=os.path.realpath(tempfile.gettempdir()))
+    proc = None
+    try:
+        proc = subprocess.Popen([
+            chrome_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            "--incognito", "--new-window",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-session-crashed-bubble", "--disable-infobars",
+            "about:blank",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            time.sleep(0.5)
+            if (list_cdp_pages("localhost", port) and cdp_pages_are_incognito("localhost", port)
+                    and _owned_endpoint_pids(port, user_data_dir)):
+                print("[chrome] 无痕 Chrome 已就绪")
+                return True, user_data_dir
+        raise RuntimeError(f"端口 {port} 的 Chrome 未就绪或无法确认无痕模式，已停止本次启动。")
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        close_test_chrome(port, user_data_dir)
+        raise
+
+
+def close_test_chrome(port: int, user_data_dir: str = None) -> None:
+    """仅关闭本次 profile 的实例，再删除经过范围验证的临时目录。"""
+    profile = _validated_profile(port, user_data_dir)
+    if profile is None:  # 复用实例没有本次 profile，不承担它的关闭或清理。
+        return
+    if _close_owned_cdp(port, profile):
+        time.sleep(0.5)
+    processes = _chrome_processes()
+    if processes is None or _profile_processes(profile, processes):
+        _stop_profile_processes(profile)
+        for _ in range(10):
+            processes = _chrome_processes()
+            if processes is not None and not _profile_processes(profile, processes):
+                break
+            time.sleep(0.2)
+    if not _remove_profile(port, profile):
+        print("[chrome] 未能确认专用实例已退出或 profile 无法删除，保留该临时目录")
+
+
+def _live_step(step_no, decision, execution, state):
+    """每步结束的实时回调：打印动作 / 路由 / 判定 / 结果。"""
+    import json as _json
+    a = decision.action
+    action_str = ""
+    if a is not None:
+        action_str = _json.dumps({"action": a.action, "args": a.args}, ensure_ascii=False)
+    route = state.route or {}
+    channel = route.get("channel", "") if isinstance(route, dict) else ""
+    parts = [f"[step {step_no}] {action_str}"]
+    if channel:
+        parts.append(f"路由:{channel}")
+    if decision.action_status:
+        parts.append(f"判定:{decision.action_status}")
+    print("  " + "  |  ".join(parts), flush=True)
+    if execution.outcome:
+        print(f"         结果: {str(execution.outcome)[:200]}", flush=True)
+
+
+def main() -> int:
+    # 行缓冲：即使被后台 subprocess 捕获，也逐行 flush，避免"看似卡住"（上次就是这个坑）
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    parser = argparse.ArgumentParser(description="Windows 本地手动任务运行器")
+    parser.add_argument("--task", required=True, help="自由文本任务描述")
+    parser.add_argument("--model", default="Qwen3.5-9B")
+    parser.add_argument("--model-url", default="http://7.246.80.189:9028/v1")
+    parser.add_argument("--ground-model", default="UI-Venus-2-9B")
+    parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
+    parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
+    parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
+    parser.add_argument("--browser-port", type=int, default=9222)
+    parser.add_argument("--chrome", default=CHROME_DEFAULT)
+    parser.add_argument("--download-dir", default=None, help="下载目录（缺省为 osworld_agent/downloads）")
+    parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省不落盘）")
+    args = parser.parse_args()
+
+    # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
+    import pyautogui
+    sw, sh = pyautogui.size()
+    width = args.width or sw
+    height = args.height or sh
+    print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
+
+    # 1) 确保 Chrome 带 remote debugging 且运行在无痕模式
+    started_chrome, chrome_profile = ensure_chrome(args.browser_port, args.chrome)
+    env = None
+    try:
+        time.sleep(2.0)  # 等 Chrome 窗口稳定
+
+        # 2) 模型（Logging 实时推送到 viz server）
+        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY")))
+        grounding = LoggingGrounding(UIVenus2Grounding(url=args.ground_url, api_key="EMPTY",
+                                                       model=args.ground_model, width=width, height=height))
+
+        # 3) 环境
+        env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
+                                 downloads_dir=args.download_dir)
+
+        # 4) 组装 + 跑，保留 1010 的规划流水线
+        agent = Agent(decision_model=model, grounding=grounding, env=env,
+                      max_steps=args.max_steps, enable_reflection=False,
+                      step_callback=_live_step)
+        if args.result_dir:
+            set_results_dir(args.result_dir)
+        reset_collected()
+        log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps})
+        print(f"\n===== 任务开始 =====\n{args.task}\n")
+        result = agent.run(args.task)
+    finally:
+        try:
+            if env is not None:
+                env.close()
+        finally:
+            # 初始化、运行或环境关闭失败时，仍清理本次创建的实例。
+            if started_chrome:
+                close_test_chrome(args.browser_port, chrome_profile)
+
+    # 通知前端任务结束（带结果），否则前端收不到 task_end 会把"已完成"误判成"异常终止"
+    log_status({
+        "event": "task_end",
+        "result": result.score,
+        "steps": result.steps,
+        "success": bool(result.success),
+        "answer": result.final_answer or "",
+    })
+
+    # 5) 逐步回放
+    print(f"\n===== 结束 =====\nscore={result.score} steps={result.steps} answer={result.final_answer!r}\n")
+    print("----- 逐步记录 -----")
+    for s in result.trajectory:
+        step = s.get("step")
+        action = s.get("action") or "(无动作)"
+        outcome = s.get("outcome") or ""
+        routing = s.get("routing") or {}
+        channel = routing.get("channel") if isinstance(routing, dict) else ""
+        assess = s.get("assessment") or {}
+        line = f"step{step}: {action}"
+        if channel:
+            line += f"  [路由:{channel}]"
+        print(line)
+        if outcome:
+            print(f"      结果: {str(outcome)[:160]}")
+        if assess.get("action_status"):
+            print(f"      判定: {assess.get('action_status')}")
+
+    # 6) 落盘轨迹 + 截图
+    if args.result_dir:
+        os.makedirs(args.result_dir, exist_ok=True)
+        for step_no, shot in result.screenshots.items():
+            try:
+                if hasattr(shot, "save"):
+                    shot.save(os.path.join(args.result_dir, f"step_{step_no}.png"))
+            except Exception:  # noqa: BLE001
+                pass
+        # 原始每步记录（含解析失败的 raw 输出），供归因。剔除 base64 图避免膨胀（图已在 assets/ 去重）。
+        import json as _json
+
+        def _strip_images(obj):
+            if isinstance(obj, dict):
+                return {k: _strip_images(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_strip_images(v) for v in obj]
+            if isinstance(obj, str) and obj.startswith("data:image/"):
+                return "[image]"
+            return obj
+
+        raw_lines = [_json.dumps(_strip_images(s), ensure_ascii=False)
+                     for s in result.trajectory if isinstance(s, dict)]
+        with open(os.path.join(args.result_dir, "traj_raw.jsonl"), "w", encoding="utf-8") as _f:
+            _f.write("\n".join(raw_lines))
+        from osworld_agent.trajectory import build_trajectory, dump_trajectory
+        traj = build_trajectory(task_id="local", domain="windows",
+                                instruction=args.task, result=result)
+        dump_trajectory(os.path.join(args.result_dir, "trajectory.json"), traj)
+        print(f"\n轨迹与截图已保存到: {args.result_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
