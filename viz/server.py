@@ -290,10 +290,22 @@ def _local_traj_to_frontend(traj):
         reasoning = s.get("reasoning") or {}
         assessment = s.get("assessment") or {}
         grounding = s.get("grounding") or {}
+        timing = s.get("timing_ms") or {}
         gs = []
-        if grounding:
+        if grounding and grounding.get("coord"):
             gs.append({"query": grounding.get("target", ""),
-                       "coord": grounding.get("coord"), "elapsed": None})
+                       "coord": grounding.get("coord"),
+                       "elapsed": timing.get("ground")})
+        # 决策耗时：decision_calls 最后一条的 latency_ms（LoggingChatModel 转发后才有）
+        decision_elapsed = None
+        dc = s.get("decision_calls") or []
+        if dc:
+            decision_elapsed = dc[-1].get("latency_ms")
+        # 子 Agent 调用：从 execution_info 里提取 call_code_agent
+        ei = s.get("execution_info") or {}
+        subagent = None
+        if ei.get("action") == "call_code_agent":
+            subagent = {"task": ei.get("task", ""), "result": ei.get("result", "")}
         lines.append({
             "step_num": s.get("step"),
             "plan": reasoning.get("screen_analysis", ""),
@@ -307,6 +319,9 @@ def _local_traj_to_frontend(traj):
             "outcome": (s.get("execution") or {}).get("outcome", ""),
             "assessment": assessment,
             "prompt": s.get("prompt_text", ""),
+            "timing_ms": timing,
+            "decision_elapsed_ms": decision_elapsed,
+            "subagent": subagent,
         })
     return lines
 
@@ -325,6 +340,7 @@ async def local_traj(run: str):
         return {"ok": False, "error": f"轨迹解析失败：{exc}"}
     return {"ok": True, "traj": _local_traj_to_frontend(traj),
             "instruction": (traj.get("task") or {}).get("instruction", ""),
+            "plan": traj.get("plan"),
             "trajectory": traj}
 
 
@@ -858,6 +874,37 @@ async def debug_chat(request: Request):
     return {"ok": False, "error": f"暂不支持的 provider: {engine_type}（当前支持 vllm / openai / open_router）"}
 
 
+def _keep_model_warm():
+    """后台保活线程：用真实 system prompt warm 决策模型的 prefix cache，避免冷启动（78s）。
+
+    决策变慢的根因不是「模型被卸载」，而是 vLLM 第一次处理长 system prompt（+3 张截图）时
+    要计算全部 KV cache（prefix cache 冷启动）；纯文本 "ping" 无法 warm 这个 cache。
+    所以这里用 build_system_prompt(browser_only=True) 作为 system 前缀去 warm，
+    之后真实决策的 system 前缀命中 cache，只剩动态部分（任务/截图/AX树），快。
+    """
+    import requests as _req
+    from osworld_agent.prompts import build_system_prompt
+    sys_prompt = build_system_prompt(browser_only=True)
+    dec_url = os.getenv("OSWORLD_DECISION_URL", "http://7.246.80.189:9028/v1/chat/completions")
+    grd_url = os.getenv("OSWORLD_GROUNDING_URL", "http://7.246.80.189:8001/v1/chat/completions")
+    while True:
+        try:
+            _req.post(dec_url, json={"model": "Qwen3.5-9B",
+                                     "messages": [{"role": "system", "content": sys_prompt},
+                                                  {"role": "user", "content": "keepalive"}],
+                                     "max_tokens": 1}, timeout=120)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _req.post(grd_url, json={"model": "UI-Venus-2-9B",
+                                     "messages": [{"role": "user", "content": "keepalive"}],
+                                     "max_tokens": 1}, timeout=60)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(60)
+
+
 if __name__ == "__main__":
     port = int(os.getenv("AGENTS_VIZ_PORT", "8088"))
+    threading.Thread(target=_keep_model_warm, daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

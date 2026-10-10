@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 MAX_RECENT_EVENTS = 3
 MAX_FAILURES = 3
@@ -29,6 +29,8 @@ class StructuredMemory:
         "completed": [],
         "pending": [],
     })
+    # 任务计划（planner 阶段0产出）：{"steps":[{"idx":1,"goal":"...","status":"pending"}], "keywords":[...], "final_check":"..."}
+    plan: Optional[Dict[str, Any]] = None
     recent_events: List[str] = field(default_factory=list)      # 最近 3 条
     known_facts: Dict[str, Any] = field(default_factory=dict)   # 关键事实（key -> value）
     failure_memory: List[str] = field(default_factory=list)     # 最近 1~3 个重要失败
@@ -100,6 +102,22 @@ class StructuredMemory:
             f"- 当前子目标 current_subgoal: {ts['current_subgoal'] or '（未填）'}",
             f"- 已完成 completed: {ts['completed'] if ts['completed'] else '[]'}",
             f"- 待办 pending: {ts['pending'] if ts['pending'] else '[]'}",
+            "",
+        ]
+        # 任务计划段（planner 阶段0产出）
+        if self.plan:
+            lines.append("## 任务计划(plan)")
+            for s in (self.plan.get("steps") or []):
+                idx = s.get("idx", "?")
+                goal = s.get("goal", "")
+                status = s.get("status", "pending")
+                mark = {"pending": "待办", "doing": "进行中", "done": "已完成"}.get(status, status)
+                lines.append(f"- [{mark}] {idx}. {goal}")
+            if self.plan.get("keywords"):
+                lines.append(f"- 搜索关键词 keywords: {self.plan.get('keywords')}")
+            if self.plan.get("final_check"):
+                lines.append(f"- 完成判据 final_check: {self.plan.get('final_check')}")
+        lines += [
             "",
             "## 动作历史(action_history，从头到尾做了什么)",
         ]

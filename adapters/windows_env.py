@@ -36,6 +36,13 @@ class WindowsEnvironment(Environment):
 
     # ---- 观察 ----
     def _take_screenshot(self):
+        """浏览器场景用 CDP 截 viewport（不受其他窗口遮挡），桌面场景用 pyautogui 全屏。"""
+        if self._focus_is_browser():
+            session = self._get_browser_session()
+            if session is not None:
+                shot = session.screenshot()
+                if shot is not None:
+                    return shot
         import pyautogui
         return pyautogui.screenshot()
 
@@ -206,7 +213,8 @@ class WindowsEnvironment(Environment):
                 and self._focus_is_browser()):
             session = self._get_browser_session()
             if session is not None:
-                result = session.click_at_screen(action, int(action.args["x"]), int(action.args["y"]))
+                # 截图是 viewport（CDP 截的），grounding 坐标即 viewport 坐标，直接点，不再屏幕→viewport 换算
+                result = session.click_at_viewport(action, int(action.args["x"]), int(action.args["y"]))
                 return StepResult(observation=self._build_observation(), info=dict(result))
 
         if kind == "browser":

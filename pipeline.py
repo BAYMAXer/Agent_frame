@@ -32,8 +32,14 @@ from .model.decision_model import encode_image
 from .scene import scene_hint
 from .memory import StructuredMemory
 from .skills import is_skill, validate_skill, run_skill, enabled_skills, SkillContext
-from .prompts import build_user_prompt, build_format_feedback
+from .prompts import build_user_prompt, build_format_feedback, build_planner_prompt
 from .context import PromptCompiler
+
+# 实时状态推送（可选）：execute 阶段进度推给 viz 前端，失败不影响主流程
+try:
+    from .viz.logging import log_status as _viz_log_status
+except Exception:  # noqa: BLE001
+    _viz_log_status = None
 
 # 确定性卡死检测参数
 _NO_CHANGE_DIFF_THRESHOLD = 2.0       # 64x64 灰度 mean-abs-diff 阈值（< 此值视为无变化）
@@ -56,6 +62,7 @@ class AgentResult:
     final_answer: str = ""
     trajectory: List[dict] = field(default_factory=list)
     screenshots: Dict[int, Any] = field(default_factory=dict)   # step -> 决策前截图（PIL 或 bytes）
+    plan: Optional[Dict[str, Any]] = None   # 阶段0 产出的任务计划（steps/keywords/final_check）
 
 
 @dataclass
@@ -145,6 +152,9 @@ class Pipeline:
     def run(self, task: str) -> AgentResult:
         result = AgentResult(task=task)
         state = self._init_state(task)
+        # 阶段0：任务规划（模糊任务 → 结构化 plan），失败静默降级
+        self._plan(task, state)
+        result.plan = state.memory.plan
 
         for step_no in range(1, self.max_steps + 1):
             started = time.perf_counter()
@@ -179,7 +189,21 @@ class Pipeline:
             action = self.ground(decision.action, state)
             ground_ms = (time.perf_counter() - ground_started) * 1000
             execute_started = time.perf_counter()
+            # execute 阶段推送进度（下载等长耗时动作让前端看到"执行中"而非干等）
+            if _viz_log_status is not None:
+                try:
+                    _viz_log_status({"event": "executing", "step": step_no,
+                                     "action": decision.action.action if decision.action else ""})
+                except Exception:  # noqa: BLE001
+                    pass
             execution = self.execute(action, state)
+            if _viz_log_status is not None:
+                try:
+                    _viz_log_status({"event": "executed", "step": step_no,
+                                     "status": (execution.info or {}).get("status", ""),
+                                     "action": (execution.info or {}).get("action", "")})
+                except Exception:  # noqa: BLE001
+                    pass
             execute_ms = (time.perf_counter() - execute_started) * 1000
             state, should_break = self.postprocess(step_no, decision, execution, state, result)
             result.steps = step_no
@@ -419,7 +443,9 @@ class Pipeline:
             for k, v in (result.get("notes") or {}).items():
                 state.memory.known_facts[k] = v
             return Execution(kind="subagent", executed=f"子Agent: {task[:60]}",
-                             outcome="子Agent已执行，结果将在下一步返回")
+                             outcome="子Agent已执行，结果将在下一步返回",
+                             info={"action": "call_code_agent", "task": task,
+                                   "result": state.code_agent_result[:1000]})
 
         if kind == "terminal":
             if name == "fail":
@@ -480,6 +506,8 @@ class Pipeline:
                 state.memory.add_event(f"{desc} → {decision.observed_effect or decision.action_status or '已执行'}")
         # 3) 应用 state_update 补丁
         state.memory.apply_state_update(decision.state_update)
+        # 3.1) 程序侧更新 plan 进度（不依赖模型 state_update，防止待办一直不更新）
+        self._update_plan_progress(state, execution)
         # 4) 回填上一步动作 a_{t-1} 的 assessment（decision 的 observed_effect/action_status
         #    评价的是上一步动作，而不是本步 next_action）
         self._fill_prev_assessment(result, decision)
@@ -540,6 +568,20 @@ class Pipeline:
             should_break = True
         # 8) 设置下一步的 expected_effect（当前决策的 expected_effect → 下一步对比用）
         state.memory.expected_effect = decision.expected_effect
+        # 8.5) 程序侧完成判断：用验证器（导航/下载等）判断任务是否完成，不靠模型 finish 验证器
+        if not should_break:
+            verifier = self._programmatic_done(state, execution)
+            if verifier:
+                info = execution.info or {}
+                if verifier == "download":
+                    result.final_answer = f"已下载文件到 {info.get('path', '')}（{info.get('bytes', 0)} 字节），已核实落盘"
+                elif verifier == "navigation":
+                    result.final_answer = f"已导航到 {info.get('url', '')}"
+                else:
+                    result.final_answer = "任务完成"
+                result.success = True
+                state.memory.add_event(f"✅ 程序核实：{verifier} 验证通过，任务结束")
+                should_break = True
         # 9) request_finish 验证
         if not should_break and execution.kind == "finish_request":
             confirmed, reason = self._verify_finish(state, execution.answer)
@@ -583,9 +625,12 @@ class Pipeline:
         """
         for t in reversed(result.trajectory):
             if t.get("action") and t.get("assessment") is None:
+                # 本机任务无评测器（score 恒 0），以 success（finish 验证结果）为准；
+                # OSWorld 有评测器，score>=1 才算成功。
+                ok = bool(result.success) or result.score >= 1.0
                 t["assessment"] = {
-                    "observed_effect": f"任务结束，最终得分 {result.score}",
-                    "action_status": "success" if result.score >= 1.0 else "failure",
+                    "observed_effect": ("任务结束，成功" if ok else f"任务结束，最终得分 {result.score}"),
+                    "action_status": "success" if ok else "failure",
                 }
                 t["done"] = True
                 break
@@ -596,6 +641,83 @@ class Pipeline:
             memory=StructuredMemory(),
             skill_ctx=SkillContext(env=self.env),
         )
+
+    def _plan(self, task: str, state: StepState) -> None:
+        """阶段0：把模糊任务拆成结构化 plan，存进记忆。
+
+        失败（模型输出非法 JSON / 网络异常）静默降级为「无 plan 继续跑」，
+        绝不因为 planner 出错而卡死整个任务。
+        """
+        prompt = build_planner_prompt(task)
+        try:
+            raw = self.model.chat([{"role": "user", "content": prompt}], retries=1, json_mode=True)
+            obj = parse_decision(raw)
+            steps = obj.get("steps") if isinstance(obj, dict) else None
+            if not isinstance(steps, list) or not steps:
+                return
+            norm_steps = []
+            for s in steps:
+                if not isinstance(s, dict):
+                    continue
+                goal = str(s.get("goal", "")).strip()
+                if not goal:
+                    continue
+                norm_steps.append({
+                    "idx": s.get("idx", len(norm_steps) + 1),
+                    "goal": goal,
+                    "status": "pending",
+                })
+            if not norm_steps:
+                return
+            state.memory.plan = {
+                "steps": norm_steps,
+                "keywords": obj.get("keywords") or [],
+                "final_check": str(obj.get("final_check") or ""),
+            }
+            state.memory.task_state["goal"] = task
+            state.memory.add_event(f"📋 已制定任务计划：{len(norm_steps)} 步")
+        except Exception:  # noqa: BLE001  planner 失败不影响主流程
+            return
+
+    def _update_plan_progress(self, state: StepState, execution: Execution) -> None:
+        """根据执行结果，程序侧标记 plan 里已完成的步骤（不依赖模型 state_update）。
+
+        模型常漏 state_update（current_subgoal/completed 为空），导致 plan 的 status 永远 pending。
+        这里用执行结果（action + verified 等确定性信号）标记步骤完成。
+        """
+        plan = state.memory.plan
+        if not plan or not plan.get("steps"):
+            return
+        info = execution.info if isinstance(execution.info, dict) else {}
+        if info.get("status") != "executed":
+            return
+        action = info.get("action") or ""
+        # 下载成功（程序核实落盘 verified）→ 标记所有"下载/PDF"步骤 done
+        if action == "download" and info.get("verified"):
+            for s in plan["steps"]:
+                g = (s.get("goal") or "").lower()
+                if any(k in g for k in ("下载", "download", "pdf")):
+                    s["status"] = "done"
+            return
+        # goto 成功 → 标记第一个"打开/进入/访问网站"步骤 done
+        if action == "goto":
+            for s in plan["steps"]:
+                if s.get("status") != "done":
+                    g = (s.get("goal") or "").lower()
+                    if any(k in g for k in ("打开", "进入", "访问", "官网", "首页",
+                                            "搜索页面", "arxiv", "scholar", "google")):
+                        s["status"] = "done"
+                        break
+
+    def _programmatic_done(self, state: StepState, execution: Execution) -> str:
+        """程序侧判断任务是否完成（确定性验证器，不靠模型 finish 验证器）。
+
+        返回命中的验证器名（str），未命中返回空字符串。
+        验证器在 verifiers.py 里注册，可逐步扩展（导航/下载/表单/搜索……）。
+        """
+        info = execution.info if isinstance(execution.info, dict) else {}
+        from . import verifiers
+        return verifiers.check_completion(state.task or "", info)
 
     def _build_memory_text(self, state: StepState) -> str:
         return state.memory.to_text() + "\n\n" + self._program_info_text(state)
@@ -805,6 +927,16 @@ class Pipeline:
         spec = get_action_spec(action.action)
         if spec is None or spec.resolve == "none":
             return action
+        # grounding 坐标空间 = 截图尺寸：浏览器场景截图是 viewport（CDP 截），桌面是全屏，
+        # 这里按截图实际尺寸动态适配 grounding 的 width/height，坐标自然落在正确空间。
+        if obs.screenshot is not None:
+            try:
+                w, h = obs.screenshot.size
+                if hasattr(self.grounding, "width"):
+                    self.grounding.width = int(w)
+                    self.grounding.height = int(h)
+            except Exception:  # noqa: BLE001
+                pass
         if spec.resolve == "point":
             gr = self.grounding.locate(obs.screenshot, str(action.args.get("target", "")))
             coord = resolve_coords(gr)

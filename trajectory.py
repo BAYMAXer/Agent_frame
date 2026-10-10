@@ -132,6 +132,7 @@ def build_trajectory(
             "termination_reason": getattr(result, "termination_reason", "unknown"),
         },
         "steps": steps,
+        "plan": getattr(result, "plan", None),
     }
 
 

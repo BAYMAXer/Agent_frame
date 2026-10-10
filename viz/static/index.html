@@ -292,8 +292,8 @@
     <div class="brand"><span class="dot"></span>Agent S3 可视化</div>
     <button class="navbtn active" id="nav-run">⚡ 运行配置</button>
     <button class="navbtn" id="nav-live">▶ 实时监控</button>
-    <button class="navbtn" id="nav-history">📁 历史轨迹</button>
-    <button class="navbtn" id="nav-local">🖥 本地运行</button>
+    <button class="navbtn" id="nav-history">📁 虚拟轨迹</button>
+    <button class="navbtn" id="nav-local">🖥 本机轨迹</button>
     <button class="navbtn" id="nav-debug">🧪 模型调试</button>
     <button class="navbtn" id="nav-chat">💬 会话调试</button>
     <span class="conn off" id="conn"><span class="led"></span><span id="conn-text">连接中…</span></span>
@@ -565,7 +565,7 @@
     <div id="history-body" class="scroll"></div>
   </div>
 
-  <!-- 本地运行视图（Windows 本机任务，local_runs/） -->
+  <!-- 本机轨迹视图（Windows 本机任务，local_runs/） -->
   <div id="view-local">
     <div id="local-body" class="scroll"></div>
   </div>
@@ -795,7 +795,9 @@ function statusCardHtml(payload) {
   else if (payload.event === 'step') detail = 'Step ' + payload.step + ' 执行完成，reward=' + payload.reward + '，done=' + payload.done;
   else if (payload.event === 'manual_mode') detail = '🧑 手动模式：请在 VMware 窗口中手动完成任务，完成后点「评估结果」';
   else if (payload.event === 'error') detail = '⚠️ Step ' + payload.step + ' 出错：' + esc(payload.error || '');
-  else if (payload.event === 'task_end') detail = '任务结束，最终 result=' + payload.result;
+  else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
+  else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
+  else if (payload.event === 'executed') detail = '✅ 执行完成：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
   else detail = esc(payload.event || '');
   return '<div class="card status" data-kind="status">' +
     '<div class="card-head"><span class="tag status">状态</span>' +
@@ -1332,7 +1334,7 @@ function loadRuns() {
 }
 function renderRunList(runs) {
   const body = document.getElementById('history-body');
-  if (!runs.length) { body.innerHTML = '<div class="empty">暂无历史运行</div>'; return; }
+  if (!runs.length) { body.innerHTML = '<div class="empty">暂无虚拟轨迹</div>'; return; }
   body.innerHTML = runs.map(r => {
     const time = new Date(r.mtime * 1000).toLocaleString();
     // 有 error 的失败任务标红，纯未完成（无 error）标黄
@@ -1393,7 +1395,7 @@ function renderRunList(runs) {
     });
   });
 }
-/* ===== 本地运行（Windows 本机任务，local_runs/） ===== */
+/* ===== 本机轨迹（Windows 本机任务，local_runs/） ===== */
 function loadLocalRuns() {
   const body = document.getElementById('local-body');
   body.innerHTML = '<div class="empty">加载中…</div>';
@@ -1401,7 +1403,7 @@ function loadLocalRuns() {
 }
 function renderLocalList(runs) {
   const body = document.getElementById('local-body');
-  if (!runs.length) { body.innerHTML = '<div class="empty">暂无本地运行（local_runs/ 目录为空）</div>'; return; }
+  if (!runs.length) { body.innerHTML = '<div class="empty">暂无本机轨迹（local_runs/ 目录为空）</div>'; return; }
   body.innerHTML = runs.map(r => {
     const time = new Date(r.mtime * 1000).toLocaleString();
     // 优先看 success（本地任务无独立评测器，score 恒 0）；否则按 score
@@ -1431,7 +1433,7 @@ function loadLocalDetail(runId) {
   const body = document.getElementById('local-body');
   body.innerHTML = '<div class="empty">加载轨迹…</div>';
   fetch('/local/traj?run=' + encodeURIComponent(runId))
-    .then(r => r.json()).then(d => renderLocalDetail(runId, d.traj || [], d.instruction || ''))
+    .then(r => r.json()).then(d => renderLocalDetail(runId, d.traj || [], d.instruction || '', d.plan))
     .catch(() => { body.innerHTML = '<div class="empty">加载失败</div>'; });
 }
 function formatAction(actionStr) {
@@ -1459,15 +1461,27 @@ function formatAction(actionStr) {
   }
 }
 
-function renderLocalDetail(runId, traj, instruction) {
+function renderLocalDetail(runId, traj, instruction, plan) {
   const body = document.getElementById('local-body');
   const backBtn = '<div style="display:flex;gap:8px;align-items:center"><button id="local-backbtn" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:8px 16px;border-radius:var(--radius);cursor:pointer;font-size:13px;font-weight:600">← 返回列表</button><span style="font-size:13px;color:var(--dim);font-family:var(--mono)">编号 ' + esc(runId) + '</span></div>';
   const instrCard = instruction ? '<div class="card"><div class="card-body"><div style="font-size:14px;line-height:1.6">' + esc(instruction) + '</div></div></div>' : '';
+  // 任务计划卡片（planner 阶段0 产出）
+  let planCard = '';
+  if (plan && plan.steps && plan.steps.length) {
+    const stepsHtml = plan.steps.map(s => {
+      const mark = {'pending': '⬜', 'doing': '▶️', 'done': '✅'}[s.status] || '⬜';
+      return '<div style="padding:4px 0">' + mark + ' ' + esc((s.idx != null ? s.idx + '. ' : '') + s.goal) + '</div>';
+    }).join('');
+    const kwHtml = (plan.keywords && plan.keywords.length) ? '<div style="margin-top:8px;color:var(--dim)">🔑 关键词: ' + esc(plan.keywords.join(', ')) + '</div>' : '';
+    const fcHtml = plan.final_check ? '<div style="color:var(--dim)">🎯 完成判据: ' + esc(plan.final_check) + '</div>' : '';
+    planCard = '<div class="card"><div class="card-head"><span class="tag status">📋 任务计划（planner）</span></div>' +
+      '<div class="card-body"><div class="texts" style="flex:1">' + stepsHtml + kwHtml + fcHtml + '</div></div></div>';
+  }
   let savedNote = '';
   try { savedNote = localStorage.getItem('local_note|' + runId) || ''; } catch (e) {}
   const noteCard = '<div class="card"><div class="card-head"><span class="tag status">📝 运行备注</span></div>' +
     '<div class="card-body"><div class="texts" style="flex:1"><textarea id="local-note" class="run-note-area" placeholder="记录这次运行的情况、结论、问题…">' + esc(savedNote) + '</textarea></div></div></div>';
-  body.innerHTML = backBtn + noteCard + instrCard + traj.map(t => localStepCard(runId, t)).join('');
+  body.innerHTML = backBtn + noteCard + instrCard + planCard + traj.map(t => localStepCard(runId, t)).join('');
   document.getElementById('local-backbtn').addEventListener('click', loadLocalRuns);
   const noteEl = document.getElementById('local-note');
   if (noteEl) noteEl.addEventListener('input', () => { try { localStorage.setItem('local_note|' + runId, noteEl.value); } catch (e) {} });
@@ -1485,9 +1499,45 @@ function localStepCard(runId, t) {
   const expectHtml = t.expected_effect ? '<div class="sec-title">expected_effect</div><div class="response">' + esc(t.expected_effect) + '</div>' : '';
   const outcomeHtml = t.outcome ? '<div class="sec-title">执行结果</div><div class="response">' + esc(String(t.outcome)) + '</div>' : '';
   const assess = t.assessment || {};
-  const assessHtml = assess.action_status ? '<div class="sec-title">判定</div><div class="response">' + esc(assess.action_status + (assess.observed_effect ? (' — ' + assess.observed_effect) : '')) + '</div>' : '';
-  return '<div class="card"><div class="card-head"><span class="step">Step ' + stepNum + '</span>' + channelHtml + '</div>' +
-    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + outcomeHtml + assessHtml + '</div></div></div>';
+  // 判定 badge：放卡片头部（图片上方）
+  const status = assess.action_status;
+  let statusHtml = '';
+  if (status) {
+    const bg = status === 'success' ? '#e6f4ea' : (status === 'failure' ? '#fce8e6' : '#fef7e0');
+    const fg = status === 'success' ? '#1e8e3e' : (status === 'failure' ? '#d93025' : '#e37400');
+    statusHtml = '<span class="step" style="background:' + bg + ';color:' + fg + '">' + esc(status) + '</span>';
+  }
+  // observed_effect（判定的详细描述）保留在右侧
+  const observeHtml = assess.observed_effect ? '<div class="sec-title">observed_effect</div><div class="response">' + esc(assess.observed_effect) + '</div>' : '';
+  // grounding 定位坐标
+  let gHtml = '';
+  if (t.grounding && t.grounding.length) {
+    gHtml = '<div class="sec-title">Grounding 定位</div><div class="response">' + t.grounding.map(g => {
+      const c = g.coord ? ('(' + g.coord[0] + ', ' + g.coord[1] + ')') : '';
+      return '📍 ' + c + ' — ' + esc(g.query) + (g.elapsed != null ? ' <span style="color:var(--dim)">(' + Math.round(g.elapsed) + ' ms)</span>' : '');
+    }).join('') + '</div>';
+  }
+  // 耗时（决策 + 总）放卡片头部，和实时监控一致用 ⏱
+  const decMs = t.decision_elapsed_ms;
+  const totMs = (t.timing_ms || {}).total;
+  let elapsedHtml = '';
+  if (decMs != null || totMs != null) {
+    const parts = [];
+    if (decMs != null) {
+      const s = decMs / 1000;
+      parts.push('⏱ ' + (s < 1 ? Math.round(decMs) + ' ms' : s.toFixed(1) + 's'));
+    }
+    if (totMs != null) parts.push('总 ' + (totMs / 1000).toFixed(1) + 's');
+    elapsedHtml = '<span class="elapsed">' + esc(parts.join(' · ')) + '</span>';
+  }
+  // 子 Agent 调用
+  let subHtml = '';
+  if (t.subagent) {
+    subHtml = '<div class="sec-title">子 Agent 调用</div><div class="response">任务: ' + esc(t.subagent.task) + '</div>' +
+      (t.subagent.result ? '<div class="prompt">' + esc(t.subagent.result) + '</div>' : '');
+  }
+  return '<div class="card"><div class="card-head"><span class="step">Step ' + stepNum + '</span>' + channelHtml + elapsedHtml + statusHtml + '</div>' +
+    '<div class="card-body">' + shotHtml + '<div class="texts">' + promptHtml + actionHtml + planHtml + expectHtml + gHtml + subHtml + outcomeHtml + observeHtml + '</div></div></div>';
 }
 
 function loadRunDetail(model, domain, task) {

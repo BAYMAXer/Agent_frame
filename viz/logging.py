@@ -105,6 +105,15 @@ class LoggingChatModel:
         self.inner = inner
         self.vision = getattr(inner, "vision", True)
 
+    @property
+    def last_call(self):
+        """转发 inner 的 last_call（决策耗时 latency_ms 等元数据，供轨迹 decision_calls 记录）。
+
+        之前这里漏了转发，导致 decide() 里 getattr(self.model, "last_call", {})
+        拿到空 dict，decision_calls 丢失 latency_ms / usage 等，本地运行历史拿不到决策耗时。
+        """
+        return getattr(self.inner, "last_call", {})
+
     def chat(self, messages, retries: int = 2, json_mode: bool = False) -> str:
         text, screenshot = _extract_last_user(messages)
         mtype = _classify_mtype(text, screenshot)

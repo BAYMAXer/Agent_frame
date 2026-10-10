@@ -14,9 +14,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -33,55 +37,220 @@ from osworld_agent.viz.logging import (LoggingChatModel, LoggingGrounding,  # no
                                        set_results_dir, log_status, reset_collected)
 
 CHROME_DEFAULT = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+_PROFILE_PREFIX = "osworld_agent_chrome_incognito_"
 
 
-def ensure_chrome(port: int, chrome_path: str) -> bool:
-    """确保有带 remote-debugging 的无痕 Chrome；仅新建实例时返回 True。"""
+def _validated_profile(port: int, user_data_dir: str):
+    """只接受临时根目录下、本端口的专用 profile，拒绝链接或越界路径。"""
+    if not user_data_dir:
+        return None
+    try:
+        original = os.path.abspath(user_data_dir)
+        if os.path.islink(original) or getattr(os.path, "isjunction", lambda _: False)(original):
+            return None
+        profile = os.path.realpath(original)
+        root = os.path.realpath(tempfile.gettempdir())
+        prefix = f"{_PROFILE_PREFIX}{int(port)}_"
+        name = os.path.basename(profile)
+        if (os.path.normcase(os.path.dirname(profile)) != os.path.normcase(root)
+                or not name.startswith(prefix) or len(name) == len(prefix)):
+            return None
+        return profile
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _profile_command_pattern(profile: str) -> str:
+    """匹配完整 user-data-dir 参数，兼容含空格的 Windows 命令行。"""
+    path = re.escape(profile)
+    alternatives = [rf'"--user-data-dir={path}"', rf'--user-data-dir="{path}"']
+    if not re.search(r"\s", profile):
+        alternatives.append(rf'--user-data-dir={path}')
+    return r'(?:^|\s)(?:' + "|".join(alternatives) + r')(?=\s|$)'
+
+
+def _chrome_processes():
+    """读取 Chrome 进程及其监听端口；无法确认时返回 None，禁止扩大清理范围。"""
+    script = """
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$taskListeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
+$taskRows = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | ForEach-Object {
+    $taskPid = [int]$_.ProcessId
+    $taskPorts = @($taskListeners | Where-Object { $_.OwningProcess -eq $taskPid } |
+                  Select-Object -ExpandProperty LocalPort -Unique)
+    [pscustomobject]@{
+        pid = $taskPid
+        command_line = $_.CommandLine
+        ports = @($taskPorts | Where-Object {
+            $taskPort = $_
+            -not ($taskListeners | Where-Object {
+                $_.LocalPort -eq $taskPort -and $_.OwningProcess -ne $taskPid
+            })
+        })
+    }
+})
+ConvertTo-Json -InputObject $taskRows -Compress -Depth 3
+"""
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=20)
+        if result.returncode:
+            return None
+        rows = json.loads(result.stdout)
+        return rows if isinstance(rows, list) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _profile_processes(profile: str, processes):
+    pattern = _profile_command_pattern(profile)
+    return [proc for proc in (processes or [])
+            if re.search(pattern, proc.get("command_line") or "", flags=re.IGNORECASE)]
+
+
+def _stop_profile_processes(profile: str) -> bool:
+    processes = _chrome_processes()
+    if processes is None:
+        return False
+    if not _profile_processes(profile, processes):
+        return True
+    # 路径通过环境变量传给 PowerShell，避免把路径内容拼成 shell 代码。
+    task_env = os.environ.copy()
+    task_env["OSWORLD_AGENT_PROFILE_PATTERN"] = _profile_command_pattern(profile)
+    script = """
+$ErrorActionPreference = 'Stop'
+Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |
+    Where-Object { $_.CommandLine -match $env:OSWORLD_AGENT_PROFILE_PATTERN } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }
+"""
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                env=task_env, capture_output=True, timeout=20)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _owned_endpoint_pids(port: int, profile: str):
+    """仅在该端口的监听者全部属于指定 profile 时返回它们的 PID。"""
+    processes = _chrome_processes()
+    owners = {proc["pid"] for proc in _profile_processes(profile, processes)
+              if port in (proc.get("ports") or [])}
+    listeners = [proc for proc in (processes or []) if port in (proc.get("ports") or [])]
+    if not owners or any(proc["pid"] not in owners for proc in listeners):
+        return set()
+    return owners
+
+
+def _close_owned_cdp(port: int, profile: str) -> bool:
+    owners = _owned_endpoint_pids(port, profile)
+    if not owners:
+        return False
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://localhost:{port}", timeout=4000)
+            try:
+                # 连接期间端口可能已被重新占用；发送关闭命令前再次核对 PID 和 profile。
+                current = _owned_endpoint_pids(port, profile)
+                if not current or not current.issubset(owners):
+                    return False
+                browser.new_browser_cdp_session().send("Browser.close")
+                return True
+            finally:
+                try:
+                    browser.close()  # 仅断开临时连接；真正退出由 Browser.close 完成。
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _remove_profile(port: int, profile: str) -> bool:
+    verified = _validated_profile(port, profile)
+    if verified is None:
+        return False
+    processes = _chrome_processes()
+    if (processes is None or any(not proc.get("command_line") for proc in processes)
+            or _profile_processes(verified, processes)):
+        return False
+    try:
+        if os.path.exists(verified):
+            # 递归删除前再次确认绝对路径和临时根目录范围。
+            if _validated_profile(port, verified) != verified:
+                return False
+            shutil.rmtree(verified)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_chrome(port: int, chrome_path: str):
+    """确保可连接无痕 Chrome，返回 (是否新建, 本次专用 profile 目录)。"""
     from osworld_agent.utils import cdp_pages_are_incognito, list_cdp_pages
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError("浏览器调试端口必须在 1 到 65535 之间")
     if list_cdp_pages("localhost", port):
         if not cdp_pages_are_incognito("localhost", port):
             raise RuntimeError(
                 f"调试端口 {port} 已被普通或无法确认无痕模式的浏览器占用。"
                 "请关闭该调试浏览器，或使用 --browser-port 指定空闲端口。")
         print(f"[chrome] 检测到 {port} 端口已有无痕 Chrome，直接复用")
-        return False
+        return False, None
     if not os.path.isfile(chrome_path):
-        print(f"[chrome] 找不到 Chrome：{chrome_path}（可用 --chrome 指定路径）")
-        return False
+        raise FileNotFoundError(f"找不到 Chrome：{chrome_path}（可用 --chrome 指定路径）")
     print(f"[chrome] 启动带 remote-debugging 的无痕 Chrome（端口 {port}）...")
-    user_data_dir = os.path.join(os.environ.get("TEMP") or os.environ.get("TMP") or ".",
-                                 f"osworld_agent_chrome_incognito_{port}")
-    proc = subprocess.Popen([
-        chrome_path,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={user_data_dir}",
-        "--incognito", "--new-window",
-        "--no-first-run", "--no-default-browser-check",
-        "--disable-session-crashed-bubble", "--disable-infobars",  # 消除"恢复页面"弹窗干扰
-        "about:blank",
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(30):
-        time.sleep(0.5)
-        if list_cdp_pages("localhost", port) and cdp_pages_are_incognito("localhost", port):
-            print("[chrome] 无痕 Chrome 已就绪")
-            return True
-    if proc.poll() is None:
-        proc.terminate()
-        proc.wait(timeout=10)
-    raise RuntimeError(f"端口 {port} 的 Chrome 未就绪或无法确认无痕模式，已停止本次启动。")
-
-
-def close_test_chrome(port: int = 9222) -> None:
-    """关闭 ensure_chrome 启动的测试 Chrome（按 user-data-dir 过滤，不碰用户自己的 Chrome）。"""
-    profile_pattern = rf"osworld_agent_chrome_incognito_{int(port)}(?:\"|\s|$)"
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
-          f"Where-Object {{ $_.CommandLine -match '{profile_pattern}' }} | "
-          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    user_data_dir = tempfile.mkdtemp(prefix=f"{_PROFILE_PREFIX}{port}_",
+                                    dir=os.path.realpath(tempfile.gettempdir()))
+    proc = None
     try:
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                       capture_output=True, timeout=20)
-    except Exception:  # noqa: BLE001  关闭失败不影响主流程
-        pass
+        proc = subprocess.Popen([
+            chrome_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            "--incognito", "--new-window",
+            "--no-first-run", "--no-default-browser-check",
+            "--disable-session-crashed-bubble", "--disable-infobars",
+            "about:blank",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            time.sleep(0.5)
+            if (list_cdp_pages("localhost", port) and cdp_pages_are_incognito("localhost", port)
+                    and _owned_endpoint_pids(port, user_data_dir)):
+                print("[chrome] 无痕 Chrome 已就绪")
+                return True, user_data_dir
+        raise RuntimeError(f"端口 {port} 的 Chrome 未就绪或无法确认无痕模式，已停止本次启动。")
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        close_test_chrome(port, user_data_dir)
+        raise
+
+
+def close_test_chrome(port: int, user_data_dir: str = None) -> None:
+    """仅关闭本次 profile 的实例，再删除经过范围验证的临时目录。"""
+    profile = _validated_profile(port, user_data_dir)
+    if profile is None:  # 复用实例没有本次 profile，不承担它的关闭或清理。
+        return
+    if _close_owned_cdp(port, profile):
+        time.sleep(0.5)
+    processes = _chrome_processes()
+    if processes is None or _profile_processes(profile, processes):
+        _stop_profile_processes(profile)
+        for _ in range(10):
+            processes = _chrome_processes()
+            if processes is not None and not _profile_processes(profile, processes):
+                break
+            time.sleep(0.2)
+    if not _remove_profile(port, profile):
+        print("[chrome] 未能确认专用实例已退出或 profile 无法删除，保留该临时目录")
 
 
 def _live_step(step_no, decision, execution, state):
@@ -132,37 +301,39 @@ def main() -> int:
     height = args.height or sh
     print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
 
-    # 1) 确保 Chrome 带 remote debugging
-    started_chrome = ensure_chrome(args.browser_port, args.chrome)
-    time.sleep(2.0)  # 等 Chrome 窗口稳定
-
-    # 2) 模型（用 Logging 包装，每次决策/定位调用实时推送到 viz server，前端边跑边显示）
-    model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY")))
-    grounding = LoggingGrounding(UIVenus2Grounding(url=args.ground_url, api_key="EMPTY",
-                                                   model=args.ground_model, width=width, height=height))
-
-    # 3) 环境
-    env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
-                             downloads_dir=args.download_dir)
-
-    # 4) 组装 + 跑
-    agent = Agent(decision_model=model, grounding=grounding, env=env,
-                  max_steps=args.max_steps, enable_reflection=False,
-                  step_callback=_live_step)
-
-    if args.result_dir:
-        set_results_dir(args.result_dir)
-    reset_collected()
-    log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps})
-
-    print(f"\n===== 任务开始 =====\n{args.task}\n")
+    # 1) 确保 Chrome 带 remote debugging 且运行在无痕模式
+    started_chrome, chrome_profile = ensure_chrome(args.browser_port, args.chrome)
+    env = None
     try:
+        time.sleep(2.0)  # 等 Chrome 窗口稳定
+
+        # 2) 模型（Logging 实时推送到 viz server）
+        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY")))
+        grounding = LoggingGrounding(UIVenus2Grounding(url=args.ground_url, api_key="EMPTY",
+                                                       model=args.ground_model, width=width, height=height))
+
+        # 3) 环境
+        env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
+                                 downloads_dir=args.download_dir)
+
+        # 4) 组装 + 跑，保留 1010 的规划流水线
+        agent = Agent(decision_model=model, grounding=grounding, env=env,
+                      max_steps=args.max_steps, enable_reflection=False,
+                      step_callback=_live_step)
+        if args.result_dir:
+            set_results_dir(args.result_dir)
+        reset_collected()
+        log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps})
+        print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)
     finally:
-        env.close()
-        # 任务结束（无论成功/失败/异常）都关掉本次新建的测试 Chrome，避免窗口残留
-        if started_chrome:
-            close_test_chrome(args.browser_port)
+        try:
+            if env is not None:
+                env.close()
+        finally:
+            # 初始化、运行或环境关闭失败时，仍清理本次创建的实例。
+            if started_chrome:
+                close_test_chrome(args.browser_port, chrome_profile)
 
     # 通知前端任务结束（带结果），否则前端收不到 task_end 会把"已完成"误判成"异常终止"
     log_status({

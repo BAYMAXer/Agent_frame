@@ -183,6 +183,22 @@ class BrowserSession:
                 pass
 
     # ---- route ----
+    def _ref_hint(self, observation, limit=20):
+        """生成"当前可用元素编号"提示，帮模型从编造/过期的 ref 里纠正过来。"""
+        refs = observation.info.get("exposed_refs") or list(self.nodes.keys())
+        parts = []
+        for ref in refs:
+            n = self.nodes.get(ref)
+            if not n:
+                continue
+            name = (n.get("name") or "").strip()
+            role = n.get("role") or ""
+            if name:
+                parts.append(f"[{ref}] {role} '{name}'")
+            if len(parts) >= limit:
+                break
+        return "；".join(parts) if parts else "（无）"
+
     def route(self, action, observation):
         ref = action.args.get("target_ref")
         if not ref:
@@ -193,7 +209,11 @@ class BrowserSession:
         if not ref:
             return None
         if ref not in observation.info.get("exposed_refs", self.nodes):
-            return {"channel": "reobserve", "reason": "target_ref was not in the policy input"}
+            hint = self._ref_hint(observation)
+            return {"channel": "reobserve",
+                    "reason": f"target_ref '{ref}' 不在当前页面里，可能是编造或过期的编号。"
+                              f"当前页面可用的元素编号（部分）：{hint}。"
+                              f"请从中选一个正确的 ref，或改用 element_id / 英文 target。"}
         if not self.snapshot or ref not in self.nodes:
             return {"channel": "reobserve", "reason": "Unknown or stale target_ref"}
         if action.action not in {"click", "double_click", "right_click", "type", "select", "scroll"}:
@@ -339,7 +359,10 @@ class BrowserSession:
                     full = urljoin(self.snapshot.get("url", ""), node["href"])
                 except Exception:  # noqa: BLE001
                     full = node["href"]
-                if full.lower().endswith(".pdf") or ".pdf?" in full.lower() or ".pdf#" in full.lower():
+                _u = full.lower()
+                # PDF 链接判定：.pdf 后缀 / 查询/锚点参数 / 路径含 /pdf/（arXiv 的 /pdf/1706.03762 这类）
+                if (_u.endswith(".pdf") or ".pdf?" in _u or ".pdf#" in _u
+                        or "/pdf/" in _u or _u.endswith("/pdf")):
                     return self.download(full)
             if name == "type" and (not point["editable"] or point["readOnly"]):
                 raise BrowserActionError("Target is not editable")
@@ -434,6 +457,102 @@ class BrowserSession:
             except Exception:
                 pass
 
+    def screenshot(self):
+        """截当前页面 viewport（返回 PIL Image），不受其他窗口遮挡。"""
+        try:
+            p, browser = self._connect()
+        except Exception:
+            return None
+        try:
+            page = self._pick_page(browser)
+            if page is None:
+                return None
+            data = page.screenshot(full_page=False)
+            import io
+            from PIL import Image
+            return Image.open(io.BytesIO(data))
+        except Exception:
+            return None
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                p.stop()
+            except Exception:
+                pass
+
+    def viewport_size(self):
+        """返回当前页面 viewport 尺寸 (width, height)。"""
+        try:
+            p, browser = self._connect()
+        except Exception:
+            return None
+        try:
+            page = self._pick_page(browser)
+            if page is None:
+                return None
+            vp = page.evaluate("({w: innerWidth, h: innerHeight})")
+            return int(vp["w"]), int(vp["h"])
+        except Exception:
+            return None
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                p.stop()
+            except Exception:
+                pass
+
+    def click_at_viewport(self, action, vx, vy):
+        """视觉定位回退（浏览器 viewport 截图坐标系）：直接在 viewport 坐标处 CDP 虚拟点击/输入。
+
+        与 click_at_screen 的区别：坐标已经是 viewport 坐标（因为截图就是 viewport），
+        不再做屏幕→viewport 换算。
+        """
+        started, dispatched = time.perf_counter(), False
+        try:
+            p, browser = self._connect()
+        except Exception as exc:
+            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
+                    "resolved": "visual", "error": str(exc)[:200]}
+        try:
+            page = self._pick_page(browser)
+            if page is None:
+                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
+                        "resolved": "visual", "error": "No page"}
+            name = action.action
+            if name in ("click", "double_click", "right_click"):
+                page.mouse.click(vx, vy, button="right" if name == "right_click" else "left",
+                                 click_count=2 if name == "double_click" else 1)
+                dispatched = True
+            elif name == "type":
+                page.mouse.click(vx, vy)
+                if action.args.get("overwrite"):
+                    page.keyboard.press("ControlOrMeta+A")
+                    page.keyboard.press("Backspace")
+                page.keyboard.insert_text(str(action.args.get("text", "")))
+                dispatched = True
+            else:
+                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
+                        "resolved": "visual", "error": f"不支持的视觉动作 {name}"}
+            return {"status": "executed" if dispatched else "rejected", "dispatched": dispatched,
+                    "channel": "browser_dom", "resolved": "visual",
+                    "coord": [vx, vy], "coordinate_space": "css_viewport",
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                p.stop()
+            except Exception:
+                pass
+
     def download(self, url):
         """用 HTTP 下载文件（论文 PDF 等）到 downloads 目录，返回结果 dict。
 
@@ -480,6 +599,14 @@ class BrowserSession:
                     filename += ".html"
             os.makedirs(self.downloads_dir, exist_ok=True)
             path = os.path.join(self.downloads_dir, filename)
+            # 文件已存在 → 加后缀改名（xxx_1.pdf、xxx_2.pdf…），不覆盖旧下载
+            if os.path.exists(path):
+                base, ext = os.path.splitext(filename)
+                i = 1
+                while os.path.exists(os.path.join(self.downloads_dir, f"{base}_{i}{ext}")):
+                    i += 1
+                filename = f"{base}_{i}{ext}"
+                path = os.path.join(self.downloads_dir, filename)
             size = 0
             with open(path, "wb") as f:
                 for chunk in r.iter_content(65536):
