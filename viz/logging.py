@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import time
+import copy
+import hashlib
 
 import requests
 
@@ -54,6 +56,48 @@ def log_status(status: dict) -> None:
 def _new_log_id() -> int:
     _next_log_id[0] += 1
     return _next_log_id[0]
+
+
+def compact_messages(messages) -> list:
+    """Preserve model text and roles without duplicating inline image bytes in logs.
+
+    Image references retain their MIME type, encoded size and content hash. The
+    actual current screenshot is sent separately for the live screenshot cache.
+    """
+    result = copy.deepcopy(messages or [])
+    for message in result:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for part in message["content"]:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            image_url = part.get("image_url")
+            if not isinstance(image_url, dict):
+                continue
+            url = image_url.get("url", "")
+            if not isinstance(url, str) or not url.startswith("data:image/") or ";base64," not in url:
+                continue
+            header, encoded = url.split(",", 1)
+            digest = hashlib.sha256(encoded.encode("ascii", errors="replace")).hexdigest()
+            image_url["url"] = "image://" + digest
+            part["image_metadata"] = {
+                "mime_type": header[5:].split(";", 1)[0],
+                "base64_chars": len(encoded),
+                "sha256": digest,
+            }
+    return result
+
+
+def _model_metadata(model) -> dict:
+    call = getattr(model, "last_call", {})
+    call = call if isinstance(call, dict) else {}
+    cfg = getattr(model, "cfg", None)
+    name = (call.get("response_model") or call.get("model") or getattr(cfg, "name", None)
+            or getattr(model, "model", None))
+    return {key: copy.deepcopy(value) for key, value in {
+        "model": name, "usage": call.get("usage"), "generation": call.get("generation"),
+        "finish_reason": call.get("finish_reason"), "latency_ms": call.get("latency_ms"),
+    }.items() if value is not None}
 
 
 def _extract_last_user(messages) -> tuple:
@@ -133,17 +177,22 @@ class LoggingChatModel:
             log_status({"event": "step", "step": _step[0]})
         step = _step[0]
         log_id = _new_log_id()
+        compact = compact_messages(messages)
+        model_name = getattr(getattr(self.inner, "cfg", None), "name", None)
         _post({"kind": "model", "type": mtype, "prompt": text, "screenshot": screenshot,
+               "messages": compact, "model": model_name,
                "pending": True, "step": step, "id": log_id, "ts": time.time()})
         start = time.time()
         try:
             response = self.inner.chat(messages, retries, json_mode=json_mode)
         except Exception as exc:  # noqa: BLE001
             _post({"kind": "model", "type": mtype, "prompt": text, "screenshot": screenshot,
+                   "messages": compact, **_model_metadata(self.inner),
                    "response": str(exc)[:300], "step": step, "id": log_id, "error": True,
                    "elapsed": round(time.time() - start, 3), "ts": time.time()})
             raise
         _post({"kind": "model", "type": mtype, "prompt": text, "screenshot": screenshot,
+               "messages": compact, **_model_metadata(self.inner),
                "response": response, "step": step, "id": log_id,
                "elapsed": round(time.time() - start, 3), "ts": time.time()})
         if mtype == "decision":
@@ -213,12 +262,16 @@ class LoggingGrounding:
         b64 = url.split("base64,", 1)[-1] if "base64," in url else None
         log_id = _new_log_id()
         _post({"kind": "model", "type": "grounding", "prompt": target, "screenshot": b64,
+               "model": getattr(self.inner, "model", None),
                "pending": True, "step": _step[0], "id": log_id, "ts": time.time()})
         start = time.time()
         try:
             gr = self.inner.locate(screenshot, target)
         except Exception as exc:
+            details = self.last_call if isinstance(self.last_call, dict) else {}
             _post({"kind": "model", "type": "grounding", "prompt": target,
+                   "screenshot": b64, "messages": compact_messages(details.get("messages")),
+                   **_model_metadata(self.inner), "raw_response": details.get("response", ""),
                    "response": str(exc), "step": _step[0], "id": log_id, "error": True,
                    "elapsed": round(time.time() - start, 3), "ts": time.time()})
             raise
@@ -226,6 +279,7 @@ class LoggingGrounding:
         error = details.get("error")
         response = f"{gr.x}, {gr.y}" + (f"\n定位失败: {error}" if error else "")
         _post({"kind": "model", "type": "grounding", "prompt": target, "screenshot": b64,
+               "messages": compact_messages(details.get("messages")), **_model_metadata(self.inner),
                "response": response, "step": _step[0], "id": log_id,
                "elapsed": round(time.time() - start, 3), "ts": time.time(),
                "confidence": gr.confidence, "error": bool(error),

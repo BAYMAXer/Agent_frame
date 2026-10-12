@@ -169,7 +169,7 @@ def foreground_window():
     return user32.GetForegroundWindow()
 
 
-def activate_application(app_code: str, work_screen=None) -> dict:
+def activate_application(app_code: str, work_screen=None, *, allow_browsers=True) -> dict:
     """Activate exactly one matching window; never substitute a blind Alt+Tab."""
     if not app_code or not app_code.strip():
         return {"status": "rejected", "dispatched": False, "error": "缺少目标应用 app_code"}
@@ -182,6 +182,14 @@ def activate_application(app_code: str, work_screen=None) -> dict:
                 "error": f"目标应用有多个窗口，请用完整窗口标题指定: {app_code}",
                 "matching_titles": [window["title"] for window in candidates]}
     window = candidates[0]
+    if not allow_browsers and not window.get("executable"):
+        return {"status": "rejected", "dispatched": False,
+                "error": "无法确认目标应用进程身份，未激活该窗口"}
+    if not allow_browsers and window["executable"].casefold() in {
+            "chrome.exe", "chromium.exe", "msedge.exe", "firefox.exe", "brave.exe",
+            "opera.exe", "vivaldi.exe", "safari.exe", "iexplore.exe"}:
+        return {"status": "rejected", "dispatched": False,
+                "error": "浏览器窗口须通过 goto 启动或激活本任务的无痕实例"}
     hwnd = window["hwnd"]
     user32 = _load_user32()
     for name in ("IsIconic", "SetForegroundWindow"):

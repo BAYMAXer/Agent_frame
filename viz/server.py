@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import hashlib
+from collections import OrderedDict
 import subprocess
 import sys
 import threading
@@ -19,7 +22,10 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 import uvicorn
+
+from .logging import compact_messages
 
 app = FastAPI(title="osworld_agent Viz")
 
@@ -33,6 +39,7 @@ VM_PATH = os.getenv("OSWORLD_VM_PATH", "")
 RESULTS_DIR = os.getenv("AGENTS_RESULTS_DIR", str(_PKG / "viz" / "runs"))
 LOCAL_RUNS_DIR = os.getenv("OSWORLD_LOCAL_RUNS_DIR", str(_PKG / "local_runs"))
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 
 def _runner_python() -> str:
@@ -78,6 +85,53 @@ def _detect_vm_path() -> str:
 MAX_LOGS = 200
 logs = []
 clients = []
+MAX_LIVE_SHOTS = 40
+MAX_LIVE_SHOT_BYTES = 32 * 1024 * 1024
+_live_shots = OrderedDict()
+_live_shot_bytes = 0
+
+
+def _cache_live_screenshot(encoded):
+    """Content-address recent screenshot bytes and keep memory use bounded."""
+    global _live_shot_bytes
+    if not isinstance(encoded, str) or not encoded:
+        return None
+    if encoded.startswith("data:image/") and ";base64," in encoded:
+        encoded = encoded.split(",", 1)[1]
+    if len(encoded) > (MAX_LIVE_SHOT_BYTES * 4 // 3 + 4):
+        return None
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if not data or len(data) > MAX_LIVE_SHOT_BYTES:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        mime = "image/png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+    elif data[:6] in (b"GIF87a", b"GIF89a"):
+        mime = "image/gif"
+    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        return None
+    token = hashlib.sha256(data).hexdigest()
+    if token in _live_shots:
+        _live_shots.move_to_end(token)
+        return "/live/shot/" + token
+    _live_shots[token] = (data, mime)
+    _live_shot_bytes += len(data)
+    while len(_live_shots) > MAX_LIVE_SHOTS or _live_shot_bytes > MAX_LIVE_SHOT_BYTES:
+        _, (old_data, _) = _live_shots.popitem(last=False)
+        _live_shot_bytes -= len(old_data)
+    return "/live/shot/" + token
+
+
+def _clear_live_screenshots():
+    global _live_shot_bytes
+    _live_shots.clear()
+    _live_shot_bytes = 0
 
 # 内网模型端点直连，不走华为 HIS 代理
 _no_proxy = os.environ.get("NO_PROXY", "")
@@ -133,7 +187,19 @@ async def receive_log(request: Request):
         payload = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "log payload must be an object"}
+    return await _publish_log(payload)
+
+
+async def _publish_log(payload: dict):
+    """Publish runner and server lifecycle events through the same live history."""
     payload.setdefault("ts", time.time())
+    if isinstance(payload.get("messages"), list):
+        payload["messages"] = compact_messages(payload["messages"])
+    screenshot_url = _cache_live_screenshot(payload.get("screenshot"))
+    if screenshot_url:
+        payload["screenshot_url"] = screenshot_url
     stored = dict(payload)
     stored.pop("screenshot", None)  # 存日志去掉截图 base64，省内存
     logs.append(stored)
@@ -175,6 +241,30 @@ async def history():
     # snapshot available without growing the log buffer indefinitely.
     return {"logs": logs, "task_start": _agent_state.get("task_start"),
             "plan_update": _agent_state.get("plan_update")}
+
+
+@app.get("/live/shot/{token}")
+async def live_shot(token: str):
+    shot = _live_shots.get(token)
+    if shot is None:
+        return Response(status_code=404)
+    data, mime = shot
+    return Response(content=data, media_type=mime,
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.get("/capabilities")
+async def capabilities():
+    return {
+        "run_modes": ["local", "vm"],
+        "local": {"task_text": True, "timeouts": ["model_timeout", "ground_timeout", "step_timeout"]},
+        "model_io": {"messages": True, "image_metadata": True, "usage": True,
+                     "grounding_raw_response": True},
+        "live_screenshots": {"max_count": MAX_LIVE_SHOTS, "max_bytes": MAX_LIVE_SHOT_BYTES,
+                             "volatile": True},
+        "features": {"experiments": False, "manual_eval": False, "debug_replay": False,
+                     "debug_chat": True},
+    }
 
 
 @app.websocket("/ws")
@@ -514,7 +604,7 @@ def _start_local(cfg: dict):
     cfg = {**cfg, "result_dir": result_dir}
 
     cmd = [
-        _runner_python(), str(_PKG / "run_windows_local.py"),
+        _runner_python(), str(_PKG / "launch.py"), "--runner", "local",
         "--task", task,
         "--model", model,
         "--model-url", model_url,
@@ -549,6 +639,7 @@ def _start_local(cfg: dict):
     _agent_state["status"] = "starting"
     _clear_plan_state()
     logs.clear()
+    _clear_live_screenshots()
     try:
         proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -632,6 +723,7 @@ async def start_run(request: Request):
     _agent_state["status"] = "starting"
     _clear_plan_state()
     logs.clear()
+    _clear_live_screenshots()
     try:
         proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -666,6 +758,10 @@ async def run_status():
 @app.post("/run/stop")
 async def stop_run():
     proc = _agent_state["proc"]
+    was_running = (_agent_state.get("status") in {"running", "starting"}
+                   or (proc is not None and proc.poll() is None))
+    stopped_task = _agent_state.get("task_name")
+    stopped_step = _agent_state.get("current_step", 0)
     if proc and proc.poll() is None:
         try:
             command = ["taskkill"]
@@ -706,6 +802,10 @@ async def stop_run():
     _agent_state["status"] = "idle"
     _agent_state["proc"] = None
     _agent_state["task_name"] = None
+    if was_running:
+        await _publish_log({"kind": "status", "event": "interrupted", "status": "interrupted",
+                            "step": stopped_step, "task": stopped_task,
+                            "error": "运行已手动停止，未完成的调用和动作已中断。"})
     return {"ok": True}
 
 

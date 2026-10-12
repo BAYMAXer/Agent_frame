@@ -10,7 +10,10 @@
 """
 from __future__ import annotations
 
+import ctypes
+import ntpath
 import platform
+import socket
 import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
@@ -147,6 +150,112 @@ def _foreground_linux_mac() -> bool:
         return False
 
 
+class _MIB_TCPROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "dwState", "dwLocalAddr", "dwLocalPort", "dwRemoteAddr", "dwRemotePort", "dwOwningPid")]
+
+
+class _MIB_TCP6ROW_OWNER_PID(ctypes.Structure):
+    _fields_ = [("ucLocalAddr", ctypes.c_ubyte * 16),
+                ("dwLocalScopeId", ctypes.c_uint32), ("dwLocalPort", ctypes.c_uint32),
+                ("ucRemoteAddr", ctypes.c_ubyte * 16),
+                ("dwRemoteScopeId", ctypes.c_uint32), ("dwRemotePort", ctypes.c_uint32),
+                ("dwState", ctypes.c_uint32), ("dwOwningPid", ctypes.c_uint32)]
+
+
+def _windows_foreground_identity():
+    """Return (full-width HWND, PID, executable) or None; never infer ownership by title."""
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                                   ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return None
+    pid = ctypes.c_uint32()
+    if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
+        return None
+    process = kernel32.OpenProcess(0x1000, 0, pid.value)
+    if not process:
+        return None
+    try:
+        path = ctypes.create_unicode_buffer(32768)
+        length = ctypes.c_uint32(len(path))
+        if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length)):
+            return None
+        return hwnd, pid.value, ntpath.basename(path.value).casefold()
+    finally:
+        kernel32.CloseHandle(process)
+
+
+def _tcp_listener_pids(port: int):
+    """Read IPv4 and IPv6 LISTEN owners using IP Helper; None means unknown.
+
+    DWORD stays 32 bits on Win64. Ports are network-order 16-bit values stored in
+    DWORDs. TCP_TABLE_OWNER_PID_LISTENER is enum value 3 (Microsoft IP Helper).
+    """
+    iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    query = iphlpapi.GetExtendedTcpTable
+    query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
+                      ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    query.restype = ctypes.c_uint32
+    owners = set()
+    for family, row_type in ((2, _MIB_TCPROW_OWNER_PID), (23, _MIB_TCP6ROW_OWNER_PID)):
+        size = ctypes.c_uint32()
+        if query(None, ctypes.byref(size), False, family, 3, 0) != 122:
+            return None
+        # The table may grow between the sizing and data calls. Retry boundedly.
+        for _ in range(3):
+            if not 4 <= size.value <= 16 * 1024 * 1024:
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            allocated = size.value
+            result = query(buffer, ctypes.byref(size), False, family, 3, 0)
+            if result == 122:
+                continue
+            if result != 0 or not 4 <= size.value <= allocated:
+                return None
+            count = ctypes.c_uint32.from_buffer(buffer).value
+            # OWNER_PID rows have DWORD alignment, so table[0] follows the DWORD count.
+            if 4 + count * ctypes.sizeof(row_type) > size.value:
+                return None
+            for index in range(count):
+                row = row_type.from_buffer(buffer, 4 + index * ctypes.sizeof(row_type))
+                if row.dwState == 2 and socket.ntohs(row.dwLocalPort & 0xFFFF) == port:
+                    if not row.dwOwningPid:
+                        return None
+                    owners.add(row.dwOwningPid)
+            break
+        else:
+            return None
+    return owners
+
+
+def foreground_browser_matches_port(port: int = 9222) -> bool:
+    """Only accept a foreground Chrome whose PID uniquely owns this CDP port."""
+    try:
+        port = int(port)
+        if platform.system().lower() != "windows" or not 1 <= port <= 65535:
+            return False
+        before = _windows_foreground_identity()
+        if before is None or before[2] != "chrome.exe":
+            return False
+        owners = _tcp_listener_pids(port)
+        after = _windows_foreground_identity()
+        return before == after and owners == {before[1]}
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # CDP 探测 + 抓取
 # --------------------------------------------------------------------------- #
@@ -184,6 +293,20 @@ def _connect_browser(host: str, port: int):
         raise
 
 
+def _browser_pages_are_incognito(browser) -> bool:
+    """核验当前 CDP 连接的页面上下文；普通、混合或未知模式均拒绝。"""
+    try:
+        cdp = browser.new_browser_cdp_session()
+        default_id = cdp.send("Target.getBrowserContexts").get("defaultBrowserContextId")
+        pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
+                 if target.get("type") == "page"]
+        return bool(default_id and pages) and all(
+            target.get("browserContextId") and target["browserContextId"] != default_id
+            for target in pages)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def cdp_pages_are_incognito(host: str, port: int = 9222) -> bool:
     """仅在 CDP 能确认所有页面都属于无痕上下文时，允许复用浏览器。
 
@@ -195,15 +318,7 @@ def cdp_pages_are_incognito(host: str, port: int = 9222) -> bool:
     except Exception:  # noqa: BLE001
         return False
     try:
-        cdp = browser.new_browser_cdp_session()
-        default_id = cdp.send("Target.getBrowserContexts").get("defaultBrowserContextId")
-        pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
-                 if target.get("type") == "page"]
-        return bool(default_id and pages) and all(
-            target.get("browserContextId") and target["browserContextId"] != default_id
-            for target in pages)
-    except Exception:  # noqa: BLE001
-        return False
+        return _browser_pages_are_incognito(browser)
     finally:
         try:
             browser.close()

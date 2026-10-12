@@ -4,7 +4,7 @@
 - 观察：pyautogui 截图 + browser_ax 快照（焦点在浏览器时经 BrowserSession 抓取）；
 - 执行：桌面 GUI 动作（click/type/hotkey 等）走 pyautogui（坐标定位）；
         浏览器 DOM 动作（带 target_ref / 语义兜底命中）走 CDP（DOM 定位，跳过视觉定位）；
-- 焦点检测走 Windows GetForegroundWindow。
+- 浏览器焦点同时核对 Windows 前台窗口 PID 与本任务的 CDP 调试端口。
 
 与 VMwareEnvironment 的对齐点：browser_ax 快照进 context、target_ref 路由 + 语义兜底、
 execute_routed 走 CDP。差异点：截图用 pyautogui、CDP host 是 localhost、桌面无 AT-SPI。
@@ -42,9 +42,10 @@ class WindowsEnvironment(Environment):
         self.width = width
         self.height = height
         self.os_name = "windows"
-        self.browser_only = False  # 同时支持桌面任务；browser use 由当前焦点决定
+        self.browser_only = False  # 同时支持桌面任务；browser use 仅限已核验的无痕实例
         self.downloads_dir = downloads_dir
         self._browser_launcher = browser_launcher
+        self._browser_ready = False
         self._browser_session = None
         self._screenshot_is_viewport = False
         self.action_settle_seconds = max(0.0, float(action_settle_seconds))
@@ -119,12 +120,38 @@ class WindowsEnvironment(Environment):
         return Action(action.action, args)
 
     def _focus_is_browser(self) -> bool:
-        """仅当前台活动窗口是浏览器时进入 browser use。"""
-        from ..utils import detect_foreground_browser
+        """仅已核验的无痕端口所属窗口在前台时进入 browser use。"""
+        from ..utils import foreground_browser_matches_port
         try:
-            return detect_foreground_browser("windows")
+            return self._browser_ready and foreground_browser_matches_port(self.browser_port)
         except Exception:  # noqa: BLE001
             return False
+
+    def _unmanaged_browser_has_focus(self) -> bool:
+        """个人浏览器不作为桌面输入兜底目标。"""
+        from ..utils import detect_foreground_browser
+        return detect_foreground_browser("windows") and not self._focus_is_browser()
+
+    def _ensure_browser_ready(self):
+        """明确导航时始终启动/复用并核验目标，不依赖任意浏览器焦点。"""
+        from ..utils import cdp_pages_are_incognito
+        try:
+            if self._browser_launcher is not None:
+                self._browser_launcher()
+            else:
+                from ..run_windows_local import CHROME_DEFAULT, ensure_chrome
+                ensure_chrome(self.browser_port, CHROME_DEFAULT)
+            if not cdp_pages_are_incognito("localhost", self.browser_port):
+                raise RuntimeError(f"调试端口 {self.browser_port} 无法确认是无痕浏览器；"
+                                   "请关闭该调试浏览器或更换 --browser-port")
+            self._browser_ready = True
+        except BaseException:
+            self._revoke_browser_ready()
+            raise
+
+    def _revoke_browser_ready(self):
+        self._browser_ready = False
+        self._invalidate_browser_snapshot()
 
     def _get_browser_session(self):
         """懒加载 BrowserSession；网页和前台窗口都必须聚焦才能进行 CDP 操作。"""
@@ -132,9 +159,10 @@ class WindowsEnvironment(Environment):
             from ..browser_session import BrowserSession, BrowserOptions
             self._browser_session = BrowserSession(
                 options=BrowserOptions(endpoint=f"http://localhost:{self.browser_port}",
-                                       require_focus=True),
+                                       require_focus=True, require_incognito=True),
                 foreground_check=self._focus_is_browser,
                 downloads_dir=self.downloads_dir,
+                incognito_failure_callback=self._revoke_browser_ready,
             )
         return self._browser_session
 
@@ -211,6 +239,10 @@ class WindowsEnvironment(Environment):
         流程：DOM（element_id / target_ref / 语义匹配）→ 命中走 CDP；都没命中返回 None，
         交给 pipeline 用 grounding 模型定坐标，再由 step() 用 CDP 虚拟坐标点击（仍不动真实鼠标）。
         """
+        url = self._address_bar_url(action)
+        if action.action == "goto" or url:
+            return {"channel": "browser_dom", "goto_url": url or action.args.get("url"),
+                    "coordinate_space": "css_viewport"}
         if obs is None:
             return None
         info = obs.info if isinstance(obs.info, dict) else {}
@@ -223,6 +255,9 @@ class WindowsEnvironment(Environment):
             if scene.get("browser_use") == 1:
                 return {"channel": "reobserve", "reason": "浏览器已失去焦点，需重新观察当前应用",
                         "refresh_observation": True}
+            if self._unmanaged_browser_has_focus():
+                return {"channel": "reobserve", "refresh_observation": True,
+                        "reason": "当前前台浏览器不是本任务的无痕实例；请使用 goto 启动或激活目标浏览器"}
             return None
         if (action.action not in self._BROWSER_CDP_ACTIONS
                 or scene.get("browser_use") != 1
@@ -281,6 +316,8 @@ class WindowsEnvironment(Environment):
 
     def execute_routed(self, action, route):
         """执行已路由的 browser_dom 动作：goto / DOM(ref) / scroll/press/hotkey 全部走 CDP。"""
+        if action.action == "goto" or route.get("goto_url"):
+            return self._navigate(str(action.args.get("url") or route.get("goto_url") or ""))
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
         session = self._get_browser_session()
@@ -290,13 +327,7 @@ class WindowsEnvironment(Environment):
                                     "channel": "browser_dom", "error": "Browser session unavailable"})
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
-        if action.action == "goto" or route.get("goto_url"):
-            if not self._position_browser_on_work_screen():
-                return StepResult(observation=self._fresh_obs_after_action(),
-                                  info={"status": "rejected", "dispatched": False, "action": "goto",
-                                        "error": "无法将目标浏览器窗口放到主屏工作区，需重新观察"})
-            result = session.goto(str(action.args.get("url") or route.get("goto_url")))
-        elif action.action in ("scroll", "press", "hotkey"):
+        if action.action in ("scroll", "press", "hotkey"):
             result = session.execute_target(action, None)
         elif route.get("target_ref"):
             result = session.execute(action, route)
@@ -331,49 +362,40 @@ class WindowsEnvironment(Environment):
         return self._build_observation()
 
     def _navigate(self, url: str) -> StepResult:
-        """访问网址才按需启动/激活；启动后仍按前台焦点决定能否操作浏览器。"""
+        """所有导航统一核验无痕实例；CDP 失败不向个人窗口发送原生输入。"""
         url = (url or "").strip()
         if not url:
             return StepResult(observation=self._build_observation(),
                               info={"status": "rejected", "dispatched": False,
                                     "action": "goto", "error": "empty url"})
-        if not self._focus_is_browser():
-            try:
-                if self._browser_launcher is not None:
-                    self._browser_launcher()
-                else:
-                    from ..run_windows_local import CHROME_DEFAULT, ensure_chrome
-                    ensure_chrome(self.browser_port, CHROME_DEFAULT)
-                session = self._get_browser_session()
-                if session is not None:
-                    session.activate()
-            except Exception as exc:  # noqa: BLE001
-                return StepResult(observation=self._build_observation(),
-                                  info={"status": "rejected", "dispatched": False,
-                                        "action": "goto", "error": f"浏览器启动失败: {exc}"})
+        try:
+            self._ensure_browser_ready()
+            session = self._get_browser_session()
+            if session is None:
+                raise RuntimeError("Browser session unavailable")
+            if not self._focus_is_browser() and not session.activate():
+                return self._browser_focus_rejected()
+        except Exception as exc:  # noqa: BLE001
+            return StepResult(observation=self._build_observation(),
+                              info={"status": "rejected", "dispatched": False,
+                                    "channel": "browser_dom", "action": "goto",
+                                    "error": f"无痕浏览器准备失败: {exc}"})
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
         if not self._position_browser_on_work_screen():
             return StepResult(observation=self._build_observation(),
                               info={"status": "rejected", "dispatched": False, "action": "goto",
                                     "error": "无法将目标浏览器窗口放到主屏工作区，需重新观察"})
-        session = self._get_browser_session()
-        if not self._focus_is_browser():
-            return self._browser_focus_rejected()
-        if session is not None:
-            result = session.goto(url)
-            if result.get("status") != "rejected" or result.get("dispatched"):
-                return StepResult(observation=self._build_observation(), info=dict(result))
-        # 已聚焦的普通浏览器可能没有 CDP，或焦点在地址栏；用原生 GUI 导航。
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
         try:
-            exec(to_pyautogui(Action("goto", {"url": url})), {"__name__": "__main__"})  # noqa: S102
-            result = {"status": "executed", "dispatched": True, "action": "goto", "url": url}
+            result = session.goto(url)
         except Exception as exc:  # noqa: BLE001
+            # 意外异常时不确认是否已经发送导航，禁止原生输入重试。
             result = {"status": "uncertain", "dispatched": True,
-                      "action": "goto", "error": f"浏览器导航异常: {exc}"}
-        return StepResult(observation=self._build_observation(), info=result)
+                      "error": f"CDP 导航异常: {exc}"}
+        return StepResult(observation=self._build_observation(),
+                          info={"channel": "browser_dom", "action": "goto", **dict(result)})
 
     def step(self, action: Action) -> StepResult:
         name = action.action
@@ -384,6 +406,9 @@ class WindowsEnvironment(Environment):
             })
         if name == "goto":
             return self._navigate(str(action.args.get("url") or ""))
+        url = self._address_bar_url(action)
+        if url:
+            return self._navigate(url)
         spec = get_action_spec(name)
         kind = spec.kind if spec else "env"
 
@@ -441,14 +466,21 @@ class WindowsEnvironment(Environment):
                 "status": "rejected", "dispatched": False,
                 "error": action.args.get("grounding_error") or "视觉定位失败，动作未执行",
             })
+        if (name in ("click", "double_click", "right_click", "type", "select", "press",
+                     "hotkey", "scroll", "drag_and_drop") and self._unmanaged_browser_has_focus()):
+            return self._desktop_step_result(action, {
+                "status": "rejected", "dispatched": False,
+                "error": "当前前台浏览器不是本任务的无痕实例，未发送输入；请先使用 goto 激活目标浏览器",
+            })
         dispatched = False
         try:
             if name == "switch_applications":
                 app_code = str(action.args.get("app_code") or "")
                 if self.work_screen and self.work_screen.detected and self.work_screen.monitor_count > 1:
-                    info = activate_application(app_code, work_screen=self.work_screen)
+                    info = activate_application(app_code, work_screen=self.work_screen,
+                                                allow_browsers=False)
                 else:
-                    info = activate_application(app_code)
+                    info = activate_application(app_code, allow_browsers=False)
                 return self._desktop_step_result(action, info)
             action = self._desktop_action(action)
             if (name == "scroll" and self.work_screen and self.work_screen.detected
@@ -471,6 +503,11 @@ class WindowsEnvironment(Environment):
                 import pyautogui
                 dispatched = True
                 pyautogui.click(int(x), int(y))
+                if self._unmanaged_browser_has_focus():
+                    return self._desktop_step_result(action, {
+                        "status": "uncertain", "dispatched": True,
+                        "error": "点击后焦点转到非本任务浏览器，未发送后续输入；请使用 goto 激活无痕实例",
+                    })
                 if name == "type":
                     if action.args.get("overwrite"):
                         pyautogui.hotkey("ctrl", "a")
@@ -478,6 +515,11 @@ class WindowsEnvironment(Environment):
                     write_text(str(action.args.get("text", "")), gui=pyautogui)
                 else:
                     time.sleep(0.5)  # 等下拉框打开后再输入选项。
+                    if self._unmanaged_browser_has_focus():
+                        return self._desktop_step_result(action, {
+                            "status": "uncertain", "dispatched": True,
+                            "error": "输入前焦点转到非本任务浏览器，未发送选项和回车",
+                        })
                     write_text(str(action.args.get("option", "")), gui=pyautogui)
                     pyautogui.press("enter")
             else:
@@ -511,8 +553,8 @@ class WindowsEnvironment(Environment):
     def get_page_source(self) -> str:
         if not self._focus_is_browser():
             return "当前焦点不在浏览器（可能正在操作其他应用），无需抓取页面源码"
-        from .. import utils
-        html = utils.fetch_page_source("localhost", self.browser_port)
+        session = self._get_browser_session()
+        html = session.get_page_source() if session is not None else ""
         return html or "获取页面源码失败（Chrome 可能未开 remote debugging）"
 
     # ---- 终端 / Python ----
@@ -548,6 +590,7 @@ class WindowsEnvironment(Environment):
         return 0.0
 
     def close(self) -> None:
+        self._browser_ready = False
         if self._browser_session is not None:
             try:
                 self._browser_session.close()

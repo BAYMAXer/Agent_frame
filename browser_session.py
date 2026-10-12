@@ -35,14 +35,17 @@ class BrowserOptions:
     max_nodes: int = 4000
     max_snapshot_age: float = 180.0
     require_focus: bool = True   # True=只选择聚焦页面；普通桌面/浏览器混合任务保持 True
+    require_incognito: bool = False  # Windows 本地受管会话每次连接都核验无痕上下文
 
 
 class BrowserSession:
     """每次操作临时连接 CDP，用完即关（避免 playwright asyncio loop 跨调用冲突）。"""
 
-    def __init__(self, options=None, foreground_check=None, downloads_dir=None):
+    def __init__(self, options=None, foreground_check=None, downloads_dir=None,
+                 incognito_failure_callback=None):
         self.options = options or BrowserOptions()
         self.foreground_check = foreground_check
+        self.incognito_failure_callback = incognito_failure_callback
         self.downloads_dir = downloads_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "downloads")
         self.snapshot = None
@@ -53,10 +56,32 @@ class BrowserSession:
     def _connect(self):
         from playwright.sync_api import sync_playwright
         p = sync_playwright().start()
+        browser = None
         try:
             browser = p.chromium.connect_over_cdp(self.options.endpoint, timeout=self.options.timeout_ms)
+            if self.options.require_incognito:
+                from .utils import _browser_pages_are_incognito
+                try:
+                    if not _browser_pages_are_incognito(browser):
+                        raise BrowserActionError("无法确认调试浏览器仅包含无痕页面，拒绝接入")
+                except Exception:
+                    self.invalidate()
+                    if self.incognito_failure_callback is not None:
+                        try:
+                            self.incognito_failure_callback()
+                        except Exception:
+                            pass
+                    raise
         except Exception:
-            p.stop()
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            try:
+                p.stop()
+            except Exception:
+                pass
             raise
         return p, browser
 
@@ -96,6 +121,21 @@ class BrowserSession:
             return self._focused_page(browser)
         return self._any_page(browser)
 
+    @staticmethod
+    def _visible_page(browser):
+        """唯一可见标签页；多个可见窗口时不任意选择。"""
+        visible = []
+        for ctx in browser.contexts:
+            for page in ctx.pages:
+                if page.url.startswith(("devtools://", "chrome-extension://")):
+                    continue
+                try:
+                    if page.evaluate("document.visibilityState === 'visible'"):
+                        visible.append(page)
+                except Exception:
+                    continue
+        return visible[0] if len(visible) == 1 else None
+
     def activate(self):
         """显式访问网址时激活浏览器；普通观察不会调用或改变焦点。"""
         try:
@@ -105,18 +145,7 @@ class BrowserSession:
         try:
             page = self._focused_page(browser)
             if page is None:
-                visible = []
-                for ctx in browser.contexts:
-                    for candidate in ctx.pages:
-                        if candidate.url.startswith(("devtools://", "chrome-extension://")):
-                            continue
-                        try:
-                            if candidate.evaluate("document.visibilityState === 'visible'"):
-                                visible.append(candidate)
-                        except Exception:
-                            continue
-                # 多个窗口都可见时无法确定目标，交给重新观察，不任意选页面。
-                page = visible[0] if len(visible) == 1 else None
+                page = self._visible_page(browser)
             if page is None:
                 return False
             page.bring_to_front()
@@ -478,6 +507,13 @@ class BrowserSession:
                     "error": str(exc)[:200]}
         try:
             page = self._pick_page(browser)
+            if (page is None and self.options.require_incognito and self.foreground_check
+                    and self.foreground_check()):
+                # 明确导航可在已核验无痕窗口的地址栏聚焦时，通过 CDP 操作唯一可见页。
+                # 点击、输入及观察仍要求 document.hasFocus，不能混用 chrome UI 坐标。
+                page = self._visible_page(browser)
+                if not self.foreground_check():
+                    page = None
             if page is None:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "error": "No page"}
@@ -488,6 +524,36 @@ class BrowserSession:
         except Exception as exc:
             return {"status": "uncertain", "dispatched": False, "channel": "browser_dom",
                     "error": str(exc)[:300]}
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                p.stop()
+            except Exception:
+                pass
+
+    def get_page_source(self, max_chars=20000):
+        """读取当前焦点页面；使用同一连接的无痕核验，不回退到其他标签页。"""
+        try:
+            p, browser = self._connect()
+        except Exception:
+            return ""
+        try:
+            page = self._pick_page(browser)
+            if page is None:
+                return ""
+            if self.foreground_check and not self.foreground_check():
+                self.invalidate()
+                return ""
+            html = page.content()
+            if self.foreground_check and not self.foreground_check():
+                self.invalidate()
+                return ""
+            return html[:max(0, int(max_chars))]
+        except Exception:
+            return ""
         finally:
             try:
                 browser.close()

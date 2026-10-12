@@ -6,8 +6,9 @@
     python run_windows_local.py --task "用谷歌学术(scholar.google.com)搜索 'attention is all you need'，告诉我第一个搜索结果"
 
 说明：
-- 仅在执行访问网址的动作且当前焦点不在浏览器时，启动或复用带 remote-debugging 的无痕 Chrome；
-- browser use 根据前台焦点判断；任务结束后保留浏览器窗口及页面；
+- 执行访问网址的动作时，始终启动或核验带 remote-debugging 的无痕 Chrome；
+- browser use 仅操作已核验调试端口所属的前台窗口；CDP 失败不向个人浏览器发送导航输入；
+- 任务结束后保留浏览器窗口及页面；
 - 模型默认走 189 的决策(9028) + grounding(8001)，可用 --model-url / --ground-url 覆盖；
 - 屏幕分辨率自动检测（grounding 按它换算坐标），也可用 --width/--height 覆盖；
 - 运行时会【真】控制你的鼠标键盘，跑的时候别动鼠标。
