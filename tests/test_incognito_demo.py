@@ -1,4 +1,4 @@
-"""演示入口共享无痕生命周期，导航异常也只关闭自行创建的实例。"""
+"""演示完成或导航异常都保留浏览器，仅释放会话资源。"""
 from unittest.mock import Mock
 
 import pytest
@@ -8,7 +8,7 @@ from osworld_agent import demo_browser_windows as demo
 
 @pytest.mark.parametrize("started", [True, False])
 @pytest.mark.parametrize("navigation_ok", [True, False])
-def test_demo_keeps_reused_browser_and_cleans_own_browser(monkeypatch, started, navigation_ok):
+def test_demo_keeps_browser_and_releases_session(monkeypatch, started, navigation_ok):
     profile = "owned-profile" if started else None
     ensure = Mock(return_value=(started, profile))
     close = Mock()
@@ -16,7 +16,7 @@ def test_demo_keeps_reused_browser_and_cleans_own_browser(monkeypatch, started, 
     session.goto.return_value = ({"status": "executed"} if navigation_ok
                                  else {"status": "rejected", "error": "navigation failed"})
     monkeypatch.setattr(demo, "ensure_chrome", ensure)
-    monkeypatch.setattr(demo, "close_test_chrome", close)
+    monkeypatch.setattr(demo, "close_test_chrome", close, raising=False)
     monkeypatch.setattr(demo, "BrowserSession", Mock(return_value=session))
     monkeypatch.setattr(demo.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(demo, "detect_foreground_browser", lambda _os: False)
@@ -32,7 +32,5 @@ def test_demo_keeps_reused_browser_and_cleans_own_browser(monkeypatch, started, 
 
     ensure.assert_called_once_with(demo.PORT, demo.CHROME)
     session.goto.assert_called_once_with(demo.URL)
-    if started:
-        close.assert_called_once_with(demo.PORT, profile)
-    else:
-        close.assert_not_called()
+    session.close.assert_called_once_with()
+    close.assert_not_called()

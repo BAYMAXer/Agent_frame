@@ -62,7 +62,7 @@ actions:
 
   goto:
     params: [url]
-    description: "浏览器打开网址（url）"
+    description: "仅当任务需要访问网站时，浏览器打开网址（url）；Windows 本机按需启动或激活浏览器"
     kind: env
     resolve: none
 

@@ -6,7 +6,8 @@
     python run_windows_local.py --task "用谷歌学术(scholar.google.com)搜索 'attention is all you need'，告诉我第一个搜索结果"
 
 说明：
-- 会自动启动一个带 remote-debugging 的无痕 Chrome（端口 9222），仅复用已确认的无痕实例；
+- 仅在执行访问网址的动作且当前焦点不在浏览器时，启动或复用带 remote-debugging 的无痕 Chrome；
+- browser use 根据前台焦点判断；任务结束后保留浏览器窗口及页面；
 - 模型默认走 189 的决策(9028) + grounding(8001)，可用 --model-url / --ground-url 覆盖；
 - 屏幕分辨率自动检测（grounding 按它换算坐标），也可用 --width/--height 覆盖；
 - 运行时会【真】控制你的鼠标键盘，跑的时候别动鼠标。
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -31,8 +33,10 @@ if _parent not in sys.path:
 from osworld_agent.config import ModelConfig          # noqa: E402
 from osworld_agent.model import ChatModel             # noqa: E402
 from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
+from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
 from osworld_agent.adapters.windows_env import WindowsEnvironment        # noqa: E402
 from osworld_agent.agent import Agent                 # noqa: E402
+from osworld_agent.run_recording import LocalRunRecorder  # noqa: E402
 from osworld_agent.viz.logging import (LoggingChatModel, LoggingGrounding,  # noqa: E402
                                        set_results_dir, log_status, reset_collected)
 
@@ -281,18 +285,26 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="Windows 本地手动任务运行器")
     parser.add_argument("--task", required=True, help="自由文本任务描述")
-    parser.add_argument("--model", default="Qwen3.5-9B")
-    parser.add_argument("--model-url", default="http://7.246.80.189:9028/v1")
-    parser.add_argument("--ground-model", default="UI-Venus-2-9B")
-    parser.add_argument("--ground-url", default="http://7.246.80.189:8001/v1")
+    parser.add_argument("--model", default=os.getenv("OSWORLD_LOCAL_MODEL", "Qwen3.5-9B"))
+    parser.add_argument("--model-url", default=os.getenv("OSWORLD_LOCAL_MODEL_URL", "http://7.246.80.189:9028/v1"))
+    parser.add_argument("--ground-model", default=os.getenv("OSWORLD_LOCAL_GROUND_MODEL", "UI-Venus-2-9B"))
+    parser.add_argument("--ground-url", default=os.getenv("OSWORLD_LOCAL_GROUND_URL", "http://7.246.80.189:8001/v1"))
+    parser.add_argument("--ground-type", choices=("ui-venus2", "ui-tars"),
+                        default=os.getenv("OSWORLD_LOCAL_GROUND_TYPE", "ui-venus2"))
+    parser.add_argument("--model-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_MODEL_TIMEOUT", "60")))
+    parser.add_argument("--ground-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_GROUND_TIMEOUT", "60")))
+    parser.add_argument("--step-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_STEP_TIMEOUT", "120")))
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
     parser.add_argument("--chrome", default=CHROME_DEFAULT)
     parser.add_argument("--download-dir", default=None, help="下载目录（缺省为 osworld_agent/downloads）")
-    parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省不落盘）")
+    parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省自动保存到 local_runs）")
     args = parser.parse_args()
+    if any(value <= 0 or not math.isfinite(value)
+           for value in (args.model_timeout, args.ground_timeout, args.step_timeout)):
+        parser.error("模型、定位及每步超时必须为有限正数")
 
     # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
     import pyautogui
@@ -301,39 +313,62 @@ def main() -> int:
     height = args.height or sh
     print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
 
-    # 1) 确保 Chrome 带 remote debugging 且运行在无痕模式
-    started_chrome, chrome_profile = ensure_chrome(args.browser_port, args.chrome)
+    if not args.result_dir:
+        base = os.getenv("OSWORLD_LOCAL_RUNS_DIR", os.path.join(_here, "local_runs"))
+        args.result_dir = os.path.join(base, "local_" + time.strftime("%Y%m%d_%H%M%S")
+                                      + "_" + str(time.time_ns() % 1_000_000_000))
+    recorder = LocalRunRecorder(args.result_dir, args.task)
+    print(f"[source] {os.path.abspath(__file__)}", flush=True)
+    print(f"[model] {args.model} url={args.model_url} timeout={args.model_timeout:g}s attempts=1", flush=True)
+    print(f"[grounding] {args.ground_model} type={args.ground_type} url={args.ground_url} "
+          f"timeout={args.ground_timeout:g}s attempts=1; step_budget={args.step_timeout:g}s", flush=True)
+    print(f"[trajectory] 执行前记录和每步轨迹实时保存到: {args.result_dir}", flush=True)
     env = None
+    result = None
     try:
-        time.sleep(2.0)  # 等 Chrome 窗口稳定
-
+        set_results_dir(args.result_dir)
         # 2) 模型（Logging 实时推送到 viz server）
-        model = LoggingChatModel(ChatModel(ModelConfig(name=args.model, url=args.model_url, api_key="EMPTY")))
-        grounding = LoggingGrounding(UIVenus2Grounding(url=args.ground_url, api_key="EMPTY",
-                                                       model=args.ground_model, width=width, height=height))
+        model = LoggingChatModel(ChatModel(ModelConfig(
+            name=args.model, url=args.model_url,
+            api_key=os.getenv("OSWORLD_LOCAL_MODEL_API_KEY", "EMPTY"),
+            timeout=args.model_timeout, request_retries=0)))
+        grounding_class = UIVenus2Grounding if args.ground_type == "ui-venus2" else RealUItarsGrounding
+        grounding = LoggingGrounding(grounding_class(
+            url=args.ground_url, api_key=os.getenv("OSWORLD_LOCAL_GROUND_API_KEY", "EMPTY"),
+            model=args.ground_model, width=width, height=height,
+            timeout=args.ground_timeout, retries=0))
 
         # 3) 环境
         env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
-                                 downloads_dir=args.download_dir)
+                                 downloads_dir=args.download_dir,
+                                 browser_launcher=lambda: ensure_chrome(args.browser_port, args.chrome))
 
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env,
                       max_steps=args.max_steps, enable_reflection=False,
-                      step_callback=_live_step)
-        if args.result_dir:
-            set_results_dir(args.result_dir)
+                      step_callback=_live_step, progress_callback=recorder.on_progress,
+                      step_timeout=args.step_timeout)
         reset_collected()
         log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps})
         print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)
+    except BaseException as exc:
+        recorder.finish(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+                        error=f"{type(exc).__name__}: {exc}")
+        log_status({"event": "error", "step": (recorder.pending_step or {}).get("step", 0),
+                    "error": f"{type(exc).__name__}: {exc}"})
+        log_status({"event": "task_end", "success": False, "result": 0,
+                    "answer": str(exc), "steps": (recorder.pending_step or {}).get("step", 0)})
+        raise
     finally:
-        try:
-            if env is not None:
+        if env is not None:
+            # 仅释放环境会话；浏览器由用户保留和关闭。
+            try:
                 env.close()
-        finally:
-            # 初始化、运行或环境关闭失败时，仍清理本次创建的实例。
-            if started_chrome:
-                close_test_chrome(args.browser_port, chrome_profile)
+            except BaseException as exc:
+                recorder.finish(result, status="failed", error=f"{type(exc).__name__}: {exc}")
+                raise
+    recorder.finish(result)
 
     # 通知前端任务结束（带结果），否则前端收不到 task_end 会把"已完成"误判成"异常终止"
     log_status({
@@ -388,10 +423,7 @@ def main() -> int:
                      for s in result.trajectory if isinstance(s, dict)]
         with open(os.path.join(args.result_dir, "traj_raw.jsonl"), "w", encoding="utf-8") as _f:
             _f.write("\n".join(raw_lines))
-        from osworld_agent.trajectory import build_trajectory, dump_trajectory
-        traj = build_trajectory(task_id="local", domain="windows",
-                                instruction=args.task, result=result)
-        dump_trajectory(os.path.join(args.result_dir, "trajectory.json"), traj)
+        # trajectory.json 已由 recorder 在执行前/每步结束时原子更新，保留状态与中断证据。
         print(f"\n轨迹与截图已保存到: {args.result_dir}")
     return 0
 

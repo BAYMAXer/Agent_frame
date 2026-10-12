@@ -114,7 +114,15 @@ class LoggingChatModel:
         """
         return getattr(self.inner, "last_call", {})
 
-    def chat(self, messages, retries: int = 2, json_mode: bool = False) -> str:
+    @property
+    def request_deadline(self):
+        return getattr(self.inner, "request_deadline", None)
+
+    @request_deadline.setter
+    def request_deadline(self, value):
+        self.inner.request_deadline = value
+
+    def chat(self, messages, retries: int = 0, json_mode: bool = False) -> str:
         text, screenshot = _extract_last_user(messages)
         mtype = _classify_mtype(text, screenshot)
         # 主决策的第一步（system+user 两条消息且带截图）才递增步号并发 step 事件；
@@ -171,6 +179,34 @@ class LoggingGrounding:
     def __init__(self, inner):
         self.inner = inner
 
+    @property
+    def last_call(self):
+        return getattr(self.inner, "last_call", {})
+
+    @property
+    def request_deadline(self):
+        return getattr(self.inner, "request_deadline", None)
+
+    @request_deadline.setter
+    def request_deadline(self, value):
+        self.inner.request_deadline = value
+
+    @property
+    def width(self):
+        return self.inner.width
+
+    @width.setter
+    def width(self, value):
+        self.inner.width = value
+
+    @property
+    def height(self):
+        return self.inner.height
+
+    @height.setter
+    def height(self, value):
+        self.inner.height = value
+
     def locate(self, screenshot, target: str):
         from osworld_agent.model.decision_model import encode_image
         url = encode_image(screenshot)
@@ -179,11 +215,21 @@ class LoggingGrounding:
         _post({"kind": "model", "type": "grounding", "prompt": target, "screenshot": b64,
                "pending": True, "step": _step[0], "id": log_id, "ts": time.time()})
         start = time.time()
-        gr = self.inner.locate(screenshot, target)
-        response = f"{gr.x}, {gr.y}"
+        try:
+            gr = self.inner.locate(screenshot, target)
+        except Exception as exc:
+            _post({"kind": "model", "type": "grounding", "prompt": target,
+                   "response": str(exc), "step": _step[0], "id": log_id, "error": True,
+                   "elapsed": round(time.time() - start, 3), "ts": time.time()})
+            raise
+        details = self.last_call if isinstance(self.last_call, dict) else {}
+        error = details.get("error")
+        response = f"{gr.x}, {gr.y}" + (f"\n定位失败: {error}" if error else "")
         _post({"kind": "model", "type": "grounding", "prompt": target, "screenshot": b64,
                "response": response, "step": _step[0], "id": log_id,
-               "elapsed": round(time.time() - start, 3), "ts": time.time()})
+               "elapsed": round(time.time() - start, 3), "ts": time.time(),
+               "confidence": gr.confidence, "error": bool(error),
+               "raw_response": details.get("response", "")})
         _groundings.append({"step": _step[0], "query": target,
                             "coord": [gr.x, gr.y], "elapsed": round(time.time() - start, 3)})
         return gr

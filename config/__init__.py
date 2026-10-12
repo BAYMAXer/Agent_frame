@@ -37,7 +37,8 @@ class ModelConfig:
     api_key: str = "EMPTY"
     temperature: float = 0.3
     max_tokens: int = 2048
-    timeout: float = 180.0
+    timeout: float = 60.0
+    request_retries: int = 0         # SDK 隐式重试关闭；显式重试也受该上限约束
     vision: bool = True              # 是否把截图喂给决策模型（纯文本模型设 false）
     disable_thinking: bool = True    # 关闭 Qwen 思考模式（避免模型生成大段 chain-of-thought 陷入循环）
 
@@ -50,7 +51,7 @@ class GroundingConfig:
     api_key: str = "EMPTY"
     width: int = 1920
     height: int = 1080
-    timeout: float = 180.0
+    timeout: float = 60.0
 
 
 @dataclass

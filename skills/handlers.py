@@ -97,6 +97,13 @@ def _handler_verify_file(args: Dict[str, Any], ctx) -> str:
         out = _run_in_env(ctrl, VERIFY_FILE_CMD.format(path=repr(path)))
         if out:
             return out
+    env = getattr(ctx, "env", None) if ctx is not None else None
+    if getattr(env, "local_environment", False) is True:
+        runner = getattr(env, "run_python", None)
+        if callable(runner):
+            out = runner(VERIFY_FILE_CMD.format(path=repr(path)))
+            if isinstance(out, str) and out.strip():
+                return out.strip()
     return f"verify_file 无法执行：环境未接入（env.controller 为空），无法检查目标机文件系统。path={path}"
 
 

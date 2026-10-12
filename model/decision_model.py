@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from ..config import ModelConfig
+from .request_deadline import (ModelRequestTimeout, call_with_deadline,
+                               make_request_deadline, remaining_seconds, sleep_before_retry)
 
 
 @dataclass
@@ -68,9 +70,10 @@ class ChatModel:
         self.vision = bool(getattr(cfg, "vision", True))
         self.disable_thinking = bool(getattr(cfg, "disable_thinking", True))
         self.last_call: Dict[str, Any] = {}   # 最近一次调用的完整元数据（供轨迹记录 decision_calls）
+        self.request_deadline: Optional[float] = None
 
-    def chat(self, messages, retries: int = 2, json_mode: bool = False) -> str:
-        """发送一轮对话，返回模型文本；失败自动重试。
+    def chat(self, messages, retries: int = 0, json_mode: bool = False) -> str:
+        """发送一轮对话，返回模型文本；显式重试共享墙钟预算。
 
         messages 既可以是 ChatMessage 列表，也可以是 {"role","content"} dict 列表，
         content 可以是字符串（纯文本）或 list（OpenAI vision 多部分），内部统一规范化。
@@ -78,12 +81,15 @@ class ChatModel:
         json_mode=True 时加 response_format=json_object，用 vLLM 约束解码强制输出合法
         JSON 对象（减少非 JSON、格式漂移）；这是「约束前移」，仍保留调用方的执行前校验。
         """
-        from openai import OpenAI  # 延迟导入，避免非模型场景也依赖 openai
+        from openai import OpenAI, APITimeoutError  # 延迟导入，避免非模型场景也依赖 openai
         import httpx
 
+        deadline = make_request_deadline(self.cfg.timeout, self.request_deadline)
+        retries = min(max(0, int(retries)), max(0, int(getattr(self.cfg, "request_retries", 0))))
         # trust_env=False：直连内网 endpoint，不走系统代理（同 grounding，避免 HIS 代理拦掉 7.x）
         client = OpenAI(
             base_url=self.cfg.url, api_key=self.cfg.api_key,
+            max_retries=0,
             http_client=httpx.Client(trust_env=False, timeout=self.cfg.timeout),
         )
         normalized = [self._to_message_dict(m) for m in messages]
@@ -106,7 +112,10 @@ class ChatModel:
                     create_kwargs["response_format"] = {"type": "json_object"}
                 generation = {k: v for k, v in create_kwargs.items() if k not in ("model", "messages")}
                 self.last_call["generation"] = copy.deepcopy(generation)
-                resp = client.chat.completions.create(**create_kwargs)
+                remaining = remaining_seconds(deadline)
+                # 网络线程只调用 SDK；响应解析和 last_call 更新留在当前线程。
+                resp = call_with_deadline(lambda: client.chat.completions.create(
+                    **create_kwargs, timeout=remaining), remaining)
                 msg = resp.choices[0].message
                 content = getattr(msg, "content", "") or ""
                 latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -122,13 +131,20 @@ class ChatModel:
                 self.last_call["attempts"].append({"status": "ok", "latency_ms": latency_ms,
                                                    "generation": copy.deepcopy(generation),
                                                    "response": content})
+                self.last_call.pop("error", None)
                 return content.strip()
             except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 self.last_call["attempts"].append({
-                    "status": "error", "error_type": type(exc).__name__,
+                    "status": "timeout" if isinstance(exc, (TimeoutError, APITimeoutError, httpx.TimeoutException)) else "error",
+                    "error_type": type(exc).__name__,
                     "generation": copy.deepcopy(self.last_call.get("generation", {})),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
+                self.last_call["error"] = str(exc)
+                if isinstance(exc, (TimeoutError, APITimeoutError, httpx.TimeoutException)):
+                    if isinstance(exc, ModelRequestTimeout):
+                        raise
+                    raise ModelRequestTimeout(f"模型请求超时({self.cfg.name}): {exc}") from exc
                 # 若因 extra_body 不被支持而报错，去掉 extra_body 重试一次
                 if self.disable_thinking and "extra_body" in str(exc).lower():
                     self.disable_thinking = False
@@ -136,7 +152,7 @@ class ChatModel:
                 if json_mode and ("response_format" in str(exc).lower() or "json" in str(exc).lower()):
                     json_mode = False
                 if attempt < retries:
-                    time.sleep(1.5 * (attempt + 1))
+                    sleep_before_retry(1.5 * (attempt + 1), deadline)
         raise RuntimeError(f"模型调用失败({self.cfg.name}): {last_err}")
 
     def build_vision_message(self, text: str, images=None) -> Dict[str, Any]:

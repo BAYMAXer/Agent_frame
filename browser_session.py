@@ -34,7 +34,7 @@ class BrowserOptions:
     timeout_ms: int = 4000
     max_nodes: int = 4000
     max_snapshot_age: float = 180.0
-    require_focus: bool = True   # True=要求浏览器前台聚焦；Windows 本地模式设 False（虚拟鼠标，用户可同时用电脑）
+    require_focus: bool = True   # True=只选择聚焦页面；普通桌面/浏览器混合任务保持 True
 
 
 class BrowserSession:
@@ -62,11 +62,12 @@ class BrowserSession:
 
     @staticmethod
     def _focused_page(browser):
-        """找聚焦的 http 页面；不唯一则返回 None。"""
+        """找聚焦的网页或空白/新标签页；不唯一则返回 None。"""
         candidates = []
         for ctx in browser.contexts:
             for page in ctx.pages:
-                if not page.url.startswith(("http://", "https://", "file://")):
+                if not (page.url.startswith(("http://", "https://", "file://"))
+                        or page.url in ("about:blank", "chrome://newtab/", "edge://newtab/")):
                     continue
                 try:
                     if page.evaluate("document.hasFocus() && document.visibilityState === 'visible'"):
@@ -88,9 +89,49 @@ class BrowserSession:
 
     def _pick_page(self, browser):
         """按 require_focus 选页面：聚焦模式用 _focused_page，否则 _any_page。"""
+        if self.foreground_check and not self.foreground_check():
+            self.invalidate()
+            return None
         if self.options.require_focus:
             return self._focused_page(browser)
         return self._any_page(browser)
+
+    def activate(self):
+        """显式访问网址时激活浏览器；普通观察不会调用或改变焦点。"""
+        try:
+            p, browser = self._connect()
+        except Exception:
+            return False
+        try:
+            page = self._focused_page(browser)
+            if page is None:
+                visible = []
+                for ctx in browser.contexts:
+                    for candidate in ctx.pages:
+                        if candidate.url.startswith(("devtools://", "chrome-extension://")):
+                            continue
+                        try:
+                            if candidate.evaluate("document.visibilityState === 'visible'"):
+                                visible.append(candidate)
+                        except Exception:
+                            continue
+                # 多个窗口都可见时无法确定目标，交给重新观察，不任意选页面。
+                page = visible[0] if len(visible) == 1 else None
+            if page is None:
+                return False
+            page.bring_to_front()
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                browser.close()  # 断开 CDP 临时连接，保留浏览器进程和页面。
+            except Exception:
+                pass
+            try:
+                p.stop()
+            except Exception:
+                pass
 
     # ---- collect ----
     def collect(self):

@@ -41,8 +41,12 @@ def build_system_prompt(
     os_name: str = "linux",
     browser_only: bool = False,
 ) -> str:
-    action_registry = action_registry or ACTION_REGISTRY
-    skill_registry = skill_registry or SKILL_REGISTRY
+    action_registry = ACTION_REGISTRY if action_registry is None else action_registry
+    skill_registry = SKILL_REGISTRY if skill_registry is None else skill_registry
+
+    # Windows 本机没有 VMware 的 LibreOffice UNO 执行和校验通道。
+    if (os_name or "linux").lower() == "windows":
+        action_registry = {k: v for k, v in action_registry.items() if v.kind != "uno"}
 
     if browser_only:
         action_registry = {k: v for k, v in action_registry.items() if k in _BROWSER_ONLY_ACTIONS}
@@ -130,19 +134,29 @@ def build_system_prompt(
    先排查「被挡住 / 没滚到 / 没展开」，比反复点一个看不到的目标更有效。"""
     else:
         browser_rule = """11. 浏览器规则：当你要操作的目标【是浏览器页面里的元素】时，优先加 element_id（HTML id）或 target_ref（ref 编号）直接走 DOM 定位；都拿不准才只用英文 target（程序会先结构匹配，匹配不到再视觉定位）。目标不在页面 DOM 里时（canvas、原生弹窗、地址栏、桌面窗口）才用英文 target 交给视觉定位。不要编造 id/ref。
-12. 打开网址/访问网站：必须用 goto 动作，不要点地址栏、不要往地址栏 type 网址。
+12. 仅当任务需要访问网站时才用 goto 动作，不要点地址栏、不要往地址栏 type 网址。Windows 本机在需要时会启动/激活浏览器；普通桌面任务直接操作对应应用，不要先打开浏览器。只有当前焦点位于浏览器才进入 browser use，切到其他应用后按桌面场景继续。
 13. 下载文件（如论文 PDF）：点击页面里那个下载/PDF 链接或按钮即可，加 element_id 或 target_ref 直接点。
 14. 找不到目标元素时的排查（重要）：当要操作的元素在 AX 树里找不到、或截图里看不到时，不要反复点同一个地方，按顺序排查：① 是否被弹窗/对话框遮挡 → 先关掉它；② 是否页面需要滚动才能看到 → 用 scroll；③ 是否需要先点击展开（菜单/tab/输入框）目标才会出现。"""
 
     # 桌面专用规则（表格/技能，browser_only 不渲染，经验见 docs/legacy_prompt.md）
-    desktop_rules = "" if browser_only else """
-14. 需要计算时（求和 / 加权平均 / 乘除 / 开方 / 百分比 / 汇率换算等），【千万不要心算】，把数字原样写进完整计算式子，用 calculate 技能让程序精确计算。
-15. 拿到技能结果后，若这个值后面还要用，就在【同一轮】用 state_update.known_fact_add 存成变量。
-16. 在表格（LibreOffice Calc）里点单元格后，【必须】看左上角 Name Box 确认选中的是目标单元格。
-17. 写完公式/数据后，【必须】看截图确认目标单元格里真的有了值，再 request_finish。
-18. 编辑完 LibreOffice 文档后，用 save 动作保存（程序化 store），不要用 Ctrl+S。"""
+    desktop_rules = ""
+    if not browser_only:
+        if any(n == "calculate" and s.enabled for n, s in skill_registry.items()):
+            desktop_rules += "\n14. 需要计算时（求和 / 加权平均 / 乘除 / 开方 / 百分比 / 汇率换算等），【千万不要心算】，把数字原样写进完整计算式子，用 calculate 技能让程序精确计算。"
+        if any(s.enabled for s in skill_registry.values()):
+            desktop_rules += "\n15. 拿到技能结果后，若这个值后面还要用，就在【同一轮】用 state_update.known_fact_add 存成变量。"
+        if "click" in action_registry:
+            desktop_rules += "\n16. 在表格应用里点单元格后，【必须】看左上角 Name Box 确认选中的是目标单元格。"
+        if "type" in action_registry or "set_cell_values" in action_registry:
+            desktop_rules += "\n17. 写完公式/数据后，【必须】看截图确认目标单元格里真的有了值，再 request_finish。"
+        if "save" in action_registry:
+            desktop_rules += "\n18. 编辑完 LibreOffice 文档后，用 save 动作保存（程序化 store），不要用 Ctrl+S。"
+        elif "hotkey" in action_registry:
+            desktop_rules += '\n18. 编辑文档后，用 hotkey 动作 keys: ["ctrl", "s"] 保存，并处理保存位置或格式确认对话框。'
 
-    return f"""你是一个浏览器操作智能体，通过操作浏览器完成用户下达的任务。
+    role = ("你是一个浏览器操作智能体，通过操作浏览器完成用户下达的任务。" if browser_only
+            else "你是一个 GUI 操作智能体，根据用户任务操作桌面应用或浏览器。")
+    return f"""{role}
 
 ## 当前环境
 - 目标机操作系统：{os_line}

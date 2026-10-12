@@ -792,12 +792,12 @@ function statusCardHtml(payload) {
   const time = new Date(payload.ts * 1000).toLocaleTimeString();
   let detail = '';
   if (payload.event === 'task_start') detail = '开始任务：' + esc(payload.instruction);
-  else if (payload.event === 'step') detail = 'Step ' + payload.step + ' 执行完成，reward=' + payload.reward + '，done=' + payload.done;
+  else if (payload.event === 'step') detail = 'Step ' + payload.step + ' 开始决策';
   else if (payload.event === 'manual_mode') detail = '🧑 手动模式：请在 VMware 窗口中手动完成任务，完成后点「评估结果」';
   else if (payload.event === 'error') detail = '⚠️ Step ' + payload.step + ' 出错：' + esc(payload.error || '');
   else if (payload.event === 'task_end') detail = (payload.success === true) ? '✅ 任务结束，成功' : ('任务结束，最终 result=' + payload.result);
   else if (payload.event === 'executing') detail = '<span class="spinner"></span> ⚙️ 执行中：' + esc(payload.action || '');
-  else if (payload.event === 'executed') detail = '✅ 执行完成：' + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '');
+  else if (payload.event === 'executed') detail = (payload.status === 'rejected' ? '⚠️ 未执行：' : payload.status === 'uncertain' ? '⚠️ 执行结果不确定：' : '✅ 执行完成：') + esc(payload.action || '') + (payload.status ? '（' + esc(payload.status) + '）' : '') + (payload.error ? ' ' + esc(payload.error) : '');
   else detail = esc(payload.event || '');
   return '<div class="card status" data-kind="status">' +
     '<div class="card-head"><span class="tag status">状态</span>' +
@@ -825,6 +825,7 @@ function createTaskGroup(payload) {
     config: payload,
     sectionEl: section,
     result: null,
+    pendingExecutions: {},
   };
   taskGroups.push(group);
   renderConfigCard(section, payload);
@@ -898,7 +899,15 @@ function addCard(payload) {
     if (payload.event === 'task_end') group.result = payload.result;
     const temp = document.createElement('div');
     temp.innerHTML = statusCardHtml(payload);
-    tl.appendChild(temp.firstElementChild);
+    const card = temp.firstElementChild;
+    const pending = group.pendingExecutions[payload.step];
+    if ((payload.event === 'executed' || payload.event === 'error') && pending) {
+      pending.replaceWith(card);
+      delete group.pendingExecutions[payload.step];
+    } else {
+      tl.appendChild(card);
+      if (payload.event === 'executing') group.pendingExecutions[payload.step] = card;
+    }
   }
   // 实时监控默认始终跟随最新卡片；用户可通过切换历史任务页查看旧轨迹。
   // 先等 DOM 布局完成再滚动，避免图片异步插入时 scrollHeight 尚未更新。
@@ -1028,12 +1037,12 @@ function updatePromptTokens() {
 function loadDefaultPrompt() {
   const backend = document.getElementById('run-backend').value;
   const isLocal = document.getElementById('tab-local').classList.contains('active');
-  fetch('/experiments/default-prompt?backend=' + encodeURIComponent(backend) + '&browser_only=' + isLocal).then(r => r.json()).then(d => {
+  fetch('/experiments/default-prompt?backend=' + encodeURIComponent(backend) + '&browser_only=false&os_name=' + (isLocal ? 'windows' : 'linux')).then(r => r.json()).then(d => {
     if (!d.ok) throw new Error(d.error || '未知错误');
     document.getElementById('run-system-prompt').value = d.prompt;
     updatePromptTokens();
     document.getElementById('run-prompt-preset').value = '';
-    document.getElementById('run-prompt-state').textContent = isLocal ? '本机浏览器模板（DOM 优先，已精简）' : '虚拟机 OSWorld 模板（完整，含表格/子Agent）';
+    document.getElementById('run-prompt-state').textContent = isLocal ? '本机 GUI 模板（浏览器按需启动，按焦点切换）' : '虚拟机 OSWorld 模板（完整，含表格/子Agent）';
   }).catch(e => document.getElementById('run-prompt-state').textContent = '模板加载失败：' + e);
 }
 document.getElementById('run-memory').addEventListener('change', updateStrategyHelp);
@@ -1229,6 +1238,13 @@ document.getElementById('btn-local-start').addEventListener('click', () => {
   const cfg = {
     mode: 'local',
     task: task,
+    model: document.getElementById('run-model').value,
+    model_url: document.getElementById('run-model-url').value,
+    model_api_key: document.getElementById('run-model-apikey').value,
+    ground_model: document.getElementById('run-ground').value,
+    ground_url: document.getElementById('run-ground-url').value,
+    ground_api_key: document.getElementById('run-ground-apikey').value,
+    ground_type: currentGroundType,
     max_steps: parseInt(document.getElementById('local-maxsteps').value) || 15,
   };
   fetch('/run/start', {
@@ -1277,10 +1293,20 @@ function resetLiveView() {
 }
 
 document.getElementById('btn-stop').addEventListener('click', () => {
-  fetch('/run/stop', { method: 'POST' }).then(() => {
+  fetch('/run/stop', { method: 'POST' }).then(r => r.json()).then(d => {
+    if (!d.ok) { alert(d.error || '停止失败'); return; }
     document.getElementById('run-form').style.display = '';
     document.getElementById('run-running').style.display = 'none';
     document.getElementById('btn-manual-eval').style.display = 'none';
+    const group = taskGroups[taskGroups.length - 1];
+    if (group) {
+      Object.entries(group.pendingExecutions).forEach(([step, card]) => {
+        const temp = document.createElement('div');
+        temp.innerHTML = statusCardHtml({event: 'error', step, error: '任务已手动终止，执行前记录已保存', ts: Date.now() / 1000});
+        card.replaceWith(temp.firstElementChild);
+      });
+      group.pendingExecutions = {};
+    }
   });
 });
 
@@ -1408,7 +1434,9 @@ function renderLocalList(runs) {
     const time = new Date(r.mtime * 1000).toLocaleString();
     // 优先看 success（本地任务无独立评测器，score 恒 0）；否则按 score
     let cls, txt;
-    if (r.success === true) { cls = 'ok'; txt = '成功'; }
+    if (r.status === 'running') { cls = 'unknown'; txt = '进行中 · ' + (r.phase || ''); }
+    else if (r.status === 'interrupted') { cls = 'unknown'; txt = '已终止 · ' + (r.phase || ''); }
+    else if (r.success === true) { cls = 'ok'; txt = '成功'; }
     else if (r.success === false) { cls = 'fail'; txt = '失败'; }
     else if (r.score == null) { cls = 'unknown'; txt = '无评测'; }
     else { cls = r.score >= 1 ? 'ok' : 'fail'; txt = r.score >= 1 ? '成功' : '失败'; }
@@ -1489,7 +1517,7 @@ function renderLocalDetail(runId, traj, instruction, plan) {
 function localStepCard(runId, t) {
   const stepNum = t.step_num;
   const shotFile = t.screenshot_file || ('step_' + stepNum + '.png');
-  const shotHtml = '<div class="shot"><img src="/local/shot?run=' + encodeURIComponent(runId) + '&filename=' + encodeURIComponent(shotFile) + '" loading="lazy"></div>';
+  const shotHtml = t.pending && !t.screenshot_file ? '' : '<div class="shot"><img src="/local/shot?run=' + encodeURIComponent(runId) + '&filename=' + encodeURIComponent(shotFile) + '" loading="lazy"></div>';
   const routing = t.routing || {};
   const channel = routing.channel || '';
   const channelHtml = channel ? '<span class="step" style="background:#dceafe;color:#1c6de0">' + esc(channel) + '</span>' : '';

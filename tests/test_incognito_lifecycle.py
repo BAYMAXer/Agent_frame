@@ -376,7 +376,7 @@ def test_successful_close_does_not_force_stop_remaining_foreign_browser(monkeypa
     remove.assert_called_once_with(9222, profile)
 
 
-def _stub_main(monkeypatch, profile, *, started=True, failing=None):
+def _stub_main(monkeypatch, profile, *, started=True, failing=None, browser_requested=False):
     events = []
     error = RuntimeError(f"test failure in {failing}")
     result = SimpleNamespace(score=1, steps=1, success=True, final_answer="done",
@@ -386,15 +386,20 @@ def _stub_main(monkeypatch, profile, *, started=True, failing=None):
         if failing == name:
             raise error
     class Env:
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
             checkpoint("environment")
+            self.browser_launcher = kwargs["browser_launcher"]
         def close(self):
             checkpoint("env_close")
     class Agent:
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
             checkpoint("agent")
+            self.env = kwargs["env"]
         def run(self, _task):
             checkpoint("run")
+            if browser_requested:
+                self.env.browser_launcher()
+                checkpoint("after_navigation")
             return result
     def model(_config):
         checkpoint("model")
@@ -402,9 +407,11 @@ def _stub_main(monkeypatch, profile, *, started=True, failing=None):
     def grounding(**_kwargs):
         checkpoint("grounding")
         return object()
-    monkeypatch.setattr(sys, "argv", ["run_windows_local.py", "--task", "test task"])
+    monkeypatch.setattr(sys, "argv", ["run_windows_local.py", "--task", "test task",
+                                     "--result-dir", str(Path(profile).parent / "task-results")])
     monkeypatch.setitem(sys.modules, "pyautogui", SimpleNamespace(size=lambda: (1280, 720)))
-    monkeypatch.setattr(runner, "ensure_chrome", lambda *_args: (started, profile if started else None))
+    launch = Mock(return_value=(started, profile if started else None))
+    monkeypatch.setattr(runner, "ensure_chrome", launch)
     cleanup = Mock(side_effect=lambda *_args: events.append("chrome_close"))
     monkeypatch.setattr(runner, "close_test_chrome", cleanup)
     monkeypatch.setattr(runner, "ModelConfig", lambda **_kwargs: object())
@@ -416,41 +423,46 @@ def _stub_main(monkeypatch, profile, *, started=True, failing=None):
     monkeypatch.setattr(runner, "Agent", Agent)
     monkeypatch.setattr(runner, "reset_collected", lambda: checkpoint("reset"))
     monkeypatch.setattr(runner, "log_status", lambda _status: checkpoint("log"))
-    return events, cleanup, error
+    return events, launch, cleanup, error
 
 
 @pytest.mark.parametrize("failing", ["model", "grounding", "environment", "agent", "reset",
                                      "log", "run", "env_close"])
-def test_main_always_cleans_new_browser_after_initialization_or_run_errors(monkeypatch, profile_root,
-                                                                         failing):
+def test_main_does_not_start_or_close_browser_on_desktop_task_errors(monkeypatch, profile_root,
+                                                                  failing):
     profile = _profile(profile_root)
-    events, cleanup, error = _stub_main(monkeypatch, profile, failing=failing)
+    events, launch, cleanup, error = _stub_main(monkeypatch, profile, failing=failing)
 
     with pytest.raises(RuntimeError) as caught:
         runner.main()
     assert caught.value is error
-    cleanup.assert_called_once_with(9222, profile)
+    launch.assert_not_called()
+    cleanup.assert_not_called()
     if failing not in {"model", "grounding", "environment"}:
-        assert events.index("env_close") < events.index("chrome_close")
+        assert "env_close" in events
 
 
-@pytest.mark.parametrize("failing", [None, "run", "env_close"])
-def test_main_keeps_reused_browser_on_success_or_exception(monkeypatch, profile_root, failing):
-    _events, cleanup, error = _stub_main(monkeypatch, _profile(profile_root), started=False,
-                                       failing=failing)
+@pytest.mark.parametrize("started", [True, False])
+@pytest.mark.parametrize("failing", [None, "after_navigation", "env_close"])
+def test_main_keeps_on_demand_browser_on_success_or_exception(monkeypatch, profile_root,
+                                                            started, failing):
+    _events, launch, cleanup, error = _stub_main(monkeypatch, _profile(profile_root), started=started,
+                                               failing=failing, browser_requested=True)
     if failing:
         with pytest.raises(RuntimeError) as caught:
             runner.main()
         assert caught.value is error
     else:
         assert runner.main() == 0
+    launch.assert_called_once_with(9222, runner.CHROME_DEFAULT)
     cleanup.assert_not_called()
 
 
-def test_main_closes_new_browser_after_success(monkeypatch, profile_root):
+def test_main_does_not_start_or_close_browser_for_desktop_task(monkeypatch, profile_root):
     profile = _profile(profile_root)
-    events, cleanup, _error = _stub_main(monkeypatch, profile)
+    events, launch, cleanup, _error = _stub_main(monkeypatch, profile)
 
     assert runner.main() == 0
-    cleanup.assert_called_once_with(9222, profile)
-    assert events.index("env_close") < events.index("chrome_close")
+    launch.assert_not_called()
+    cleanup.assert_not_called()
+    assert "env_close" in events

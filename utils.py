@@ -70,18 +70,55 @@ def detect_foreground_browser(os_name: Optional[str] = None) -> bool:
 
 
 def _foreground_windows() -> bool:
-    """Windows：用 ctypes 读前台窗口标题/进程名。"""
+    """Windows：根据前台窗口所属进程的可执行文件名确认浏览器。"""
     import ctypes
+    import ntpath
     from ctypes import wintypes
-    user32 = ctypes.windll.user32
-    hwnd = user32.GetForegroundWindow()
-    if not hwnd:
+    process = None
+    kernel32 = None
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # ctypes 默认返回 c_int；显式声明 HWND/HANDLE，避免 64 位句柄被截断。
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        pid = wintypes.DWORD()
+        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
+            return False
+        process = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not process:
+            return False
+        path = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(path))
+        if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length)):
+            return False
+        name = ntpath.basename(path.value).casefold()
+        return name in {
+            "chrome.exe", "chromium.exe", "msedge.exe", "firefox.exe", "brave.exe",
+            "opera.exe", "vivaldi.exe", "safari.exe", "iexplore.exe",
+        }
+    except Exception:  # noqa: BLE001
         return False
-    length = user32.GetWindowTextLengthW(hwnd)
-    buf = ctypes.create_unicode_buffer(length + 1)
-    user32.GetWindowTextW(hwnd, buf, length + 1)
-    title = buf.value.lower()
-    return any(k in title for k in _BROWSER_KEYWORDS)
+    finally:
+        if process and kernel32 is not None:
+            try:
+                kernel32.CloseHandle(process)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def _foreground_linux_mac() -> bool:

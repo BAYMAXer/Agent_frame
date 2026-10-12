@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 CODE_AGENT_PROMPT = """你是一个代码执行子 Agent，有有限的步数预算，通过逐步执行 Python / Bash 代码完成任务。
@@ -55,6 +56,21 @@ FAIL
 """
 
 
+def build_code_agent_prompt(os_name: str) -> str:
+    """让子 Agent 的命令语法与目标机一致。"""
+    if (os_name or "linux").lower() != "windows":
+        return CODE_AGENT_PROMPT
+    return (CODE_AGENT_PROMPT
+            .replace("Python / Bash", "Python / Windows cmd")
+            .replace("- 用 sudo 时：echo password | sudo -S <命令>；用户名是 user。",
+                     "- 目标机是 Windows。命令使用 cmd 语法（dir / type / findstr），复杂文件操作优先用 Python 标准库。")
+            .replace("Bash 命令：", "Windows cmd 命令（仍用 bash 标签提交，执行器实际调用 cmd /c）：")
+            .replace("/home/user/Desktop/receipt.png", "C:/Users/Administrator/Desktop/receipt.png")
+            .replace("用 cat / print 打印最终内容验证", "用 type / print 打印最终内容验证")
+            .replace("只读文件用 unzip -p / python 标准库", "只读文件用 Python 标准库（如 zipfile / pathlib）")
+            .replace("改完 store 落盘", "改完保存到原文件"))
+
+
 def _extract_code_block(text: str) -> Tuple[Optional[str], Optional[str]]:
     """从 code agent 输出里提取第一个 ```python/```bash/```note/```view 块。返回 (type, code)。"""
     m = re.search(r"```(python|bash|note|view)\s*\n(.*?)```", text, re.DOTALL)
@@ -96,11 +112,16 @@ class CodeAgent:
                         return data
                 except Exception:  # noqa: BLE001
                     pass
+        if getattr(self.env, "local_environment", False) is True:
+            try:
+                return Path(path).read_bytes()
+            except (OSError, ValueError):
+                pass
         return None
 
     def execute(self, task_instruction: str) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": CODE_AGENT_PROMPT},
+            {"role": "system", "content": build_code_agent_prompt(getattr(self.env, "os_name", "linux"))},
             {"role": "user", "content": f"## 任务\n{task_instruction}\n\n请开始第一步。"},
         ]
         execution_history: List[Dict[str, str]] = []

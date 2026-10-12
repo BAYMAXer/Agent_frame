@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Optional
 
 from ..model.grounding import Grounding, GroundingResult
+from ..model.request_deadline import (ModelRequestTimeout, call_with_deadline,
+                                     make_request_deadline, remaining_seconds, sleep_before_retry)
 
 
 # UI-Venus-2 grounding prompt。
@@ -40,12 +43,14 @@ def _extract_coords(text: str):
     m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
     if m:
         x1, y1, x2, y2 = map(int, m.groups())
+        if not all(0 <= value <= 1000 for value in (x1, y1, x2, y2)):
+            return None
         return (x1 + x2) / 2, (y1 + y2) / 2
     # [x, y] 两数
     m = re.search(r"\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]", text)
     if m:
         x, y = map(int, m.groups())
-        if x < 0 or y < 0:
+        if not (0 <= x <= 1000 and 0 <= y <= 1000):
             return None
         return float(x), float(y)
     return None
@@ -56,13 +61,16 @@ class UIVenus2Grounding(Grounding):
 
     def __init__(self, url: str, api_key: str, model: str,
                  width: int = 1920, height: int = 1080,
-                 timeout: float = 180.0):
+                 timeout: float = 60.0, retries: int = 0):
         self.url = url
         self.api_key = api_key
         self.model = model
         self.width = width
         self.height = height
         self.timeout = timeout
+        self.retries = max(0, int(retries))
+        self.request_deadline: Optional[float] = None
+        self.last_call = {}
         self._client = None
 
     def _get_client(self):
@@ -72,14 +80,21 @@ class UIVenus2Grounding(Grounding):
             # trust_env=False：直连内网 endpoint，不走系统代理
             self._client = OpenAI(
                 base_url=self.url, api_key=self.api_key,
+                max_retries=0,
                 http_client=httpx.Client(trust_env=False, timeout=self.timeout),
             )
         return self._client
 
     def locate(self, screenshot, target: str):
         from ..model.decision_model import encode_image
+        from openai import APITimeoutError
+        import httpx
+        started = time.perf_counter()
+        deadline = make_request_deadline(self.timeout, self.request_deadline)
+        self.last_call = {"model": self.model, "target": target, "attempts": [], "confidence": 0.0}
         url = encode_image(screenshot)
         if not url:
+            self.last_call["error"] = "截图无法编码"
             return GroundingResult(x=-1, y=-1, confidence=0.0)
 
         text = _DEFAULT_USER_PROMPT.replace("{instruction}", target.rstrip("."))
@@ -87,27 +102,48 @@ class UIVenus2Grounding(Grounding):
             {"type": "image_url", "image_url": {"url": url}},
             {"type": "text", "text": text},
         ]}]
+        self.last_call["messages"] = messages
 
         last_err = None
-        for attempt in range(3):
+        for attempt in range(self.retries + 1):
+            attempt_started = time.perf_counter()
             try:
-                resp = self._get_client().chat.completions.create(
-                    model=self.model, messages=messages,
-                    max_tokens=256, temperature=0.0,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-                )
+                client = self._get_client()
+                remaining = remaining_seconds(deadline)
+                resp = call_with_deadline(lambda: client.chat.completions.create(
+                    model=self.model, messages=messages, max_tokens=256, temperature=0.0,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}}, timeout=remaining,
+                ), remaining)
                 out = (resp.choices[0].message.content or "").strip()
+                self.last_call["response"] = out
                 coords = _extract_coords(out)
+                latency = round((time.perf_counter() - attempt_started) * 1000, 2)
+                self.last_call["attempts"].append({"status": "ok" if coords is not None else "format_error",
+                                                   "response": out, "latency_ms": latency})
                 if coords is not None:
-                    x = round(coords[0] / 1000.0 * self.width)
-                    y = round(coords[1] / 1000.0 * self.height)
+                    x = min(self.width - 1, round(coords[0] / 1000.0 * self.width))
+                    y = min(self.height - 1, round(coords[1] / 1000.0 * self.height))
+                    self.last_call.update({"confidence": 1.0, "x": x, "y": y,
+                                           "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
+                    self.last_call.pop("error", None)
                     return GroundingResult(x=x, y=y, confidence=1.0)
-                last_err = f"响应无坐标/拒答: {out[:100]}"
+                last_err = f"定位协议错误：响应无有效 [0,1000] 坐标或拒答: {out[:100]}"
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
-                if attempt < 2:
-                    import time
-                    time.sleep(1.0 * (attempt + 1))
+                self.last_call["error"] = last_err
+                self.last_call["attempts"].append({
+                    "status": "timeout" if isinstance(exc, (TimeoutError, APITimeoutError, httpx.TimeoutException)) else "error",
+                    "error_type": type(exc).__name__, "error": last_err,
+                    "latency_ms": round((time.perf_counter() - attempt_started) * 1000, 2)})
+                self.last_call["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+                if isinstance(exc, (TimeoutError, APITimeoutError, httpx.TimeoutException)):
+                    if isinstance(exc, ModelRequestTimeout):
+                        raise
+                    raise ModelRequestTimeout(f"定位模型请求超时({self.model}): {exc}") from exc
+            if attempt < self.retries:
+                sleep_before_retry(1.0 * (attempt + 1), deadline)
 
+        self.last_call.update({"error": last_err,
+                               "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
         print(f"[grounding 失败] target={target!r}: {last_err}")
         return GroundingResult(x=-1, y=-1, confidence=0.0)

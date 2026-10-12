@@ -30,6 +30,7 @@ from .env import Environment, Observation
 from .model import ChatModel, Grounding, resolve_coords, mark_coordinate
 from .model.decision_model import encode_image
 from .scene import scene_hint
+from .model.request_deadline import ModelRequestTimeout
 from .memory import StructuredMemory
 from .skills import is_skill, validate_skill, run_skill, enabled_skills, SkillContext
 from .prompts import build_user_prompt, build_format_feedback, build_planner_prompt
@@ -134,7 +135,8 @@ class Pipeline:
     def __init__(self, *, model: ChatModel, grounding: Grounding, env: Environment,
                  system_prompt: str, code_agent=None, max_steps: int = 20,
                  max_retries: int = 3, enable_reflection: bool = True,
-                 early_stop_repeat: int = 3, step_callback=None):
+                 early_stop_repeat: int = 3, step_callback=None, progress_callback=None,
+                 step_timeout: float = 120.0):
         self.model = model
         self.grounding = grounding
         self.env = env
@@ -145,6 +147,12 @@ class Pipeline:
         self.enable_reflection = enable_reflection
         self.early_stop_repeat = early_stop_repeat
         self.step_callback = step_callback  # 每步结束后回调(step_no, decision, execution, state)
+        self.progress_callback = progress_callback  # 各阶段即时记录，中断时也保留执行前证据
+        self.step_timeout = float(step_timeout)
+        if self.step_timeout <= 0:
+            raise ValueError("每步超时必须大于 0")
+        self._deadline = None
+        self._last_phase = None
         self.compiler = PromptCompiler()  # 上下文预算 + 相关性选择
         self._verification = None         # 最近一次 finish 验证的调用记录
 
@@ -152,19 +160,26 @@ class Pipeline:
     def run(self, task: str) -> AgentResult:
         result = AgentResult(task=task)
         state = self._init_state(task)
+        self._start_step_budget()
         # 阶段0：任务规划（模糊任务 → 结构化 plan），失败静默降级
+        self._emit_progress("planning", state, result)
         self._plan(task, state)
         result.plan = state.memory.plan
 
         for step_no in range(1, self.max_steps + 1):
+            self._start_step_budget()
             started = time.perf_counter()
             state.step_id = step_no
+            self._emit_progress("observing", state, result)
             state = self.preprocess(state)
             if state.obs is not None:
                 result.screenshots[step_no] = state.obs.screenshot
+            self._emit_progress("deciding", state, result)
             messages = self.build_input(state)
             before = self._observation_record(state.obs, f"o_{step_no}")
             decision = self.decide(messages)
+            self._emit_progress("decided", state, result, raw=decision.raw,
+                                action=self._action_record(decision.action))
             for call in decision.calls:
                 call.setdefault("actor_role", "decision")
                 call.setdefault("provenance", "sampled")
@@ -184,11 +199,22 @@ class Pipeline:
                     "terminated": False, "truncated": False,
                 })
                 state.memory.add_event("⚠️ 上一步动作解析失败，请重新输出合法的 next_action JSON")
+                result.steps = step_no
+                self._emit_progress("step_complete", state, result, status="rejected")
                 continue
             ground_started = time.perf_counter()
+            self._check_step_budget("grounding")
+            self._emit_progress("grounding", state, result,
+                                action=self._action_record(decision.action))
             action = self.ground(decision.action, state)
             ground_ms = (time.perf_counter() - ground_started) * 1000
             execute_started = time.perf_counter()
+            self._check_step_budget("executing")
+            if action.action == "wait" and float(action.args.get("seconds", 0)) > self._deadline - time.monotonic():
+                raise ModelRequestTimeout("等待动作超出本步剩余时间")
+            self._emit_progress("executing", state, result, action=self._action_record(action),
+                                route=copy.deepcopy(state.route),
+                                grounding=self._grounding_diagnostics() if state.route is None else {})
             # execute 阶段推送进度（下载等长耗时动作让前端看到"执行中"而非干等）
             if _viz_log_status is not None:
                 try:
@@ -197,15 +223,21 @@ class Pipeline:
                 except Exception:  # noqa: BLE001
                     pass
             execution = self.execute(action, state)
+            self._emit_progress("executed", state, result, execution_info=execution.info,
+                                outcome=execution.outcome)
             if _viz_log_status is not None:
                 try:
                     _viz_log_status({"event": "executed", "step": step_no,
                                      "status": (execution.info or {}).get("status", ""),
-                                     "action": (execution.info or {}).get("action", "")})
+                                     "action": (execution.info or {}).get("action", "") or action.action,
+                                     "error": (execution.info or {}).get("error", "")})
                 except Exception:  # noqa: BLE001
                     pass
             execute_ms = (time.perf_counter() - execute_started) * 1000
+            self._check_step_budget("postprocess")
+            self._emit_progress("postprocess", state, result)
             state, should_break = self.postprocess(step_no, decision, execution, state, result)
+            self._check_step_budget("step_complete")
             result.steps = step_no
             entry = next((t for t in reversed(result.trajectory)
                           if t.get("action_id") == f"a_{step_no}"), None)
@@ -227,6 +259,8 @@ class Pipeline:
                     "timing_ms": {"ground": round(ground_ms, 2), "execute_observe": round(execute_ms, 2),
                                   "total": round((time.perf_counter() - started) * 1000, 2)},
                 })
+            self._emit_progress("step_complete", state, result,
+                                status=(execution.info or {}).get("status", ""))
             if self.step_callback is not None:
                 try:
                     self.step_callback(step_no, decision, execution, state)
@@ -243,6 +277,46 @@ class Pipeline:
             transitions[-1]["truncated"] = not transitions[-1].get("terminated", False)
             transitions[-1]["done"] = True
         return result
+
+    def _start_step_budget(self):
+        self._deadline = time.monotonic() + self.step_timeout
+        for component in (self.model, self.grounding, self.env):
+            setattr(component, "request_deadline", self._deadline)
+
+    def _check_step_budget(self, phase):
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise ModelRequestTimeout(f"本步已超过 {self.step_timeout:g} 秒，阶段: {phase}")
+
+    @staticmethod
+    def _action_record(action):
+        return {"action": action.action, "args": dict(action.args)} if action is not None else None
+
+    def _grounding_diagnostics(self):
+        call = getattr(self.grounding, "last_call", {})
+        if not isinstance(call, dict):
+            return {}
+        return {key: copy.deepcopy(call[key]) for key in
+                ("model", "target", "response", "error", "confidence", "latency_ms") if key in call}
+
+    def _emit_progress(self, phase, state, result, **details):
+        now = time.monotonic()
+        if self._last_phase is not None:
+            previous, step, started = self._last_phase
+            if step == state.step_id:
+                details["previous_phase"] = previous
+                details["previous_phase_elapsed_ms"] = round((now - started) * 1000, 2)
+        self._last_phase = (phase, state.step_id, now)
+        event = {"event": phase, "phase": phase, "step": state.step_id,
+                 "task": state.task, "ts": time.time(), **details}
+        duration = event.get("previous_phase_elapsed_ms")
+        elapsed = f"；{event['previous_phase']} 耗时 {duration / 1000:.2f}s" if duration is not None else ""
+        print(f"[step {state.step_id}] [phase] {phase}{elapsed}", flush=True)
+        if self.progress_callback is None:
+            return
+        try:
+            self.progress_callback(event, state, result)
+        except Exception as exc:  # 记录失败可见，不中断已经进行中的 GUI 任务
+            print(f"[trajectory] 无法保存 {phase} 记录: {exc}", flush=True)
 
     @staticmethod
     def _observation_record(obs, observation_id):
@@ -304,6 +378,8 @@ class Pipeline:
                 call.update({"messages": copy.deepcopy(messages),
                              "error_type": type(exc).__name__, "valid_action": False})
                 calls.append(call)
+                if isinstance(exc, ModelRequestTimeout):
+                    raise
                 return Decision(raw="", action=None, calls=calls)
             call = copy.deepcopy(getattr(self.model, "last_call", {}))
             call.update({"messages": copy.deepcopy(messages), "response": raw, "valid_action": False})
@@ -342,6 +418,8 @@ class Pipeline:
         # 先路由：带 target_ref 且引用有效 → browser_dom；否则走 GUI grounding
         try:
             state.route = self.env.route_action(action, state.obs)
+        except ModelRequestTimeout:
+            raise
         except Exception:  # noqa: BLE001
             state.route = None
         if state.route is not None:
@@ -389,13 +467,18 @@ class Pipeline:
                                  outcome=json.dumps(info, ensure_ascii=False),
                                  obs=step_result.observation, info=info,
                                  reward=step_result.reward, done=step_result.done)
+            except ModelRequestTimeout:
+                raise
             except Exception as exc:  # noqa: BLE001
                 return Execution(kind="browser_dom", executed=self._compact_action(action),
                                  outcome=f"结构化执行异常，需重新观察: {type(exc).__name__}",
                                  info={"status": "uncertain", "error_type": type(exc).__name__})
         if state.route and state.route.get("channel") == "reobserve":
+            refresh = getattr(self.env, "_fresh_obs_after_action", None)
+            obs = refresh() if state.route.get("refresh_observation") and callable(refresh) else None
             return Execution(kind="browser_dom", outcome=state.route.get("reason", "需重新观察"),
-                             executed="rejected", info={"status": "rejected", "dispatched": False})
+                             executed="rejected", obs=obs,
+                             info={"status": "rejected", "dispatched": False})
 
         if is_skill(name):
             out = run_skill(name, action.args, state.skill_ctx)
@@ -460,9 +543,13 @@ class Pipeline:
         # 共用 env.step 通道，但验证方式不同（uno 读回单元格 / 确认落盘，env 看屏幕变化）。
         try:
             step_result = self.env.step(action)
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:  # noqa: BLE001
             return Execution(kind=kind, executed=self._compact_action(action),
-                             outcome=f"执行异常: {exc}")
+                             outcome=f"执行异常: {exc}",
+                             info={"status": "uncertain", "dispatched": True,
+                                   "action": name, "error": str(exc)})
         outcome = self._describe_outcome(step_result)
         # type 落点校验结果透传：把「疑似打错输入框」的提示拼进 outcome，模型下一轮能看到并纠正
         if isinstance(step_result.info, dict):
@@ -486,7 +573,9 @@ class Pipeline:
 
         return Execution(kind=kind, executed=self._compact_action(action),
                          outcome=outcome,
-                         obs=step_result.observation, done=step_result.done)
+                         obs=step_result.observation, done=step_result.done,
+                         info=step_result.info if isinstance(step_result.info, dict) else {},
+                         reward=step_result.reward)
 
     def postprocess(self, step_no: int, decision: Decision, execution: Execution,
                     state: StepState, result: AgentResult) -> Tuple[StepState, bool]:
@@ -676,6 +765,8 @@ class Pipeline:
             }
             state.memory.task_state["goal"] = task
             state.memory.add_event(f"📋 已制定任务计划：{len(norm_steps)} 步")
+        except ModelRequestTimeout:
+            raise
         except Exception:  # noqa: BLE001  planner 失败不影响主流程
             return
 
@@ -783,7 +874,9 @@ class Pipeline:
         status = info.get("status")
         if status == "rejected":
             return f"失败：{str(info.get('error', ''))[:60]}"
-        if status in ("executed", "uncertain"):
+        if status == "uncertain":
+            return f"结果不确定：{str(info.get('error', ''))[:60]}"
+        if status == "executed":
             return "已执行"
         return (execution.outcome or "")[:80]
 
@@ -856,6 +949,8 @@ class Pipeline:
         messages = [{"role": "user", "content": text}]
         try:
             raw = self.model.chat(messages)
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:  # noqa: BLE001  模型不可用时放行，避免死锁
             self._verification = {"messages": messages, "error_type": type(exc).__name__}
             return True, ""
@@ -912,12 +1007,16 @@ class Pipeline:
         elif execution.kind == "terminal":
             state.execution_status = "fail"
         else:
-            state.execution_status = "executed"
+            info = execution.info or {}
+            state.execution_status = info.get("status") or ("error" if info.get("error") else "executed")
 
     def _validate_action(self, action: Action) -> Optional[str]:
         name = action.action
         if is_skill(name):
             return validate_skill(name, action.args)
+        supported = getattr(self.env, "supported_action_names", None)
+        if supported is not None and name not in supported:
+            return f"当前环境不支持动作「{name}」。可选动作：{', '.join(sorted(supported))}"
         if name not in ACTION_REGISTRY:
             return (f"未知动作类型「{name}」。可选动作：{', '.join(ACTION_REGISTRY)}；"
                     f"可选技能：{', '.join(enabled_skills())}")
@@ -947,7 +1046,9 @@ class Pipeline:
                 coord = self._ocr_fallback(obs.screenshot, str(action.args.get("target", "")))
             if coord is None:
                 # grounding 失败：不带可执行坐标，由执行器拒绝（空转），不做坐标钳制
-                return Action(action.action, {"grounding_failed": True, **extra})
+                return Action(action.action, {"grounding_failed": True,
+                                              "grounding_error": self._grounding_diagnostics().get("error", ""),
+                                              **extra})
             x, y = coord
             return Action(action.action, {"x": x, "y": y, **extra})
         if spec.resolve == "select":
@@ -987,7 +1088,11 @@ class Pipeline:
             img = screenshot
             if isinstance(screenshot, bytes):
                 img = Image.open(BytesIO(screenshot))
-            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+            self._check_step_budget("ocr")
+            timeout = max(0.001, min(15.0, self._deadline - time.monotonic())) if self._deadline else 15.0
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, timeout=timeout)
+        except ModelRequestTimeout:
+            raise
         except Exception:  # noqa: BLE001
             return None
 
@@ -1019,6 +1124,8 @@ class Pipeline:
                 if 0 <= wid < len(words):
                     w = words[wid]
                     return (w["left"] + w["width"] // 2, w["top"] + w["height"] // 2)
+        except ModelRequestTimeout:
+            raise
         except Exception:  # noqa: BLE001
             pass
         return None
@@ -1086,6 +1193,14 @@ class Pipeline:
 
     @staticmethod
     def _describe_outcome(step_result) -> str:
+        info = step_result.info if isinstance(step_result.info, dict) else {}
+        status, error = info.get("status"), info.get("error")
+        if status == "rejected":
+            return f"未执行：{error or '动作被拒绝'}"
+        if status == "uncertain":
+            return f"执行结果不确定：{error or '需要重新观察'}"
+        if error:
+            return f"执行失败：{error}"
         if step_result.done:
             return "任务完成"
         if step_result.reward and step_result.reward > 0:

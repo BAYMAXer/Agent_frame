@@ -263,6 +263,7 @@ async def local_runs():
             if not traj_path.exists():
                 continue
             instruction, score, steps, success = "", None, 0, None
+            status, phase, pending_step = "", "", None
             try:
                 with open(traj_path, encoding="utf-8") as f:
                     traj = json.load(f)
@@ -270,6 +271,9 @@ async def local_runs():
                 outcome = traj.get("outcome") or {}
                 score = outcome.get("score")
                 success = outcome.get("success")
+                status = outcome.get("status", "")
+                phase = outcome.get("phase", "")
+                pending_step = traj.get("pending_step")
                 steps = len(traj.get("steps") or [])
             except Exception:  # noqa: BLE001
                 pass
@@ -277,6 +281,7 @@ async def local_runs():
                          if f.startswith("step_") and f.endswith(".png")])
             runs.append({"id": d.name, "instruction": instruction, "score": score,
                          "success": success, "steps": steps, "shots": shots,
+                         "status": status, "phase": phase, "pending_step": pending_step,
                          "mtime": d.stat().st_mtime})
     return {"runs": runs}
 
@@ -323,6 +328,17 @@ def _local_traj_to_frontend(traj):
             "decision_elapsed_ms": decision_elapsed,
             "subagent": subagent,
         })
+    pending = traj.get("pending_step")
+    if isinstance(pending, dict):
+        step = pending.get("step", 0)
+        action = pending.get("action")
+        lines.append({"step_num": step, "pending": True,
+                      "screenshot_file": f"step_{step}.png" if step else None,
+                      "action": json.dumps(action, ensure_ascii=False) if isinstance(action, dict) else "",
+                      "plan": pending.get("raw", ""), "routing": pending.get("route") or {},
+                      "outcome": "未完成阶段: " + str(pending.get("phase") or pending.get("event") or "")
+                                 + " " + str((traj.get("outcome") or {}).get("error") or ""),
+                      "done": False})
     return lines
 
 
@@ -455,13 +471,15 @@ def _start_local(cfg: dict):
     task = str(cfg.get("task") or "").strip()
     if not task:
         return {"ok": False, "error": "请输入任务描述"}
-    model = cfg.get("model", "Qwen3.5-9B")
-    model_url = cfg.get("model_url", "http://7.246.80.189:9028/v1")
-    ground_model = cfg.get("ground_model", "UI-Venus-2-9B")
-    ground_url = cfg.get("ground_url", "http://7.246.80.189:8001/v1")
+    model = cfg.get("model") or os.getenv("OSWORLD_LOCAL_MODEL", "Qwen3.5-9B")
+    model_url = cfg.get("model_url") or os.getenv("OSWORLD_LOCAL_MODEL_URL", "http://7.246.80.189:9028/v1")
+    ground_model = cfg.get("ground_model") or os.getenv("OSWORLD_LOCAL_GROUND_MODEL", "UI-Venus-2-9B")
+    ground_url = cfg.get("ground_url") or os.getenv("OSWORLD_LOCAL_GROUND_URL", "http://7.246.80.189:8001/v1")
+    ground_type = cfg.get("ground_type") or os.getenv("OSWORLD_LOCAL_GROUND_TYPE", "ui-venus2")
     max_steps = int(cfg.get("max_steps", 15))
     result_dir = cfg.get("result_dir") or os.path.join(
         LOCAL_RUNS_DIR, "ui_" + time.strftime("%Y%m%d_%H%M%S"))
+    cfg = {**cfg, "result_dir": result_dir}
 
     cmd = [
         _runner_python(), str(_PKG / "run_windows_local.py"),
@@ -470,10 +488,18 @@ def _start_local(cfg: dict):
         "--model-url", model_url,
         "--ground-model", ground_model,
         "--ground-url", ground_url,
+        "--ground-type", ground_type,
+        "--model-timeout", str(cfg.get("model_timeout") or os.getenv("OSWORLD_LOCAL_MODEL_TIMEOUT", "60")),
+        "--ground-timeout", str(cfg.get("ground_timeout") or os.getenv("OSWORLD_LOCAL_GROUND_TIMEOUT", "60")),
+        "--step-timeout", str(cfg.get("step_timeout") or os.getenv("OSWORLD_LOCAL_STEP_TIMEOUT", "120")),
         "--max-steps", str(max_steps),
         "--result-dir", result_dir,
     ]
     env = os.environ.copy()
+    if cfg.get("model_api_key"):
+        env["OSWORLD_LOCAL_MODEL_API_KEY"] = str(cfg["model_api_key"])
+    if cfg.get("ground_api_key"):
+        env["OSWORLD_LOCAL_GROUND_API_KEY"] = str(cfg["ground_api_key"])
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
     env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{os.getenv('AGENTS_VIZ_PORT', '8088')}"
@@ -603,10 +629,41 @@ async def stop_run():
     proc = _agent_state["proc"]
     if proc and proc.poll() is None:
         try:
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=15)
+            command = ["taskkill"]
+            if (_agent_state.get("config") or {}).get("mode") != "local":
+                command.append("/T")
+            # 本机任务只停止 runner，保留它按需启动的 Chrome 子进程。
+            command.extend(["/F", "/PID", str(proc.pid)])
+            subprocess.run(command,
+                           capture_output=True, timeout=15, check=True)
+            proc.wait(timeout=5)
         except Exception:
-            proc.terminate()
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception as exc:
+                return {"ok": False, "error": f"未能确认任务已停止: {exc}"}
+        cfg = _agent_state.get("config") or {}
+        if cfg.get("mode") == "local" and cfg.get("result_dir"):
+            # /F 不会运行 runner 的 finally，保留已写入的未完成步骤并标记中断。
+            base = Path(cfg["result_dir"])
+            target = base / "trajectory.json"
+            if target.is_file():
+                try:
+                    trajectory = json.loads(target.read_text(encoding="utf-8"))
+                    outcome = trajectory.setdefault("outcome", {})
+                    if outcome.get("status") == "running":
+                        outcome.update(status="interrupted", error="任务被手动终止")
+                        temporary = base / ".stopped_trajectory.json"
+                        temporary.write_text(json.dumps(trajectory, ensure_ascii=False, indent=2),
+                                             encoding="utf-8")
+                        os.replace(temporary, target)
+                        with (base / "run_events.jsonl").open("a", encoding="utf-8") as stream:
+                            stream.write(json.dumps({"event": "task_end", "status": "interrupted",
+                                                     "phase": outcome.get("phase"), "ts": time.time()},
+                                                    ensure_ascii=False) + "\n")
+                except (OSError, ValueError, TypeError):
+                    pass
     _agent_state["status"] = "idle"
     _agent_state["proc"] = None
     _agent_state["task_name"] = None
@@ -641,11 +698,12 @@ async def manual_eval():
 
 # ================= 实验/调试 stub（防止前端报错）================= #
 @app.get("/experiments/default-prompt")
-async def get_default_prompt(backend: str = "native", browser_only: bool = False):
+async def get_default_prompt(backend: str = "native", browser_only: bool = False,
+                             os_name: str = "linux"):
     try:
         from osworld_agent.prompts import build_system_prompt
         return {"ok": True, "backend": "native",
-                "prompt": build_system_prompt(browser_only=browser_only)}
+                "prompt": build_system_prompt(os_name=os_name, browser_only=browser_only)}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -879,12 +937,12 @@ def _keep_model_warm():
 
     决策变慢的根因不是「模型被卸载」，而是 vLLM 第一次处理长 system prompt（+3 张截图）时
     要计算全部 KV cache（prefix cache 冷启动）；纯文本 "ping" 无法 warm 这个 cache。
-    所以这里用 build_system_prompt(browser_only=True) 作为 system 前缀去 warm，
+    所以这里用本机完整 GUI system prompt 作为 system 前缀去 warm，
     之后真实决策的 system 前缀命中 cache，只剩动态部分（任务/截图/AX树），快。
     """
     import requests as _req
     from osworld_agent.prompts import build_system_prompt
-    sys_prompt = build_system_prompt(browser_only=True)
+    sys_prompt = build_system_prompt(os_name="windows", browser_only=False)
     dec_url = os.getenv("OSWORLD_DECISION_URL", "http://7.246.80.189:9028/v1/chat/completions")
     grd_url = os.getenv("OSWORLD_GROUNDING_URL", "http://7.246.80.189:8001/v1/chat/completions")
     while True:

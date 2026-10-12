@@ -8,6 +8,7 @@
     - 焦点检测（当前前台窗口是不是浏览器）
     - 抓取当前页面的 AX-Tree（可访问性树）
     - 抓取当前页面的 HTML 源码
+演示完成或导航失败后保留浏览器窗口。
 """
 import sys
 import time
@@ -20,7 +21,7 @@ from osworld_agent.utils import (
     fetch_page_source,
     list_cdp_pages,
 )
-from osworld_agent.run_windows_local import ensure_chrome, close_test_chrome
+from osworld_agent.run_windows_local import ensure_chrome
 from osworld_agent.browser_session import BrowserSession, BrowserOptions
 
 CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -30,8 +31,9 @@ URL = "https://www.baidu.com"  # 可换成任意网页
 
 def main():
     print(f"[1] 启动无痕 Chrome（remote debugging 端口 {PORT}）...")
-    # 与本地 runner 共用启动/核验/清理；profile 使用真实、唯一的临时目录。
-    started, profile = ensure_chrome(PORT, CHROME)
+    # 与本地 runner 共用启动/核验；完成后保留浏览器，仅释放会话资源。
+    ensure_chrome(PORT, CHROME)
+    session = None
     try:
         session = BrowserSession(BrowserOptions(endpoint=f"http://localhost:{PORT}",
                                                 require_focus=False))
@@ -60,8 +62,8 @@ def main():
         print(f"    HTML {len(html)} 字符，前 300 字：")
         print("    " + html[:300].replace("\n", "\n    ") if html else "    (空)")
     finally:
-        if started:
-            close_test_chrome(PORT, profile)
+        if session is not None:
+            session.close()
     print("\n演示结束。注意：这是从「已打开的 Chrome」抓取；核心函数都在 osworld_agent/utils.py。")
 
 
