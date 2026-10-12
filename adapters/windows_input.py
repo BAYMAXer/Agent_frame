@@ -162,7 +162,14 @@ def _matching_windows(windows: list[dict], app_code: str) -> list[dict]:
     return [window for window in windows if window["executable"].casefold() in executables]
 
 
-def activate_application(app_code: str) -> dict:
+def foreground_window():
+    user32 = _load_user32()
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    return user32.GetForegroundWindow()
+
+
+def activate_application(app_code: str, work_screen=None) -> dict:
     """Activate exactly one matching window; never substitute a blind Alt+Tab."""
     if not app_code or not app_code.strip():
         return {"status": "rejected", "dispatched": False, "error": "缺少目标应用 app_code"}
@@ -187,6 +194,11 @@ def activate_application(app_code: str) -> dict:
     try:
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        if work_screen is not None:
+            from .windows_display import move_window_to_work_screen
+            if not move_window_to_work_screen(hwnd, work_screen):
+                return {"status": "uncertain", "dispatched": True,
+                        "error": f"目标窗口未能移动到主屏工作区: {window['title']}"}
         user32.SetForegroundWindow(hwnd)
         focused = user32.GetForegroundWindow() == hwnd
     except Exception as exc:  # noqa: BLE001  The activation might have partially completed.

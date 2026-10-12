@@ -180,7 +180,7 @@ def build_system_prompt(
   "screen_analysis": "先仔细检查并描述当前屏幕：当前打开的是哪个页面、里面有什么内容、任务要在哪里做。这一步必须做，别跳过",
   "observed_effect": "先客观描述：上一步动作后屏幕发生了什么变化（只描述事实，不判断好坏）",
   "action_status": "success | failure | uncertain",
-  "state_update": {{"current_subgoal": "...", "completed_add": [], "known_fact_add": {{}}}},
+  "state_update": {{"current_subgoal": "...", "completed_add": [], "known_fact_add": {{}}, "plan_update": {{"current_step_id": "p1", "completed_steps": [], "blocked_steps": []}}}},
   "expected_effect": "执行 next_action 后应该观察到什么变化"
 }}
 ```
@@ -188,6 +188,9 @@ def build_system_prompt(
 - observed_effect：先客观描述上一步动作的【实际效果】，再给 action_status 判断，避免主观臆断。
 - action_status：结合三张截图 + 记忆里的上一步 expected_effect，判断 success / failure / uncertain。
 - state_update：只输出补丁，不要重写整份记忆。
+- plan_update：仅当记忆中有任务计划时填写。步骤 ID 必须从当前计划复制。若【上一动作】后的观察已满足该子任务的完整完成判据，且 action_status=success，填写 completed_steps: [{{"step_id": "p1", "evidence": "实际观察到的完成结果"}}]；不要把即将执行的 next_action 提前标为完成，也不要把一次点击成功当作整个子任务完成。没有完成证据就留空。
+- current_step_id：填写当前最早未完成的计划步骤；遇到实际阻塞可填写 blocked_steps: [{{"step_id": "p1", "reason": "具体障碍"}}]。障碍解决后再选该 ID 恢复执行。没有计划时不编造 ID。
+- 若当前子目标已在界面上满足，但 last_action_plan_step_id 不属于它（包括第一步没有上一动作），不要重复打开应用或重新输入；先用 {{"type":"wait","seconds":0.1}} 仅刷新观察，再根据实际观察确认当前这一项。
 - next_action：下一步动作。type 是动作名，其余是参数（带 target_ref / element_id 时走 DOM 定位，最稳）。
 - expected_effect：这一步做完你【预期】观察到什么变化（闭环核心，程序会拿它和下一步的 observed_effect 对比）。
 
@@ -258,18 +261,21 @@ def build_format_feedback(error: str) -> str:
 # --------------------------------------------------------------------------- #
 # 任务规划（planner）：把模糊任务拆成结构化 plan
 # --------------------------------------------------------------------------- #
-def build_planner_prompt(task: str) -> str:
-    """任务规划 prompt：把用户模糊任务拆解成 3~8 个可独立执行、按顺序完成的子步骤。"""
-    return f"""你是任务规划器。把用户模糊的任务拆解成 3~8 个可独立执行、按顺序完成的子步骤。
+def build_planner_prompt(task: str, os_name: str = "linux") -> str:
+    """用一轮轻量规划生成可核实的子目标，执行进度由决策补丁与实际证据维护。"""
+    return f"""你是任务规划器。根据任务复杂度生成 1~8 个按顺序完成的子目标，简单任务可只有 1 步。
+目标环境：{_OS_DISPLAY.get(os_name, os_name)}。
 
 拆解规则：
-1. 第一步通常是「打开某个网站/应用」。搜索类任务要明确打开哪个搜索引擎（谷歌学术 scholar.google.com / 谷歌 / arXiv / Bing 等），不要只写"打开浏览器"；
+1. 从当前已打开的应用或网页继续，只有需要时才安排打开/切换。网站任务明确网址；普通桌面任务不要安排打开浏览器；
 2. 搜索类任务：必须自己提炼搜索关键词（论文名、主题词、作者等），写进 keywords 数组；
-3. 每个子步骤要具体、可操作（含明确的操作对象和预期结果），不要写"完成任务"这种空话；
-4. 最后给出「完成判据」final_check：一个可以客观核对的完成标志（如"downloads 目录下存在该论文的 PDF 文件"）。
+3. 每个子目标描述一个可核实的结果，并写 completion_criteria。把「打开网站、搜索、确认目标、下载」拆开；不同论文的下载分开列出。子目标可以需要多个界面动作，不能用一次点击是否成功代替完成判据；
+4. 最终整体核对放 final_check，不单独生成「核实任务完成」步骤，避免结束验证与待办互相等待；
+5. completion_check 只能是 {{"kind":"observation"}}、{{"kind":"navigation","url":"https://目标网址"}} 或 {{"kind":"download"}}。导航仅用于真正的访问子目标；下载仅用于单个文件的落盘子目标。只有文件名或下载地址已明确时才添加 filename/url，未知时不要猜测。不能输出脚本/代码作为检查器；
+6. 全部步骤从 1 开始顺序编号。任务进度会复用执行模型的反馈维护，不必把每个点击/按键都拆成一个子目标。
 
 任务：{task}
 
 只输出一个 JSON 对象，不要多余文字：
-{{"steps": [{{"idx": 1, "goal": "..."}}, {{"idx": 2, "goal": "..."}}], "keywords": ["..."], "final_check": "..."}}"""
+{{"steps": [{{"idx": 1, "goal": "...", "completion_criteria": "...", "completion_check": {{"kind": "observation"}}}}], "keywords": ["..."], "final_check": "..."}}"""
 

@@ -90,7 +90,24 @@ os.environ["no_proxy"] = _no_proxy
 _agent_state = {
     "status": "idle", "proc": None, "task_name": None, "config": None,
     "start_time": None, "output": [], "current_step": 0, "max_steps": 0, "task_total": 0,
+    "plan": None, "current_plan_step_id": None, "plan_revision": None,
+    "plan_update": None, "task_start": None,
 }
+
+
+def _clear_plan_state():
+    """A new task must not recover a previous task's plan after reconnecting."""
+    _agent_state.update(plan=None, current_plan_step_id=None, plan_revision=None,
+                        plan_update=None, task_start=None)
+
+
+def _plan_revision(payload):
+    plan = payload.get("plan")
+    revision = payload.get("revision", plan.get("revision") if isinstance(plan, dict) else None)
+    try:
+        return int(revision) if revision is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _reader_thread(proc):
@@ -128,6 +145,18 @@ async def receive_log(request: Request):
             _agent_state["current_step"] = max(_agent_state["current_step"] or 0, int(payload["step"]))
         elif ev == "task_start":
             _agent_state["current_step"] = 0
+            _clear_plan_state()
+            _agent_state["task_start"] = stored
+        elif ev == "plan_update" and isinstance(payload.get("plan"), (dict, list)):
+            revision = _plan_revision(payload)
+            previous = _agent_state.get("plan_revision")
+            if previous is None or revision is None or revision >= previous:
+                plan = payload["plan"]
+                _agent_state["plan"] = plan
+                _agent_state["current_plan_step_id"] = payload.get(
+                    "current_plan_step_id", plan.get("current_plan_step_id", plan.get("current_step_id")) if isinstance(plan, dict) else None)
+                _agent_state["plan_revision"] = revision
+                _agent_state["plan_update"] = stored
     msg = json.dumps(payload, ensure_ascii=False)
     dead = []
     for ws in clients:
@@ -142,7 +171,10 @@ async def receive_log(request: Request):
 
 @app.get("/history")
 async def history():
-    return {"logs": logs}
+    # MAX_LOGS can evict task_start/plan_update during a long run. Keep the current
+    # snapshot available without growing the log buffer indefinitely.
+    return {"logs": logs, "task_start": _agent_state.get("task_start"),
+            "plan_update": _agent_state.get("plan_update")}
 
 
 @app.websocket("/ws")
@@ -515,6 +547,7 @@ def _start_local(cfg: dict):
     _agent_state["max_steps"] = max_steps
     _agent_state["start_time"] = time.time()
     _agent_state["status"] = "starting"
+    _clear_plan_state()
     logs.clear()
     try:
         proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
@@ -597,6 +630,7 @@ async def start_run(request: Request):
     _agent_state["max_steps"] = max_steps
     _agent_state["start_time"] = time.time()
     _agent_state["status"] = "starting"
+    _clear_plan_state()
     logs.clear()
     try:
         proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
@@ -621,6 +655,11 @@ async def run_status():
         "max_steps": _agent_state["max_steps"],
         "elapsed": round(elapsed, 1),
         "pid": _agent_state["proc"].pid if _agent_state["proc"] else None,
+        "plan": _agent_state.get("plan"),
+        "current_plan_step_id": _agent_state.get("current_plan_step_id"),
+        "plan_revision": _agent_state.get("plan_revision"),
+        "plan_update": _agent_state.get("plan_update"),
+        "task_start": _agent_state.get("task_start"),
     }
 
 

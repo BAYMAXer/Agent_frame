@@ -35,6 +35,8 @@ from osworld_agent.model import ChatModel             # noqa: E402
 from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
 from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
 from osworld_agent.adapters.windows_env import WindowsEnvironment        # noqa: E402
+from osworld_agent.adapters.windows_display import (detect_primary_work_screen,
+                                                     initialize_dpi_awareness)  # noqa: E402
 from osworld_agent.agent import Agent                 # noqa: E402
 from osworld_agent.run_recording import LocalRunRecorder  # noqa: E402
 from osworld_agent.viz.logging import (LoggingChatModel, LoggingGrounding,  # noqa: E402
@@ -306,12 +308,19 @@ def main() -> int:
            for value in (args.model_timeout, args.ground_timeout, args.step_timeout)):
         parser.error("模型、定位及每步超时必须为有限正数")
 
-    # 0) 屏幕分辨率：grounding 按它换算坐标，必须和真实屏幕一致
+    # 0) 在 GUI 库初始化前统一 DPI；每次任务按 Windows 主屏标志选择默认工作屏幕。
+    dpi_awareness = initialize_dpi_awareness()
     import pyautogui
     sw, sh = pyautogui.size()
-    width = args.width or sw
-    height = args.height or sh
-    print(f"[screen] 分辨率 {width}x{height}（检测到 {sw}x{sh}）")
+    work_screen = detect_primary_work_screen(sw, sh)
+    width = args.width or work_screen.width
+    height = args.height or work_screen.height
+    if work_screen.detected:
+        print(f"[screen] 检测到 {work_screen.monitor_count} 块屏幕；默认工作屏幕：主屏 "
+              f"{work_screen.device or '(primary)'} {work_screen.width}x{work_screen.height}")
+    else:
+        print(f"[screen] 显示布局检测不可用，沿用默认主屏截图；后备尺寸 "
+              f"{work_screen.width}x{work_screen.height}")
 
     if not args.result_dir:
         base = os.getenv("OSWORLD_LOCAL_RUNS_DIR", os.path.join(_here, "local_runs"))
@@ -341,7 +350,8 @@ def main() -> int:
         # 3) 环境
         env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
                                  downloads_dir=args.download_dir,
-                                 browser_launcher=lambda: ensure_chrome(args.browser_port, args.chrome))
+                                 browser_launcher=lambda: ensure_chrome(args.browser_port, args.chrome),
+                                 work_screen=work_screen)
 
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env,
@@ -349,7 +359,8 @@ def main() -> int:
                       step_callback=_live_step, progress_callback=recorder.on_progress,
                       step_timeout=args.step_timeout)
         reset_collected()
-        log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps})
+        log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps,
+                    "work_screen": work_screen.to_dict(), "dpi_awareness": dpi_awareness})
         print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)
     except BaseException as exc:

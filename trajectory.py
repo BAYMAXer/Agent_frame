@@ -115,6 +115,8 @@ def build_trajectory(
             "resolved_action": s.get("resolved_action"),
             "execution_info": s.get("execution_info", {}),
             "verification": s.get("verification"),
+            "plan_step_id": s.get("plan_step_id"),
+            "plan_snapshot": s.get("plan_snapshot"),
             "timing_ms": s.get("timing_ms", {}),
             "trainable": bool(s.get("policy_input") and s.get("policy_output") and s.get("valid_action", False)),
         })

@@ -20,7 +20,9 @@ from typing import Any, Callable, Dict, Optional
 from ..env import Environment, Observation, StepResult
 from ..actions import ACTION_REGISTRY, Action, get_action_spec
 from .vmware_env import to_pyautogui
-from .windows_input import activate_application, write_text
+from .windows_input import activate_application, foreground_window, write_text
+from .windows_display import (WorkScreen, detect_primary_work_screen,
+                              initialize_dpi_awareness, move_window_to_work_screen)
 from ..model.request_deadline import ModelRequestTimeout
 
 
@@ -34,7 +36,8 @@ class WindowsEnvironment(Environment):
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
                  downloads_dir: Optional[str] = None,
                  browser_launcher: Optional[Callable[[], Any]] = None,
-                 action_settle_seconds: float = 0.3):
+                 action_settle_seconds: float = 0.3,
+                 work_screen: Optional[WorkScreen] = None):
         self.browser_port = browser_port
         self.width = width
         self.height = height
@@ -45,6 +48,9 @@ class WindowsEnvironment(Environment):
         self._browser_session = None
         self._screenshot_is_viewport = False
         self.action_settle_seconds = max(0.0, float(action_settle_seconds))
+        self.work_screen = work_screen
+        self._fallback_size = (width, height)
+        self.dpi_awareness = None
 
     # ---- 观察 ----
     def _take_screenshot(self):
@@ -59,10 +65,58 @@ class WindowsEnvironment(Environment):
                     return shot
         return self._take_desktop_screenshot()
 
-    @staticmethod
-    def _take_desktop_screenshot():
+    def _take_desktop_screenshot(self):
+        if self.work_screen and self.work_screen.detected and self.work_screen.monitor_count > 1:
+            from PIL import ImageGrab
+            screen = self.work_screen
+            # bbox 使用虚拟桌面坐标；all_screens 支持左侧/上方副屏的负坐标布局。
+            return ImageGrab.grab(bbox=(screen.left, screen.top,
+                                        screen.left + screen.width, screen.top + screen.height),
+                                  all_screens=True)
         import pyautogui
         return pyautogui.screenshot()
+
+    def _screen_info(self):
+        return self.work_screen.to_dict() if self.work_screen else None
+
+    def _screenshot_origin(self):
+        if self._screenshot_is_viewport or not self.work_screen:
+            return [0, 0]
+        return [self.work_screen.left, self.work_screen.top]
+
+    def _position_browser_on_work_screen(self):
+        """明确导航时才移动已激活的浏览器窗口，观察阶段不改变用户窗口。"""
+        screen = self.work_screen
+        if not screen or not screen.detected or screen.monitor_count <= 1:
+            return True
+        if not self._focus_is_browser():
+            return False
+        try:
+            hwnd = foreground_window()
+            if not hwnd or not self._focus_is_browser() or foreground_window() != hwnd:
+                return False
+            if not move_window_to_work_screen(hwnd, screen):
+                return False
+            self._invalidate_browser_snapshot()
+            return foreground_window() == hwnd and self._focus_is_browser()
+        except OSError:
+            return False
+
+    def _desktop_action(self, action):
+        """截图内坐标转换为工作屏幕坐标；浏览器 viewport 不经过此路径。"""
+        screen = self.work_screen
+        if not screen or not screen.detected:
+            return action
+        args = dict(action.args)
+        for x_key, y_key in (("x", "y"), ("x1", "y1"), ("x2", "y2")):
+            x, y = args.get(x_key), args.get(y_key)
+            if x is None or y is None:
+                continue
+            x, y = int(x), int(y)
+            if not (0 <= x < screen.width and 0 <= y < screen.height):
+                raise ValueError("目标坐标不在当前工作屏幕内")
+            args[x_key], args[y_key] = x + screen.left, y + screen.top
+        return Action(action.action, args)
 
     def _focus_is_browser(self) -> bool:
         """仅当前台活动窗口是浏览器时进入 browser use。"""
@@ -123,7 +177,9 @@ class WindowsEnvironment(Environment):
                 self._screenshot_is_viewport = False
         context = [snapshot] if snapshot and scene["structure_available"] else []
         info = {"scene": scene,
-                "screenshot_coordinate_space": "css_viewport" if self._screenshot_is_viewport else "screen"}
+                "screenshot_coordinate_space": "css_viewport" if self._screenshot_is_viewport else "screen",
+                "screenshot_origin": self._screenshot_origin(), "work_screen": self._screen_info(),
+                "dpi_awareness": self.dpi_awareness}
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
     def _derive_scene(self, snapshot):
@@ -235,6 +291,10 @@ class WindowsEnvironment(Environment):
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
         if action.action == "goto" or route.get("goto_url"):
+            if not self._position_browser_on_work_screen():
+                return StepResult(observation=self._fresh_obs_after_action(),
+                                  info={"status": "rejected", "dispatched": False, "action": "goto",
+                                        "error": "无法将目标浏览器窗口放到主屏工作区，需重新观察"})
             result = session.goto(str(action.args.get("url") or route.get("goto_url")))
         elif action.action in ("scroll", "press", "hotkey"):
             result = session.execute_target(action, None)
@@ -255,6 +315,19 @@ class WindowsEnvironment(Environment):
 
     # ---- Environment 接口 ----
     def reset(self, task: str) -> Observation:
+        self.dpi_awareness = initialize_dpi_awareness()
+        self.work_screen = detect_primary_work_screen(*self._fallback_size)
+        self.width, self.height = self.work_screen.width, self.work_screen.height
+        self._invalidate_browser_snapshot()
+        self._screenshot_is_viewport = False
+        screen = self.work_screen
+        if screen.detected:
+            print(f"[screen] 检测到 {screen.monitor_count} 块屏幕；默认工作屏幕：主屏 "
+                  f"{screen.device or '(primary)'} {screen.width}x{screen.height} "
+                  f"origin=({screen.left},{screen.top})", flush=True)
+        else:
+            print(f"[screen] 显示布局检测不可用，沿用默认主屏截图；后备尺寸 "
+                  f"{screen.width}x{screen.height}", flush=True)
         return self._build_observation()
 
     def _navigate(self, url: str) -> StepResult:
@@ -280,6 +353,10 @@ class WindowsEnvironment(Environment):
                                         "action": "goto", "error": f"浏览器启动失败: {exc}"})
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
+        if not self._position_browser_on_work_screen():
+            return StepResult(observation=self._build_observation(),
+                              info={"status": "rejected", "dispatched": False, "action": "goto",
+                                    "error": "无法将目标浏览器窗口放到主屏工作区，需重新观察"})
         session = self._get_browser_session()
         if not self._focus_is_browser():
             return self._browser_focus_rejected()
@@ -323,7 +400,10 @@ class WindowsEnvironment(Environment):
                 scene = self._derive_scene(None)
                 scene["reason"] = "screen_coordinates_required"
                 observation = Observation(screenshot=screenshot,
-                                          info={"scene": scene, "screenshot_coordinate_space": "screen"})
+                                          info={"scene": scene, "screenshot_coordinate_space": "screen",
+                                                "screenshot_origin": self._screenshot_origin(),
+                                                "work_screen": self._screen_info(),
+                                                "dpi_awareness": self.dpi_awareness})
                 return StepResult(observation=observation,
                                   info={"status": "rejected", "dispatched": False, "channel": "gui",
                                         "error": "该动作需要全屏坐标，已切换到全屏观察，请重新定位后再执行"})
@@ -364,8 +444,24 @@ class WindowsEnvironment(Environment):
         dispatched = False
         try:
             if name == "switch_applications":
-                info = activate_application(str(action.args.get("app_code") or ""))
+                app_code = str(action.args.get("app_code") or "")
+                if self.work_screen and self.work_screen.detected and self.work_screen.monitor_count > 1:
+                    info = activate_application(app_code, work_screen=self.work_screen)
+                else:
+                    info = activate_application(app_code)
                 return self._desktop_step_result(action, info)
+            action = self._desktop_action(action)
+            if (name == "scroll" and self.work_screen and self.work_screen.detected
+                    and self.work_screen.monitor_count > 1):
+                import pyautogui
+                x, y = pyautogui.position()
+                screen = self.work_screen
+                if not (screen.left <= x < screen.left + screen.width
+                        and screen.top <= y < screen.top + screen.height):
+                    # 滚轮发送到鼠标所在窗口，不能沿用上一任务留在副屏的光标。
+                    wl, wt, wr, wb = screen.work_area
+                    dispatched = True
+                    pyautogui.moveTo((wl + wr) // 2, (wt + wb) // 2)
             if name in ("type", "select"):
                 x, y = action.args.get("x"), action.args.get("y")
                 if x is None or y is None or int(x) < 0 or int(y) < 0:

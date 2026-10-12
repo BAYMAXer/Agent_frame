@@ -91,6 +91,11 @@
   .card.grounding .response { border-left-color: var(--accent-grounding); }
   .coord-note { font-size: 14px; font-weight: 700; color: var(--accent-grounding); }
   .prompt.reflection { border-left: 3px solid var(--accent-status); }
+  .plan-step { padding: 8px 10px; border-radius: 6px; font-size: 14px; line-height: 1.5; }
+  .plan-step.current { background: #e8f0fe; border-left: 3px solid var(--accent); }
+  .plan-step.blocked { background: #fff3e4; }
+  .plan-step.skipped { color: var(--dim); }
+  .plan-meta { color: var(--dim); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
 
   /* 模型思考中动画 + 流式填充 + 截图淡入 */
   .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 6px; vertical-align: -2px; }
@@ -806,6 +811,63 @@ function statusCardHtml(payload) {
     '<div class="card-body"><div class="texts"><div class="prompt">' + detail + '</div></div></div></div>';
 }
 
+function shortPlanText(value) {
+  if (value == null) return '';
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return text.length > 220 ? text.slice(0, 220) + '…' : text;
+}
+
+// Live updates and saved runs share the renderer, including pre-tracker plans.
+function planCardHtml(plan, currentPlanStepId, revision) {
+  const data = Array.isArray(plan) ? {steps: plan} : (plan || {});
+  const steps = Array.isArray(data.steps) ? data.steps : [];
+  if (!steps.length) return '';
+  const currentId = currentPlanStepId != null ? currentPlanStepId : (data.current_plan_step_id != null ? data.current_plan_step_id : data.current_step_id);
+  const labels = {pending: ['⬜', '待执行'], in_progress: ['▶️', '进行中'],
+    done: ['✅', '已完成'], blocked: ['⚠️', '受阻'], skipped: ['⏭️', '已跳过']};
+  let done = 0;
+  const stepsHtml = steps.map((step, i) => {
+    const s = step && typeof step === 'object' ? step : {goal: String(step)};
+    const status = s.status === 'doing' ? 'in_progress' : (labels[s.status] ? s.status : 'pending');
+    if (status === 'done') done++;
+    const id = s.id != null ? s.id : (s.idx != null ? s.idx : i + 1);
+    const current = currentId != null ? String(id) === String(currentId) : status === 'in_progress';
+    const label = labels[status];
+    const detail = [['完成判据', s.completion_criteria], ['证据', s.evidence], ['受阻原因', s.blocked_reason]]
+      .filter(v => v[1] != null && v[1] !== '').map(v => '<div class="plan-meta">' + v[0] + '：' + esc(shortPlanText(v[1])) + '</div>').join('');
+    return '<div class="plan-step ' + status + (current ? ' current' : '') + '" data-plan-step="' + esc(id) + '" data-plan-status="' + status + '">' +
+      label[0] + ' ' + esc((s.idx != null ? s.idx : i + 1) + '. ' + (s.goal || '')) +
+      ' <span class="plan-meta">' + label[1] + (current ? ' · 当前项' : '') + '</span>' + detail + '</div>';
+  }).join('');
+  const kwHtml = Array.isArray(data.keywords) && data.keywords.length ? '<div class="plan-meta">🔑 关键词：' + esc(data.keywords.join(', ')) + '</div>' : '';
+  const fcHtml = data.final_check ? '<div class="plan-meta">🎯 完成判据：' + esc(shortPlanText(data.final_check)) + '</div>' : '';
+  const version = revision != null ? revision : data.revision;
+  return '<div class="card plan-card" data-kind="plan"><div class="card-head"><span class="tag status">📋 任务计划</span>' +
+    '<span class="step">完成 ' + done + ' / ' + steps.length + '</span>' +
+    (version != null ? '<span class="time">版本 ' + esc(version) + '</span>' : '') + '</div>' +
+    '<div class="card-body"><div class="texts">' + stepsHtml + kwHtml + fcHtml + '</div></div></div>';
+}
+
+function updatePlanCard(group, payload) {
+  const plan = payload.plan;
+  const rawRevision = payload.revision != null ? payload.revision : plan && plan.revision;
+  const revision = rawRevision != null && Number.isFinite(Number(rawRevision)) ? Number(rawRevision) : null;
+  if (revision != null && group.planRevision != null && revision < group.planRevision) return;
+  group.planRevision = revision;
+  const html = planCardHtml(plan, payload.current_plan_step_id, revision);
+  if (!html) {
+    if (group.planCard) group.planCard.remove();
+    group.planCard = null;
+    return;
+  }
+  const temp = document.createElement('div');
+  temp.innerHTML = html;
+  const card = temp.firstElementChild;
+  if (group.planCard) group.planCard.replaceWith(card);
+  else group.sectionEl.insertBefore(card, group.sectionEl.firstElementChild && group.sectionEl.firstElementChild.nextSibling);
+  group.planCard = card;
+}
+
 // ===== 任务分组 + 翻页 =====
 let taskGroups = [];   // 每个: {example_id, instruction, config, sectionEl, result}
 let currentGroup = -1;
@@ -826,6 +888,8 @@ function createTaskGroup(payload) {
     sectionEl: section,
     result: null,
     pendingExecutions: {},
+    planCard: null,
+    planRevision: null,
   };
   taskGroups.push(group);
   renderConfigCard(section, payload);
@@ -877,7 +941,10 @@ function addCard(payload) {
   const tl = group.sectionEl;
   const shouldFollow = (group === taskGroups[currentGroup]) && nearBottom();
 
-  if (payload.kind === 'model') {
+  if (payload.kind === 'status' && payload.event === 'plan_update') {
+    updatePlanCard(group, payload);
+    return;
+  } else if (payload.kind === 'model') {
     if (payload.pending) {
       const temp = document.createElement('div');
       temp.innerHTML = modelCardHtml(payload);
@@ -1493,18 +1560,7 @@ function renderLocalDetail(runId, traj, instruction, plan) {
   const body = document.getElementById('local-body');
   const backBtn = '<div style="display:flex;gap:8px;align-items:center"><button id="local-backbtn" style="background:var(--panel);color:var(--text);border:1px solid var(--border);padding:8px 16px;border-radius:var(--radius);cursor:pointer;font-size:13px;font-weight:600">← 返回列表</button><span style="font-size:13px;color:var(--dim);font-family:var(--mono)">编号 ' + esc(runId) + '</span></div>';
   const instrCard = instruction ? '<div class="card"><div class="card-body"><div style="font-size:14px;line-height:1.6">' + esc(instruction) + '</div></div></div>' : '';
-  // 任务计划卡片（planner 阶段0 产出）
-  let planCard = '';
-  if (plan && plan.steps && plan.steps.length) {
-    const stepsHtml = plan.steps.map(s => {
-      const mark = {'pending': '⬜', 'doing': '▶️', 'done': '✅'}[s.status] || '⬜';
-      return '<div style="padding:4px 0">' + mark + ' ' + esc((s.idx != null ? s.idx + '. ' : '') + s.goal) + '</div>';
-    }).join('');
-    const kwHtml = (plan.keywords && plan.keywords.length) ? '<div style="margin-top:8px;color:var(--dim)">🔑 关键词: ' + esc(plan.keywords.join(', ')) + '</div>' : '';
-    const fcHtml = plan.final_check ? '<div style="color:var(--dim)">🎯 完成判据: ' + esc(plan.final_check) + '</div>' : '';
-    planCard = '<div class="card"><div class="card-head"><span class="tag status">📋 任务计划（planner）</span></div>' +
-      '<div class="card-body"><div class="texts" style="flex:1">' + stepsHtml + kwHtml + fcHtml + '</div></div></div>';
-  }
+  const planCard = planCardHtml(plan);
   let savedNote = '';
   try { savedNote = localStorage.getItem('local_note|' + runId) || ''; } catch (e) {}
   const noteCard = '<div class="card"><div class="card-head"><span class="tag status">📝 运行备注</span></div>' +
@@ -2128,19 +2184,45 @@ document.getElementById('chat-clear').addEventListener('click', () => {
   document.getElementById(id).addEventListener('change', syncSettingsToSession));
 
 /* ===== 实时数据 ===== */
-function loadHistory() { fetch('/history').then(r => r.json()).then(d => { (d.logs || []).forEach(addCard); }).catch(() => {}); }
-function poll() {
-  fetch('/history').then(r => r.json()).then(d => {
+function consumeLog(payload) {
+  const key = payload.ts + '|' + payload.kind + '|' + (payload.type || payload.event || '') +
+    (payload.event === 'plan_update' ? '|' + (payload.revision != null ? payload.revision : (payload.plan || {}).revision || '') : '');
+  if (!seenKeys.has(key)) { seenKeys.add(key); addCard(payload); }
+}
+function ensureSnapshotGroup(start) {
+  if (!start) return null;
+  let group = taskGroups.find(g => g.config.ts === start.ts && g.example_id === start.example_id);
+  if (!group) {
+    consumeLog(start);
+    group = taskGroups.find(g => g.config.ts === start.ts && g.example_id === start.example_id);
+  }
+  return group;
+}
+function recoverPlanSnapshot(snapshot) {
+  const group = snapshot.task_start ? ensureSnapshotGroup(snapshot.task_start) : taskGroups[taskGroups.length - 1];
+  const update = snapshot.plan_update || (snapshot.plan ? {plan: snapshot.plan,
+    current_plan_step_id: snapshot.current_plan_step_id, revision: snapshot.plan_revision} : null);
+  if (group && update) updatePlanCard(group, update);
+}
+function loadHistory() {
+  return fetch('/history').then(r => r.json()).then(d => {
     (d.logs || []).forEach(l => {
-      const key = l.ts + '|' + l.kind + '|' + (l.type || l.event || '');
-      if (!seenKeys.has(key)) { seenKeys.add(key); addCard(l); }
+      // Recover the active group before rendering logs whose task_start was
+      // evicted from the bounded server history.
+      if (d.task_start && l.ts >= d.task_start.ts) ensureSnapshotGroup(d.task_start);
+      consumeLog(l);
     });
+    recoverPlanSnapshot(d);
   }).catch(() => {});
 }
+function poll() { loadHistory(); }
 function connect() {
   const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
-  ws.onopen = () => { document.getElementById('conn').className = 'conn on'; document.getElementById('conn-text').textContent = '已连接'; };
-  ws.onmessage = (e) => { try { const l = JSON.parse(e.data); const key = l.ts + '|' + l.kind + '|' + (l.type || l.event || ''); if (!seenKeys.has(key)) { seenKeys.add(key); addCard(l); } } catch (err) {} };
+  ws.onopen = () => {
+    document.getElementById('conn').className = 'conn on'; document.getElementById('conn-text').textContent = '已连接';
+    loadHistory().then(() => fetch('/run/status')).then(r => r.json()).then(recoverPlanSnapshot).catch(() => {});
+  };
+  ws.onmessage = (e) => { try { consumeLog(JSON.parse(e.data)); } catch (err) {} };
   ws.onclose = () => { document.getElementById('conn').className = 'conn off'; document.getElementById('conn-text').textContent = '断开，重连中…'; setTimeout(connect, 2000); };
   ws.onerror = () => ws.close();
 }

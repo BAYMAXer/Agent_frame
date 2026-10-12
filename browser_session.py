@@ -610,9 +610,17 @@ class BrowserSession:
         # 幂等：本次会话已下载过这个 URL → 直接返回，不重复下载（防模型重复点击同一链接）
         if url in self._downloaded:
             path = self._downloaded[url]
-            return {"status": "already_downloaded", "dispatched": False, "channel": "browser_dom",
-                    "action": "download", "path": path,
-                    "message": f"该文件已下载过：{path}，无需重复下载"}
+            try:
+                size = os.path.getsize(path) if os.path.isfile(path) else 0
+            except OSError:
+                size = 0
+            if size > 0:
+                return {"status": "already_downloaded", "dispatched": False, "channel": "browser_dom",
+                        "action": "download", "path": path, "bytes": size, "url": url,
+                        "verified": True, "verification_source": "cached_file",
+                        "message": f"已重新核实本地文件：{path}（{size} 字节），无需重复下载"}
+            # 文件被删除、变成目录或空文件时，缓存不能阻止重新下载。
+            self._downloaded.pop(url, None)
         headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")}
         started = time.perf_counter()
@@ -662,8 +670,8 @@ class BrowserSession:
                 verified = False
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "action": "download", "path": path, "bytes": size,
-                    "verified": verified, "url": url[:200],
-                    "message": (f"✅ 已成功下载到 {path}（{size} 字节），已核实落盘，任务完成" if verified
+                    "verified": verified, "url": url,
+                    "message": (f"✅ 已成功下载到 {path}（{size} 字节），已核实此文件落盘" if verified
                                 else f"⚠️ 下载写入异常：{path} 落盘校验失败"),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except Exception as exc:  # noqa: BLE001

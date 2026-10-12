@@ -26,3 +26,13 @@ outputs/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Test files are excluded from published source
+test/
+tests/
+test_*.py
+*_test.py
+conftest.py
+pytest.ini
+*.test.*
+*.spec.*
