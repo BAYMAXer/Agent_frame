@@ -54,6 +54,7 @@ class WindowsEnvironment(Environment):
         self.downloads_dir = downloads_dir
         self._browser_launcher = browser_launcher
         self._browser_ready = False
+        self._browser_launch_profile = None
         self._browser_session = None
         self._window_presenter = WindowPresenter(recovery_path=presentation_state_path)
         self._foreground_before_input = None
@@ -208,11 +209,17 @@ class WindowsEnvironment(Environment):
             session = self._get_browser_session() if self.execution_mode == "browser_first" else None
             if session is not None:
                 session._check_deadline()
-            if self._browser_launcher is not None:
-                self._browser_launcher()
-            else:
-                from ..run_windows_local import CHROME_DEFAULT, ensure_chrome
-                ensure_chrome(self.browser_port, CHROME_DEFAULT)
+            # browser_first 的绑定页跨子任务复用；即使被关闭也不能重新启动浏览器
+            # 并偷偷切换到另一页。后续 _connect / _pick_page 仍核验当前身份。
+            if session is None or not session.page_id:
+                if self._browser_launcher is not None:
+                    launched = self._browser_launcher()
+                else:
+                    from ..run_windows_local import CHROME_DEFAULT, ensure_chrome
+                    launched = ensure_chrome(self.browser_port, CHROME_DEFAULT)
+                if (session is not None and isinstance(launched, tuple) and len(launched) == 2
+                        and launched[0] is True and isinstance(launched[1], str)):
+                    self._browser_launch_profile = launched[1]
             if session is not None:
                 session._check_deadline()
                 playwright, browser = session._connect()  # 同一连接核验无痕，遵守共享 deadline。
@@ -242,7 +249,10 @@ class WindowsEnvironment(Environment):
         try:
             self._ensure_browser_ready()
             session = self._get_browser_session()
-            session.bind_owned_page()
+            if self._browser_launch_profile and not session.page_id:
+                session.bind_owned_page(launch_profile=self._browser_launch_profile)
+            else:
+                session.bind_owned_page()
         except ModelRequestTimeout:
             raise
         except Exception as exc:

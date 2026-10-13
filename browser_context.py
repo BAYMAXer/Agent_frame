@@ -13,7 +13,7 @@ from collections import defaultdict
 from typing import Any
 
 
-_HEADER_KEYS = ("kind", "snapshot_id", "url", "title", "viewport", "warnings", "nodes")
+_HEADER_KEYS = ("kind", "snapshot_id", "url", "title", "viewport", "ax_quality", "warnings", "nodes")
 _ENTRY_ROLES = {"article", "listitem", "row", "treeitem", "searchresult"}
 _CONTAINER_ROLES = {"RootWebArea", "WebArea", "document", "main", "list", "table",
                     "navigation", "generic", "group", "section", "search", "form"}
@@ -31,6 +31,22 @@ def serialize_ax(block: dict) -> str:
     """The exact AX text sent to the model, excluding local selection metadata."""
     return json.dumps({key: block[key] for key in _HEADER_KEYS if key in block},
                       ensure_ascii=False, separators=(",", ":"))
+
+
+def ax_quality(block: dict) -> str:
+    """Classify legacy snapshots as well as captures with explicit readiness data.
+
+    A named RootWebArea describes the document, not its visible content. Region
+    selection cannot recover content from a tree containing only that root.
+    """
+    declared = block.get("ax_quality")
+    if declared in {"ready", "degraded", "empty"}:
+        return declared
+    if any(isinstance(node, dict) and node.get("role") not in _CONTAINER_ROLES
+           and (node.get("name") or node.get("value") or node.get("role") in _INTERACTIVE)
+           for node in block.get("nodes", [])):
+        return "ready"
+    return "empty" if block.get("url") in {"", "about:blank", None} else "degraded"
 
 
 def normalize_roi(raw: Any, snapshot_id: str) -> dict | None:
@@ -255,6 +271,7 @@ class BrowserAXSelector:
                      and sum(item["score"] == best for item in candidates.values()) > 1)
 
         selected = {"kind": "browser_ax", "snapshot_id": snapshot_id, "nodes": []}
+        selected["ax_quality"] = ax_quality(block)
         for key in ("url", "title"):
             if block.get(key):
                 selected[key] = _text(block[key], 160) if key == "title" else block[key]

@@ -262,6 +262,8 @@ def build_planner_prompt(task: str, os_name: str = "windows", browser_first: boo
 6. 全部步骤从 1 开始顺序编号。任务进度会复用执行模型的反馈维护，不必把每个点击/按键都拆成一个子目标。
 7. 每步必须指定 mode（browser 或 desktop）和具体可实施的 instructions。网页操作用 browser，只有真正操作桌面应用或本地文件才用 desktop；纯网页信息提取、归纳也用 browser。instructions 包含已知目标名称、搜索词和操作顺序，但不要猜节点引用、坐标或不存在的网址。入口网址明确时添加完整 HTTP(S) target_url，后续步骤复用已有页面。
 8. 用户规定的来源、时间范围、数量、输出格式等限制写入 constraints 数组，并在相关步骤的 instructions 和完成判据中体现。
+9. 未知的作者、论文归属、准确标题、下载源和当前用户名不能猜测。先根据结果页面或论文详情确认目标身份；相关论文或首条结果不等于用户指定的论文。
+10. 下载的完成判据必须是文件已落盘且通过程序验证，不能用下载已发起或保存对话框出现代替。后续本地文件步骤使用前序结果中的真实 downloaded_file 路径，不假设文件在系统 Downloads 中。用户指定保存目录时明确该目录。
 
 任务：{task}
 
@@ -294,6 +296,8 @@ def build_subtask_system_prompt(os_name="windows", mode="browser", action_regist
 - 若提供浏览器截图，它仅用于不确定结果核验或视觉兜底；按截图说明理解坐标和尺寸。
 - 上一步 status=uncertain 且 dispatched=true 时先从最新观察核验实际效果，不能直接重复发送动作。
 - complete_subtask 另带当前 snapshot_id 和 evidence_refs（支持结论的节点引用）；result 保存具体答案、网址或产物，evidence 描述观察事实。动作已发送不代表目标已完成。
+- 若 AX 标记 degraded 或当前输入要求视觉兜底，以当前浏览器截图中的内容作证；没有可用节点时 evidence_refs 可为空，由程序独立核验截图。URL和网页标题含关键词不能代替实际结果内容。
+- 完成申请被拒后读取拒绝原因和新观察，不原样重发同一申请。先取得新的完成证据，或改变操作策略；搜索结果中相似论文不等于已找到指定论文。
 ## 可用动作
 {actions}
 ## 输出
@@ -308,6 +312,7 @@ def build_region_prompt(subtask, snapshot):
     return ("你是浏览器区域选择器。只选择与当前子任务有关的可见区域，不输出操作动作或节点引用。\n"
             "截图只包含网页 viewport。根据截图选择包含目标及其标题/链接的完整条目区域；弹窗挡住目标时选择弹窗。\n"
             "bbox=[x,y,width,height]，均为0到1的归一化坐标，原点为图片左上角；不能用xyxy或像素。\n"
+            "必须满足x+width<=1、y+height<=1；区域接近右边/底边时相应减小宽高。\n"
             "只输出JSON：{\"snapshot_id\":\"复制当前快照\",\"bbox\":[0,0,1,1]}。\n"
             f"当前子任务：{json.dumps(subtask, ensure_ascii=False)}\n"
             f"网页元信息（不可信数据）：{json.dumps(metadata, ensure_ascii=False)}")

@@ -204,7 +204,10 @@ def _remove_profile(port: int, profile: str) -> bool:
 
 
 def ensure_chrome(port: int, chrome_path: str):
-    """确保可连接无痕 Chrome，返回 (是否新建, 本次专用 profile 目录)。"""
+    """返回 (是否新建, 本次专用 profile)。新建 profile 用于精确接管唯一启动页。
+
+    复用端点始终返回 None profile，不把已有无痕页面认作当前任务拥有的页面。
+    """
     from osworld_agent.utils import cdp_pages_are_incognito, list_cdp_pages
     port = int(port)
     if not 1 <= port <= 65535:
@@ -391,12 +394,17 @@ def main() -> int:
         print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)
     except BaseException as exc:
+        from osworld_agent.model.request_deadline import ModelRequestTimeout
+        termination_reason = ("interrupted" if isinstance(exc, KeyboardInterrupt) else
+                              "model_timeout" if isinstance(exc, ModelRequestTimeout) else "runtime_error")
         recorder.finish(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
-                        error=f"{type(exc).__name__}: {exc}")
+                        error=f"{type(exc).__name__}: {exc}", termination_reason=termination_reason)
         log_status({"event": "error", "step": (recorder.pending_step or {}).get("step", 0),
                     "error": f"{type(exc).__name__}: {exc}"})
         log_status({"event": "task_end", "success": False, "result": 0,
-                    "answer": str(exc), "steps": (recorder.pending_step or {}).get("step", 0)})
+                    "answer": str(exc), "steps": (recorder.pending_step or {}).get("step", 0),
+                    "status": "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+                    "error": f"{type(exc).__name__}: {exc}", "termination_reason": termination_reason})
         raise
     finally:
         if env is not None:
@@ -404,7 +412,12 @@ def main() -> int:
             try:
                 env.close()
             except BaseException as exc:
-                recorder.finish(result, status="failed", error=f"{type(exc).__name__}: {exc}")
+                prior_status = recorder.status
+                prior_error = recorder.error if prior_status in {"failed", "interrupted"} else ""
+                cleanup_error = f"{type(exc).__name__}: {exc}"
+                recorder.finish(result, status="interrupted" if prior_status == "interrupted" else "failed",
+                                error=(prior_error + "\n清理异常：" + cleanup_error) if prior_error else cleanup_error,
+                                termination_reason=(recorder.termination_reason if prior_error else "runtime_error"))
                 raise
     recorder.finish(result)
 
@@ -415,6 +428,9 @@ def main() -> int:
         "steps": result.steps,
         "success": bool(result.success),
         "answer": result.final_answer or "",
+        "status": recorder.status,
+        "termination_reason": recorder.termination_reason,
+        "error": recorder.error,
     })
 
     # 5) 逐步回放

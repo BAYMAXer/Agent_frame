@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -67,6 +68,8 @@ class AgentResult:
     trajectory: List[dict] = field(default_factory=list)
     screenshots: Dict[int, Any] = field(default_factory=dict)   # step -> 决策前截图（PIL 或 bytes）
     plan: Optional[Dict[str, Any]] = None   # 阶段0 产出的任务计划（steps/keywords/final_check）
+    termination_reason: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -111,6 +114,10 @@ class StepState:
     uncertain_action: Dict[str, Any] = field(default_factory=dict)
     browser_no_progress_count: int = 0
     action_identity: Dict[str, Any] = field(default_factory=dict)
+    browser_visual_required: bool = False
+    browser_refresh_pending: bool = False
+    browser_selection_cache: Dict[str, Any] = field(default_factory=dict)
+    rejected_completion: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -180,6 +187,8 @@ class Pipeline:
             if not self.browser_first:
                 raise
             state, result = self._running_state, self._running_result
+            result.termination_reason = ("model_timeout" if isinstance(exc, ModelRequestTimeout)
+                                         else "context_budget")
             self._record_blocked_result(state, result, str(exc))
             decision = getattr(self, "_running_decision", None)
             calls = list(decision.calls if decision else []) + state.auxiliary_calls
@@ -209,7 +218,7 @@ class Pipeline:
         self._running_state, self._running_result = state, result
         self._running_decision = None
         self._start_step_budget()
-        # 阶段0：任务规划（模糊任务 → 结构化 plan），失败静默降级
+        # 阶段0：任务规划；browser_first 格式纠错失败必须明确终止。
         self._emit_progress("planning", state, result)
         try:
             self._plan(task, state)
@@ -217,6 +226,7 @@ class Pipeline:
             if not self.browser_first:
                 raise
             result.final_answer = f"规划失败：{exc}"
+            result.termination_reason, result.error = "planning_error", result.final_answer
             result.trajectory.append({"step": 0, "error": result.final_answer, "phase": "planning"})
             self._emit_progress("planning_failed", state, result, error=result.final_answer)
             return result
@@ -364,7 +374,10 @@ class Pipeline:
                 break
 
         if self.browser_first and not result.success:
+            result.termination_reason = result.termination_reason or "step_budget"
             self._record_blocked_result(state, result, result.final_answer or "达到执行步数预算")
+        elif result.success:
+            result.termination_reason, result.error = "success", ""
         result.score = self._evaluate(result)
         result.plan = copy.deepcopy(state.memory.plan)
         # 补齐最后一步的 assessment（任务结束时没有下一步决策来评估 a_N）
@@ -446,6 +459,10 @@ class Pipeline:
                 state.browser_recovery_level = 0
                 state.browser_no_progress_count = 0
                 state.region_selection = {}
+                state.browser_selection_cache = {}
+                state.browser_visual_required = False
+                state.browser_refresh_pending = False
+                state.rejected_completion = {}
                 state.uncertain_action = {}
                 state.no_change_count = 0
                 state.action_keys.clear()
@@ -453,6 +470,13 @@ class Pipeline:
                 state.memory.control_state = "CONTINUE"
                 state.memory.forbidden_repeats.clear()
                 state.memory.expected_effect = ""
+            if subtask and subtask["mode"] == "browser" and state.browser_refresh_pending:
+                self._check_step_budget("completion_recovery_observation")
+                refresh = getattr(self.env, "_fresh_obs_after_action", None)
+                if callable(refresh):
+                    state.obs = refresh()
+                    state.memory.add_event("完成申请被拒后已重新采集网页观察；请使用新快照核对证据或改变策略。")
+                state.browser_refresh_pending = False
             if state.obs is not None:
                 state.obs.info["plan_step_id"] = subtask.get("id") if subtask else None
         if state.obs is None:
@@ -471,19 +495,35 @@ class Pipeline:
                      if step.get("id") == current), None)
 
     def _select_browser_context(self, state, subtask, blocks):
-        from .browser_context import BrowserAXSelector, normalize_roi, serialize_ax
+        from .browser_context import BrowserAXSelector, ax_quality, normalize_roi, serialize_ax
         selector = BrowserAXSelector(max_chars=self.compiler.config.ax_max_chars)
         selected_blocks, selection = [], {}
+        state.browser_visual_required = False
         for block in blocks:
             if block.get("kind") != "browser_ax":
                 selected_blocks.append(block)
                 continue
             selected, metadata = selector.select(block, subtask,
                 viewport_only=state.browser_recovery_level > 0)
+            quality = ax_quality(block)
             metadata["original"] = metadata.get("original_count", len(block.get("nodes", [])))
             metadata["selected"] = metadata.get("selected_count", len(selected.get("nodes", [])))
-            if (metadata.get("needs_region") and state.browser_recovery_level == 0
+            cache_key = (block.get("snapshot_id"), subtask.get("id"), selector.max_chars)
+            cache = state.browser_selection_cache
+            if quality == "degraded":
+                metadata.update(reason="degraded_ax_browser_visual_fallback", needs_region=False)
+            elif (metadata.get("needs_region") and state.browser_recovery_level == 0
                     and state.obs.screenshot is not None and getattr(self.model, "vision", True)):
+                if cache.get("key") == cache_key:
+                    selected, metadata = copy.deepcopy(cache["selection"])
+                    metadata.update(region_cached=True, region_ms=0, ax_quality=quality,
+                                    visual_required=not bool(selected.get("nodes")))
+                    state.region_selection = metadata.get("roi", {})
+                    selected_blocks.append(selected)
+                    state.browser_evidence_text = serialize_ax(selected)
+                    state.browser_visual_required = not bool(selected.get("nodes"))
+                    selection = metadata
+                    continue
                 self._check_step_budget("region_selection")
                 prompt = build_region_prompt(subtask, block)
                 messages = [{"role": "system", "content": "只输出绑定当前快照的浏览器区域 JSON。"},
@@ -514,12 +554,18 @@ class Pipeline:
                     selected, metadata = selector.select(block, subtask, viewport_only=True)
                     metadata["reason"] = "region_error_viewport_fallback"
                 metadata["region_ms"] = round((time.perf_counter() - started) * 1000, 2)
-            if state.browser_recovery_level:
+                state.browser_selection_cache = {"key": cache_key,
+                    "selection": copy.deepcopy((selected, metadata))}
+            if state.browser_recovery_level and quality != "degraded":
                 metadata["recovery_level"] = state.browser_recovery_level
                 metadata["reason"] = ("expanded_viewport_ax" if state.browser_recovery_level == 1
                                       else "browser_visual_fallback")
             metadata["original"] = metadata.get("original_count", len(block.get("nodes", [])))
             metadata["selected"] = metadata.get("selected_count", len(selected.get("nodes", [])))
+            metadata["ax_quality"] = quality
+            metadata["visual_required"] = quality == "degraded" or (
+                quality == "ready" and not selected.get("nodes"))
+            state.browser_visual_required = metadata["visual_required"]
             selected_blocks.append(selected)
             state.browser_evidence_text = serialize_ax(selected)
             selection = metadata
@@ -560,9 +606,10 @@ class Pipeline:
                                 "browser_result": browser_result}, ensure_ascii=False)
         images = self._build_images(state) if getattr(self.model, "vision", True) else []
         if subtask and subtask["mode"] == "browser":
-            needs_image = (state.browser_recovery_level >= 2 or
+            needs_image = (state.browser_visual_required or state.browser_recovery_level >= 2 or
                            state.last_execution_info.get("status") == "uncertain")
-            images = [("当前浏览器 viewport，仅用于核验或视觉兜底", state.obs.screenshot)] if needs_image else []
+            images = [("当前浏览器 viewport，仅用于核验或视觉兜底", state.obs.screenshot)] if (
+                needs_image and state.obs.screenshot is not None and getattr(self.model, "vision", True)) else []
         user_text, images, metadata = self.compiler.compile(
             system=system, task=task_text, memory=state.memory_text,
             blocks=blocks, auxiliary=auxiliary,
@@ -660,7 +707,7 @@ class Pipeline:
         subtask = self._current_subtask(state) if self.browser_first else None
         spec = get_action_spec(action.action)
         if (subtask and subtask["mode"] == "browser" and spec and spec.resolve != "none"
-                and state.browser_recovery_level < 2):
+                and state.browser_recovery_level < 2 and not state.browser_visual_required):
             state.route = {"channel": "reobserve", "refresh_observation": True,
                            "reason": "节点未定位：刷新观察并扩大到视口 AX，之后才使用浏览器视觉兜底"}
             state.resolved_action = action
@@ -680,6 +727,9 @@ class Pipeline:
         name = action.action
         if name == "complete_subtask":
             confirmed, reason = self._verify_subtask(state, action)
+            if self.browser_first and not confirmed:
+                subtask = self._current_subtask(state)
+                state.browser_refresh_pending = bool(subtask and subtask["mode"] == "browser")
             return Execution(kind="subtask_complete", executed=name, outcome=reason,
                 info={"status": "executed" if confirmed else "rejected", "dispatched": False,
                       "verified": confirmed, "action": name, "step_id": action.args.get("step_id"),
@@ -889,13 +939,14 @@ class Pipeline:
                 state.uncertain_action = {"key": self._stable_action_key(decision.action),
                     "identity": state.action_identity or self._browser_action_identity(decision.action, state),
                     "action": self._action_record(decision.action), "expected_effect": decision.expected_effect}
-            if subtask and subtask["mode"] == "browser" and execution.kind != "subtask_complete":
+            if subtask and subtask["mode"] == "browser":
                 if info.get("status") in {"rejected", "failed", "failure", "error"}:
                     state.browser_recovery_level = min(2, state.browser_recovery_level + 1)
                     state.browser_no_progress_count += 1
                     state.memory.add_event(f"当前子任务恢复 {state.browser_recovery_level}：{info.get('error') or execution.outcome}")
                 elif info.get("status") in {"executed", "already_downloaded"}:
                     state.browser_no_progress_count = 0
+                    state.rejected_completion = {}
             if plan_changed:
                 state.no_change_count = 0
                 state.action_keys.clear()
@@ -904,9 +955,13 @@ class Pipeline:
         should_break = False
         if state.memory.control_state == "STALL" and state.memory.stall_count >= 3:
             result.trajectory.append({"step": step_no, "early_stop": "持续卡死，强制停止"})
+            result.termination_reason = "repeated_action"
+            result.final_answer = "连续动作未取得进展，达到停滞阈值"
             should_break = True
-        if self.browser_first and state.browser_no_progress_count >= max(3, self.early_stop_repeat):
+        if self.browser_first and state.browser_no_progress_count >= max(1, self.early_stop_repeat):
             result.final_answer = str((execution.info or {}).get("error") or execution.outcome or "连续恢复后仍无法定位目标")
+            result.termination_reason = ("completion_rejected" if execution.kind == "subtask_complete"
+                                         else "recovery_exhausted")
             should_break = True
         # 8) 设置下一步的 expected_effect（当前决策的 expected_effect → 下一步对比用）
         state.memory.expected_effect = decision.expected_effect
@@ -929,6 +984,7 @@ class Pipeline:
             confirmed, reason = self._verify_finish(state, answer)
             result.success = confirmed
             result.final_answer = answer if confirmed else f"最终检查未通过：{reason}"
+            result.termination_reason = "success" if confirmed else "final_verification_failed"
             should_break = True
         # 9) request_finish 验证
         if not should_break and execution.kind == "finish_request":
@@ -954,6 +1010,7 @@ class Pipeline:
             should_break = True
             if self.browser_first and not result.success and not result.final_answer:
                 result.final_answer = "执行模型报告无法完成当前子任务"
+            result.termination_reason = "success" if result.success else "agent_failure"
         state.last_action_plan_step_id = state.action_plan_step_id
         state.last_execution_info = copy.deepcopy(execution.info)
         # （reflection 已关闭：旧实现调了模型但结果被丢弃，属无效调用，浪费一次推理）
@@ -1144,6 +1201,7 @@ class Pipeline:
                     "expected_effect": memory.expected_effect,
                     "control_state": memory.control_state,
                     "browser_recovery_level": state.browser_recovery_level,
+                    "browser_visual_required": state.browser_visual_required,
                     "recent_events": memory.recent_events[-2:],
                     "failure_memory": memory.failure_memory[-2:],
                     "forbidden_repeats": memory.forbidden_repeats[-2:]}
@@ -1245,6 +1303,7 @@ class Pipeline:
     def _detect_stall(self, state: StepState, decision: Decision,
                       execution: Execution, before_screenshot) -> Optional[str]:
         """确定性卡死检测：屏幕无变化 + shell 输出无变化 + 动作循环 + 禁止重复命中。返回原因或 None。"""
+        repeat_threshold = max(1, self.early_stop_repeat) if self.browser_first else _REPEAT_ACTION_THRESHOLD
         # 1) 屏幕无变化（仅 env 动作，对比动作前后截图）
         if execution.kind == "env" and execution.obs is not None:
             after = execution.obs.screenshot
@@ -1258,19 +1317,19 @@ class Pipeline:
         #     改用「连续多次终端输出完全相同」判卡死（典型：反复执行同一失败命令）。
         if execution.kind == "shell":
             state.shell_outputs.append(state.terminal_result or "")
-            recent = state.shell_outputs[-_REPEAT_ACTION_THRESHOLD:]
-            if (len(recent) >= _REPEAT_ACTION_THRESHOLD
+            recent = state.shell_outputs[-repeat_threshold:]
+            if (len(recent) >= repeat_threshold
                     and all(o == recent[-1] for o in recent)):
                 return f"连续 {len(recent)} 次终端命令输出完全相同（命令未产生新进展）"
         # 2) 连续相同动作（连续 N 次相同 action+target；用稳定签名，忽略每次变化的 ref/id）
         sig = self._stable_action_key(decision.action)
         state.action_keys.append(sig)
-        recent = state.action_keys[-_REPEAT_ACTION_THRESHOLD:]
-        if len(recent) >= _REPEAT_ACTION_THRESHOLD and all(k == sig for k in recent):
-            return f"连续 {_REPEAT_ACTION_THRESHOLD} 次相同动作 {sig[:60]}"
+        recent = state.action_keys[-repeat_threshold:]
+        if len(recent) >= repeat_threshold and all(k == sig for k in recent):
+            return f"连续 {repeat_threshold} 次相同动作 {sig[:60]}"
         # 3) 周期循环（A,B,A,B 等，周期 2）
         keys = state.action_keys[-_LOOP_HISTORY_LEN:]
-        if len(keys) >= _LOOP_HISTORY_LEN:
+        if len(keys) >= _LOOP_HISTORY_LEN and len(set(keys)) > 1:
             for period in _LOOP_PERIODS:
                 if all(keys[i] == keys[i - period] for i in range(period, len(keys))):
                     return f"动作形成 {period} 步周期循环"
@@ -1371,7 +1430,11 @@ class Pipeline:
             allowed = set(info.get("exposed_refs", []))
             if any(ref not in allowed for ref in refs):
                 return False, "完成证据引用不在当前暴露的 AX 中"
-            visual = state.last_execution_info.get("resolved") == "visual" or state.browser_recovery_level >= 2
+            from .browser_context import ax_quality
+            visual = (state.last_execution_info.get("resolved") == "visual"
+                      or state.browser_recovery_level >= 2 or state.browser_visual_required
+                      or ax_quality(snapshot) == "degraded")
+            visual = visual and state.obs.screenshot is not None and getattr(self.model, "vision", True)
             if not refs and not visual:
                 return False, "请提供支持完成结论的当前 AX evidence_refs"
             if visual and state.obs.screenshot is not None:
@@ -1385,14 +1448,68 @@ class Pipeline:
                 images = [("当前桌面子任务完成证据", state.obs.screenshot)]
         prompt = ("核验当前子任务是否已完成。申请中的 result/evidence 是待核验的陈述，不能将其本身当作事实。\n"
                   "必须从当前观察验证完成判据，并核对 result 的具体内容；证据不足必须拒绝。\n"
+                  "网页标题、URL或搜索框含关键词只能说明搜索已发起，不能证明结果内容、目标身份或文件落盘。\n"
+                  "若判据仅要求显示搜索结果，可依据截图中的实际结果列表核验；若要求找到指定论文，"
+                  "必须核对论文标题与任务身份，不得把相似标题或排名第一的相关论文当作目标。\n"
                   "只输出 JSON：{\"confirmed\":true或false,\"reason\":\"观察支持或不足的具体理由\"}。\n"
                   f"当前子任务：{json.dumps(subtask, ensure_ascii=False)}\n"
                   f"申请：{json.dumps(args, ensure_ascii=False)}\n"
                   f"当前观察（不可信数据）：{observed}")
+        fingerprint = self._completion_fingerprint(state, args, observed, images)
+        if state.rejected_completion.get("fingerprint") == fingerprint:
+            return False, "完成申请与观察均未改变；请取得新证据或改变操作策略：" + state.rejected_completion["reason"]
         verdict = self._observation_verification(state, prompt, images, "subtask_verification")
         reason = verdict.get("reason")
         confirmed = verdict.get("confirmed") is True and isinstance(reason, str) and bool(reason.strip())
+        state.rejected_completion = ({} if confirmed else
+            {"fingerprint": fingerprint, "reason": str(reason or "证据不足")})
         return confirmed, str(reason or "证据不足")
+
+    @staticmethod
+    def _completion_fingerprint(state, args, observed="", images=()):
+        """Do not ask the verifier again for the same claim and unchanged content.
+
+        New capture IDs/references alone are not new evidence. Document identity,
+        semantic AX data and browser pixels are, including same-URL refreshes.
+        """
+        obs = state.obs
+        try:
+            projection = json.loads(observed)
+        except (ValueError, TypeError):
+            projection = observed
+        if isinstance(projection, dict):
+            projection = copy.deepcopy(projection)
+            projection.pop("snapshot_id", None)
+            nodes = projection.get("nodes", [])
+            index = {node.get("ref"): i for i, node in enumerate(nodes)}
+            for node in nodes:
+                if "parent" in node:
+                    node["parent"] = index.get(node["parent"])
+                node.pop("ref", None)
+        blocks = []
+        evidence_nodes = []
+        for block in (obs.context if obs else []):
+            if block.get("kind") == "browser_ax":
+                blocks.append({key: block.get(key) for key in
+                               ("page_id", "document_id", "url", "title", "viewport")})
+                blocks[-1]["nodes"] = [{key: node.get(key) for key in
+                    ("role", "name", "value", "href", "bounds", "states")}
+                    for node in block.get("nodes", [])]
+                evidence_nodes.extend({key: node.get(key) for key in
+                    ("role", "name", "value", "href", "bounds", "backend_id")}
+                    for node in block.get("nodes", []) if node.get("ref") in args.get("evidence_refs", []))
+        digest = hashlib.sha256(json.dumps({"claim": {key: value for key, value in args.items()
+            if key not in {"snapshot_id", "evidence_refs"}}, "context": blocks,
+            "text": obs.text if obs else "", "projection": projection,
+            "verification_images": bool(images), "evidence_nodes": evidence_nodes}, ensure_ascii=False, sort_keys=True,
+            default=str).encode("utf-8"))
+        screenshot = obs.screenshot if obs else None
+        if hasattr(screenshot, "tobytes"):
+            digest.update(str((screenshot.size, screenshot.mode)).encode())
+            digest.update(screenshot.tobytes())
+        elif isinstance(screenshot, bytes):
+            digest.update(screenshot)
+        return digest.hexdigest()
 
     def _verify_uncertain_effect(self, state):
         pending = state.uncertain_action
@@ -1435,6 +1552,8 @@ class Pipeline:
                          if step.get("status") == "done")
 
     def _record_blocked_result(self, state, result, reason):
+        result.success = False
+        result.error = reason
         current = self._current_subtask(state)
         if current:
             current.update(status="blocked", blocked_reason=reason)

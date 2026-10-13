@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from .logging import compact_messages
+from ..trajectory import normalize_outcome
 
 app = FastAPI(title="osworld_agent Viz")
 
@@ -102,14 +103,14 @@ _agent_state = {
     "status": "idle", "proc": None, "task_name": None, "config": None,
     "start_time": None, "output": [], "current_step": 0, "max_steps": 0, "task_total": 0,
     "plan": None, "current_plan_step_id": None, "plan_revision": None,
-    "plan_update": None, "task_start": None, "browser_observation": None,
+    "plan_update": None, "task_start": None, "browser_observation": None, "outcome": None,
 }
 
 
 def _clear_plan_state():
     """A new task must not recover a previous task's plan after reconnecting."""
     _agent_state.update(plan=None, current_plan_step_id=None, plan_revision=None,
-                        plan_update=None, task_start=None, browser_observation=None)
+                        plan_update=None, task_start=None, browser_observation=None, outcome=None)
 
 
 def _plan_revision(payload):
@@ -153,7 +154,25 @@ def _reader_thread(proc, config=None):
         rc = proc.wait()
         _recover_local_window_presentation(proc, cfg)
         if _agent_state.get("proc") is proc and _agent_state["status"] == "running":
-            _agent_state["status"] = "done" if rc == 0 else "failed"
+            outcome = None
+            if cfg.get("result_dir"):
+                try:
+                    saved = json.loads((Path(cfg["result_dir"]) / "trajectory.json").read_text(encoding="utf-8"))
+                    outcome = normalize_outcome(saved.get("outcome") or {}, saved.get("plan"))
+                except (OSError, ValueError, TypeError):
+                    pass
+            if outcome is not None:
+                if outcome.get("status") == "running":
+                    outcome = normalize_outcome({**outcome, "status": "failed", "success": False,
+                        "error": "运行器已退出，但任务未产生结束记录", "termination_reason": "runtime_error"})
+                elif rc != 0 and outcome.get("status") == "completed":
+                    outcome = normalize_outcome({**outcome, "status": "failed", "success": False,
+                        "error": f"运行器异常退出，退出码 {rc}", "termination_reason": "runtime_error"})
+                _agent_state["outcome"] = outcome
+                _agent_state["status"] = ("idle" if outcome.get("status") == "interrupted" else
+                                          "failed" if outcome.get("status") == "failed" or rc != 0 else "done")
+            else:
+                _agent_state["status"] = "done" if rc == 0 else "failed"
 
 
 # ================= 实时日志 ================= #
@@ -284,11 +303,12 @@ async def local_runs():
                 continue
             instruction, score, steps, success = "", None, 0, None
             status, phase, pending_step = "", "", None
+            outcome = {}
             try:
                 with open(traj_path, encoding="utf-8") as f:
                     traj = json.load(f)
                 instruction = (traj.get("task") or {}).get("instruction", "")
-                outcome = traj.get("outcome") or {}
+                outcome = normalize_outcome(traj.get("outcome") or {}, traj.get("plan"))
                 score = outcome.get("score")
                 success = outcome.get("success")
                 status = outcome.get("status", "")
@@ -302,6 +322,8 @@ async def local_runs():
             runs.append({"id": d.name, "instruction": instruction, "score": score,
                          "success": success, "steps": steps, "shots": shots,
                          "status": status, "phase": phase, "pending_step": pending_step,
+                         "error": outcome.get("error", ""),
+                         "termination_reason": outcome.get("termination_reason", ""),
                          "mtime": d.stat().st_mtime})
     return {"runs": runs}
 
@@ -384,6 +406,7 @@ async def local_traj(run: str):
     return {"ok": True, "traj": _local_traj_to_frontend(traj),
             "instruction": (traj.get("task") or {}).get("instruction", ""),
             "plan": traj.get("plan"),
+            "outcome": normalize_outcome(traj.get("outcome") or {}, traj.get("plan")),
             "trajectory": traj}
 
 
@@ -552,6 +575,7 @@ async def run_status():
         "plan_update": _agent_state.get("plan_update"),
         "task_start": _agent_state.get("task_start"),
         "browser_observation": _agent_state.get("browser_observation"),
+        "outcome": _agent_state.get("outcome"),
     }
 
 
@@ -586,7 +610,8 @@ async def stop_run():
                     trajectory = json.loads(target.read_text(encoding="utf-8"))
                     outcome = trajectory.setdefault("outcome", {})
                     if outcome.get("status") == "running":
-                        outcome.update(status="interrupted", error="任务被手动终止")
+                        outcome.update(status="interrupted", success=False, error="任务被手动终止",
+                                       termination_reason="interrupted")
                         temporary = base / ".stopped_trajectory.json"
                         temporary.write_text(json.dumps(trajectory, ensure_ascii=False, indent=2),
                                              encoding="utf-8")
@@ -595,6 +620,7 @@ async def stop_run():
                             stream.write(json.dumps({"event": "task_end", "status": "interrupted",
                                                      "phase": outcome.get("phase"), "ts": time.time()},
                                                     ensure_ascii=False) + "\n")
+                    _agent_state["outcome"] = normalize_outcome(outcome, trajectory.get("plan"))
                 except (OSError, ValueError, TypeError):
                     pass
     if proc is not None:
@@ -874,37 +900,7 @@ async def debug_chat(request: Request):
     return {"ok": False, "error": f"暂不支持的 provider: {engine_type}（当前支持 vllm / openai / open_router）"}
 
 
-def _keep_model_warm():
-    """后台保活线程：用真实 system prompt warm 决策模型的 prefix cache，避免冷启动（78s）。
-
-    决策变慢的根因不是「模型被卸载」，而是 vLLM 第一次处理长 system prompt（+3 张截图）时
-    要计算全部 KV cache（prefix cache 冷启动）；纯文本 "ping" 无法 warm 这个 cache。
-    所以这里用本机完整 GUI system prompt 作为 system 前缀去 warm，
-    之后真实决策的 system 前缀命中 cache，只剩动态部分（任务/截图/AX树），快。
-    """
-    import requests as _req
-    from osworld_agent.prompts import build_system_prompt
-    sys_prompt = build_system_prompt(os_name="windows", browser_only=False)
-    dec_url = os.getenv("OSWORLD_DECISION_URL", "http://7.246.80.189:9028/v1/chat/completions")
-    grd_url = os.getenv("OSWORLD_GROUNDING_URL", "http://7.246.80.189:8001/v1/chat/completions")
-    while True:
-        try:
-            _req.post(dec_url, json={"model": "Qwen3.5-9B",
-                                     "messages": [{"role": "system", "content": sys_prompt},
-                                                  {"role": "user", "content": "keepalive"}],
-                                     "max_tokens": 1}, timeout=120)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            _req.post(grd_url, json={"model": "UI-Venus-2-9B",
-                                     "messages": [{"role": "user", "content": "keepalive"}],
-                                     "max_tokens": 1}, timeout=60)
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(60)
-
-
 if __name__ == "__main__":
     port = int(os.getenv("AGENTS_VIZ_PORT", "8088"))
-    threading.Thread(target=_keep_model_warm, daemon=True).start()
+    # 模型请求由启动后的任务 runner 按需发送；服务入口不启动保活请求。
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")

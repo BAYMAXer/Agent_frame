@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from .trajectory import build_trajectory, dump_trajectory
+from .trajectory import build_trajectory, dump_trajectory, normalize_outcome
 
 
 class LocalRunRecorder:
@@ -24,6 +24,7 @@ class LocalRunRecorder:
         self.status = "running"
         self.phase = "starting"
         self.error = ""
+        self.termination_reason = "running"
         self.pending_step = None
         self._saved_screenshots = set()
         self._result = SimpleNamespace(trajectory=[], screenshots={}, steps=0,
@@ -56,19 +57,32 @@ class LocalRunRecorder:
         self._save_screenshots(state, step)
         self._write_trajectory()
 
-    def finish(self, result=None, status: str = "completed", error: str = "") -> None:
+    def finish(self, result=None, status: str | None = None, error: str = "",
+               termination_reason: str | None = None) -> None:
         """Finalize a run, retaining an unfinished action on failure or stop."""
-        if status not in {"completed", "failed", "interrupted"}:
+        if status not in {None, "completed", "failed", "interrupted"}:
             raise ValueError(f"Unknown local run status: {status}")
         if result is not None:
             self._result = result
-        self.status = status
-        self.error = error
-        if status == "completed":
+        successful = bool(getattr(self._result, "success", False))
+        requested = status or ("completed" if successful else "failed")
+        reason = termination_reason or getattr(self._result, "termination_reason", "")
+        if requested == "failed" and error and reason in {"", "unknown", "success"}:
+            reason = "runtime_error"
+        outcome = normalize_outcome({"status": requested, "success": successful,
+            "error": error or getattr(self._result, "error", ""),
+            "final_answer": getattr(self._result, "final_answer", ""),
+            "termination_reason": reason}, getattr(self._result, "plan", None))
+        self.status = outcome["status"]
+        self.error = outcome["error"]
+        self.termination_reason = outcome["termination_reason"]
+        if self.status == "completed":
             self.pending_step = None
             self.phase = "completed"
         self._append_event({"ts": time.time(), "event": "task_end",
-                            "phase": self.phase, "status": status, "error": error})
+                            "phase": self.phase, "status": self.status,
+                            "success": self.status == "completed", "error": self.error,
+                            "termination_reason": self.termination_reason})
         self._save_screenshots(None, None)
         self._write_trajectory()
 
@@ -113,7 +127,10 @@ class LocalRunRecorder:
 
     def _write_trajectory(self) -> None:
         trajectory = build_trajectory("local", "windows", self.task, self._result)
-        trajectory["outcome"].update(status=self.status, phase=self.phase, error=self.error)
+        trajectory["outcome"].update(status=self.status, phase=self.phase, error=self.error,
+                                     termination_reason=self.termination_reason)
+        if self.status in {"failed", "interrupted"}:
+            trajectory["outcome"]["success"] = False
         trajectory["pending_step"] = self.pending_step
         target = self.result_dir / "trajectory.json"
         temp = self._temporary_path(".json")

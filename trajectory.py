@@ -29,6 +29,62 @@ from typing import Any, Dict, List, Optional
 
 TRAJECTORY_VERSION = "2.0"
 
+_FAILURE_MESSAGES = {
+    "planning_error": "任务规划失败",
+    "step_budget": "已达到最大执行步数，任务尚未完成",
+    "repeated_action": "连续重复动作已触发停止，任务尚未完成",
+    "recovery_exhausted": "恢复尝试已耗尽，任务尚未完成",
+    "final_verification_failed": "最终任务核验未通过",
+    "completion_rejected": "子任务完成证据反复未通过核验",
+    "context_budget": "输入超出上下文预算",
+    "model_timeout": "模型请求超过时间预算",
+    "runtime_error": "执行过程中发生异常",
+    "interrupted": "任务被手动中断",
+    "failed": "任务未完成",
+}
+
+
+def _outcome_text(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def normalize_outcome(outcome: Dict[str, Any], plan=None) -> Dict[str, Any]:
+    """Return a coherent display/export outcome without changing saved history."""
+    normalized = dict(outcome)
+    status = _outcome_text(normalized.get("status"))
+    success = normalized.get("success")
+    if status in {"failed", "interrupted"}:
+        normalized["success"] = False
+    elif status == "completed" and success is not True:
+        status = "failed"
+        normalized["success"] = False
+    elif status != "running" and success is False:
+        status = "failed"
+    elif not status and isinstance(success, bool):
+        status = "completed" if success else "failed"
+    if status:
+        normalized["status"] = status
+    reason = _outcome_text(normalized.get("termination_reason"))
+    if reason in {"", "unknown"}:
+        reason = "success" if status == "completed" else status or "unknown"
+    if status == "interrupted":
+        reason = "interrupted"
+    elif status == "failed" and reason == "success":
+        reason = "runtime_error"
+    normalized["termination_reason"] = reason
+    if status == "completed":
+        normalized["error"] = ""
+    elif status in {"failed", "interrupted"}:
+        plan_steps = plan if isinstance(plan, list) else plan.get("steps", []) if isinstance(plan, dict) else []
+        blocked = next((_outcome_text(step.get("blocked_reason"))
+                        for step in plan_steps
+                        if isinstance(step, dict) and _outcome_text(step.get("blocked_reason"))), "")
+        normalized["error"] = (_outcome_text(normalized.get("error"))
+            or ("" if status == "interrupted" else _outcome_text(normalized.get("final_answer")))
+            or ("" if status == "interrupted" else blocked)
+            or _FAILURE_MESSAGES.get(reason, _FAILURE_MESSAGES[status]))
+    return normalized
+
 
 def _parse_action(action_repr) -> Dict[str, Any]:
     if isinstance(action_repr, dict):
@@ -125,7 +181,7 @@ def build_trajectory(
     return {
         "version": TRAJECTORY_VERSION,
         "task": {"id": task_id, "domain": domain, "instruction": instruction},
-        "outcome": {
+        "outcome": normalize_outcome({
             "success": bool(getattr(result, "success", False)),
             "score": float(getattr(result, "score", 0.0)),
             "num_steps": int(getattr(result, "steps", 0)),
@@ -133,7 +189,9 @@ def build_trajectory(
             "evaluation_available": bool(getattr(result, "evaluation_available", False)),
             "reward_source": "environment_evaluator" if getattr(result, "evaluation_available", False) else "unavailable",
             "termination_reason": getattr(result, "termination_reason", "unknown"),
-        },
+            "status": "completed" if getattr(result, "success", False) else "failed",
+            "error": getattr(result, "error", ""),
+        }, getattr(result, "plan", None)),
         "steps": steps,
         "plan": getattr(result, "plan", None),
     }

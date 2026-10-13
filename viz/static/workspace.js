@@ -401,10 +401,14 @@ function browserContextText(entry,planPayload) {
     if (selection.snapshot_id) lines.push('输入快照：'+selection.snapshot_id);
     if (selection.roi) lines.push('关注区域 ROI：'+JSON.stringify(selection.roi));
     if (selection.reason) lines.push('选择 / 恢复：'+selection.reason);
+    if (selection.ax_quality) lines.push('AX 状态：'+selection.ax_quality+(selection.visual_required?' · 使用浏览器截图兜底':''));
+    if (selection.region_cached) lines.push('选区：复用当前快照结果');
     if (selection.omitted_groups?.length) lines.push('省略的区域：'+selection.omitted_groups.join('、'));
     if (selection.selection_ms!=null || selection.region_ms!=null) lines.push('选区耗时：'+formatElapsed(Number(selection.selection_ms ?? selection.region_ms)/1000));
   }
   const capture=entry?.observation?.info?.capture || entry?.capture;
+  const axCapture=entry?.observation?.info?.ax_capture;
+  if (axCapture) lines.push('AX 采集：'+axCapture.attempts+' 次 · 有效内容节点 '+axCapture.meaningful_node_count+' · '+formatElapsed(Number(axCapture.readiness_ms || 0)/1000)+(axCapture.reason?' · '+axCapture.reason:''));
   if (capture) {
     const size=value => Array.isArray(value)?value.join(' × '):typeof value==='object' && value?value.width+' × '+value.height:String(value ?? '—');
     const original=capture.original_size || capture.source_size || capture.viewport_css_size || capture.viewport;

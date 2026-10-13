@@ -55,6 +55,8 @@ class BrowserSession:
         self.nodes = {}
         self.page_id = None
         self.context_id = None
+        self._adopted_launcher_context = False
+        self._owned_page_ids = set()
         self.last_capture_info = {}
         self.request_deadline = None
         self._downloaded = {}  # url -> path，本次会话已下载的文件（幂等去重）
@@ -198,6 +200,7 @@ class BrowserSession:
             children = [target for target in cdp.send("Target.getTargets")["targetInfos"]
                         if target.get("type") == "page" and target.get("openerId") == self.page_id
                         and target.get("browserContextId") == self.context_id]
+            self._owned_page_ids.update(target["targetId"] for target in children)
             self._check_deadline()
             if len(children) == 1:
                 self.page_id = children[0]["targetId"]
@@ -214,8 +217,8 @@ class BrowserSession:
         finally:
             cdp.detach()
 
-    def bind_owned_page(self):
-        """首次创建本次运行专属的空白标签页；后续子任务复用同一 target。"""
+    def bind_owned_page(self, launch_profile=None):
+        """接管本次新启动的空白页，或在复用端点中创建隔离页；不另开启动窗口。"""
         self._check_deadline()
         p, browser = self._connect()
         try:
@@ -225,8 +228,39 @@ class BrowserSession:
                 return self.page_id
             cdp = browser.new_browser_cdp_session()
             try:
-                # --incognito 的原生窗口 context 不能用于 Target.createTarget。
-                # CDP 显式创建运行专属私有 context，临时连接断开后继续保留。
+                if launch_profile:
+                    # 仅 fresh launcher 返回的专用 profile 可被接管，已有无痕端点
+                    # 不提供 profile，也不能通过焦点或任取页面取得运行所有权。
+                    from urllib.parse import urlsplit
+                    from .run_windows_local import _validated_profile, _owned_endpoint_pids
+                    port = urlsplit(self.options.endpoint).port
+                    profile = _validated_profile(port, launch_profile)
+                    owners = _owned_endpoint_pids(port, profile) if profile else set()
+                    self._check_deadline()
+                    if not owners:
+                        raise BrowserActionError("不能确认启动页属于本任务的专用浏览器 profile")
+                    pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
+                             if target.get("type") == "page"]
+                    self._check_deadline()
+                    if (len(pages) == 1 and pages[0].get("url") == "about:blank"
+                            and pages[0].get("browserContextId") and not pages[0].get("openerId")):
+                        # Chrome --incognito 的原生 context 不支持 createTarget，但已存在的
+                        # 精确 target 可直接操作；这避免再次 createContext 打开第二个窗口。
+                        target = pages[0]
+                        current_owners = _owned_endpoint_pids(port, profile)
+                        self._check_deadline()
+                        if current_owners != owners:
+                            raise BrowserActionError("接管启动页时调试端口所有权发生变化")
+                        self.page_id, self.context_id = target["targetId"], target["browserContextId"]
+                        if self._pick_page(browser) is None:
+                            self.page_id = self.context_id = None
+                            raise BrowserActionError("本任务的浏览器启动页已关闭")
+                        self._adopted_launcher_context = True
+                        self._owned_page_ids.add(self.page_id)
+                        self.invalidate()
+                        return self.page_id
+                # 复用端点或没有唯一可接管启动页时显式创建私有 context。
+                # native --incognito context 不能用于 Target.createTarget。
                 self.context_id = cdp.send("Target.createBrowserContext", {
                     "disposeOnDetach": False,
                 })["browserContextId"]
@@ -234,6 +268,7 @@ class BrowserSession:
                     self.page_id = cdp.send("Target.createTarget", {
                         "url": "about:blank", "browserContextId": self.context_id,
                     })["targetId"]
+                    self._owned_page_ids.add(self.page_id)
                 except Exception:
                     cdp.send("Target.disposeBrowserContext", {"browserContextId": self.context_id})
                     self.context_id = None
@@ -304,6 +339,37 @@ class BrowserSession:
         """一次连接捕获同一页面/文档的截图和 AX；失败不混用旧结构。"""
         return self._capture(include_image=True)
 
+    def _read_ax_tree(self, page, cdp):
+        """新 CDP 会话的 AX 初始化可能晚于导航完成；只重读当前文档。"""
+        started = time.perf_counter()
+        delays = (75, 150, 250, 350)
+        raw, meaningful, quality = [], [], "degraded"
+        for attempt in range(len(delays) + 1):
+            self._check_deadline()
+            raw = cdp.send("Accessibility.getFullAXTree").get("nodes", [])
+            self._check_deadline()
+            meaningful = [node for node in raw if not node.get("ignored")
+                and node.get("role", {}).get("value") not in SKIP | {"RootWebArea", "WebArea"}
+                and (str(node.get("name", {}).get("value", "")).strip()
+                     or node.get("role", {}).get("value") in INTERACTIVE
+                     or str(node.get("value", {}).get("value", "")).strip())]
+            if meaningful:
+                quality = "ready"
+                break
+            if page.url == "about:blank":
+                quality = "empty"
+                break
+            if attempt < len(delays):
+                # Playwright 的等待会继续处理 CDP 事件，time.sleep 无法做到这一点。
+                page.wait_for_timeout(self._timeout_ms(delays[attempt]))
+                self._check_deadline()
+        metadata = {"attempts": attempt + 1, "raw_node_count": len(raw),
+            "meaningful_node_count": len(meaningful),
+            "reason": "" if quality == "ready" else (
+                "blank_document" if quality == "empty" else "ax_tree_not_ready"),
+            "readiness_ms": round((time.perf_counter() - started) * 1000, 2)}
+        return raw, quality, metadata
+
     def _capture(self, include_image):
         self._check_deadline()
         start = time.perf_counter()
@@ -326,106 +392,22 @@ class BrowserSession:
             if page is None:
                 raise BrowserActionError("本任务的浏览器页面不可用")
             cdp = page.context.new_cdp_session(page)
-            cdp.send("Accessibility.enable")
-            doc_before = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
-            page_id = cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"]
-            url = page.url
-            viewport = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
-            self._check_deadline()
-            dom = cdp.send("DOMSnapshot.captureSnapshot", {"computedStyles": []})
-            self._check_deadline()
-            strings, layout = dom["strings"], {}
-            for doc in dom["documents"]:
-                dn = doc["nodes"]
-                li = doc.get("layout", {})
-                bounds = dict(zip(li.get("nodeIndex", []), li.get("bounds", [])))
-                for i, backend in enumerate(dn.get("backendNodeId", [])):
-                    attrs = dn.get("attributes", [])[i]
-                    at = {strings[attrs[k]]: strings[attrs[k + 1]] for k in range(0, len(attrs), 2)}
-                    layout[backend] = {"bounds": bounds.get(i), "tag": strings[dn["nodeName"][i]].lower(),
-                                       "attrs": at, "frame_id": strings[doc["frameId"]]}
-            main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
-            raw = cdp.send("Accessibility.getFullAXTree")["nodes"]
-            self._check_deadline()
-            snapshot_id = uuid.uuid4().hex[:12]
-            retained = [n for n in raw if not n.get("ignored") and n.get("role", {}).get("value") not in SKIP]
-            raw_map = {n["nodeId"]: n for n in raw}
-            refs = {n["nodeId"]: str(i) for i, n in enumerate(retained)}  # 短数字 ref（ComponentBench 风格，模型易抄）
-            nodes = []
-            # 保留完整本地缓存。区域筛选和上下文预算发生在读取侧，不提前截掉尾部结果。
-            for n in retained:
-                backend = n.get("backendDOMNodeId")
-                detail = layout.get(backend, {})
-                attrs = detail.get("attrs", {})
-                role = n.get("role", {}).get("value", "")
-                states = {p["name"]: p.get("value", {}).get("value") for p in n.get("properties", [])
-                          if p["name"] in {"checked", "selected", "expanded", "disabled", "focused", "required", "readonly", "level"}}
-                parent = n.get("parentId")
-                seen = set()
-                while parent and parent not in refs and parent not in seen:
-                    seen.add(parent)
-                    parent = raw_map.get(parent, {}).get("parentId")
-                bounds = detail.get("bounds")
-                visible = bool(bounds and bounds[2] > 0 and bounds[3] > 0 and
-                    bounds[0] < viewport["x"] + viewport["width"] and bounds[0] + bounds[2] > viewport["x"] and
-                    bounds[1] < viewport["y"] + viewport["height"] and bounds[1] + bounds[3] > viewport["y"])
-                node = {"ref": refs[n["nodeId"]], "parent": refs.get(parent), "role": role,
-                        "name": str(n.get("name", {}).get("value", ""))[:400], "states": states,
-                        "backend_id": backend, "frame_id": detail.get("frame_id"),
-                        "tag": detail.get("tag", ""), "bounds": bounds, "in_viewport": visible,
-                        "direct": bool(backend and role in INTERACTIVE and detail.get("frame_id") == main_frame)}
-                if "value" in n:
-                    node["value"] = "[redacted]" if attrs.get("type") == "password" else str(n["value"].get("value", ""))[:400]
-                if attrs.get("href"):
-                    node["href"] = attrs["href"][:500]
-                if attrs.get("id"):
-                    node["id"] = attrs["id"][:200]
-                nodes.append(node)
-            warnings = []
-            if len(page.frames) > 1:
-                warnings.append("iframe content may be incomplete; iframe actions use visual fallback")
-            screenshot = None
-            original_size = None
-            if include_image:
-                import io
-                from PIL import Image
-                self._check_deadline()
-                screenshot = Image.open(io.BytesIO(page.screenshot(full_page=False, scale="css", timeout=self._timeout_ms()))).convert("RGB")
-                original_size = list(screenshot.size)
-                edge = self.options.screenshot_max_edge
-                if edge > 0 and max(screenshot.size) > edge:
-                    ratio = edge / max(screenshot.size)
-                    screenshot = screenshot.resize((max(1, round(screenshot.width * ratio)),
-                                                    max(1, round(screenshot.height * ratio))),
-                                                   Image.Resampling.LANCZOS)
-            title = page.title()
-            doc_after = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
-            viewport_after = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
-            if (doc_before != doc_after or page.url != url or viewport_after != viewport
-                    or cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"] != page_id):
-                raise BrowserActionError("页面在观察期间发生变化，请重新观察")
-            self._check_deadline()
-            self.snapshot = {"kind": "browser_ax", "snapshot_id": snapshot_id, "url": url,
-                "page_id": page_id, "document_id": doc_before,
-                "title": title, "viewport": viewport, "nodes": nodes, "warnings": warnings,
-                "captured_at": time.time(), "capture_ms": round((time.perf_counter() - start) * 1000, 2)}
-            self.nodes = {n["ref"]: n for n in nodes}
-            image_size = list(screenshot.size) if screenshot is not None else None
-            self.last_capture_info = {"page_id": page_id, "document_id": doc_before,
-                "snapshot_id": snapshot_id, "screenshot_coordinate_space": "css_viewport",
-                "viewport_css_size": [viewport["width"], viewport["height"]],
-                "screenshot_image_size": image_size,
-                "screenshot_scale": {"x": image_size[0] / viewport["width"],
-                                     "y": image_size[1] / viewport["height"]} if image_size else {"x": 1, "y": 1}}
-            self.last_capture_info["capture"] = {
-                "original_size": original_size, "input_size": image_size,
-                "viewport_css_size": [viewport["width"], viewport["height"]],
-                "scale": dict(self.last_capture_info["screenshot_scale"]),
-                "page_id": page_id, "document_id": doc_before, "snapshot_id": snapshot_id,
-                "timing_ms": self.snapshot["capture_ms"],
-            }
-            result.update(screenshot=screenshot, snapshot=self.snapshot, info=dict(self.last_capture_info))
-            return result
+            try:
+                cdp.send("Accessibility.enable")
+                for capture_attempt in range(2):
+                    try:
+                        result = self._snapshot_from_page(page, cdp, include_image, start)
+                        result["info"]["capture"]["attempts"] = capture_attempt + 1
+                        return result
+                    except BrowserActionError as exc:
+                        if "观察期间发生变化" not in str(exc) or capture_attempt == 1:
+                            raise
+                        self._check_deadline()
+            finally:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
         except ModelRequestTimeout:
             self.invalidate()
             raise
@@ -436,6 +418,111 @@ class BrowserSession:
             return result
         finally:
             self._disconnect(p, browser)
+
+    def _snapshot_from_page(self, page, cdp, include_image, start):
+        """仅在文档、target 和视口稳定后发布新节点映射。"""
+        doc_before = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
+        page_id = cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+        url = page.url
+        viewport = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+        raw, ax_quality, ax_capture = self._read_ax_tree(page, cdp)
+        self._check_deadline()
+        dom = cdp.send("DOMSnapshot.captureSnapshot", {"computedStyles": []})
+        self._check_deadline()
+        strings, layout = dom["strings"], {}
+        for doc in dom["documents"]:
+            dn = doc["nodes"]
+            li = doc.get("layout", {})
+            bounds = dict(zip(li.get("nodeIndex", []), li.get("bounds", [])))
+            for i, backend in enumerate(dn.get("backendNodeId", [])):
+                attrs = dn.get("attributes", [])[i]
+                at = {strings[attrs[k]]: strings[attrs[k + 1]] for k in range(0, len(attrs), 2)}
+                layout[backend] = {"bounds": bounds.get(i), "tag": strings[dn["nodeName"][i]].lower(),
+                                   "attrs": at, "frame_id": strings[doc["frameId"]]}
+        main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
+        self._check_deadline()
+        snapshot_id = uuid.uuid4().hex[:12]
+        retained = [n for n in raw if not n.get("ignored") and n.get("role", {}).get("value") not in SKIP]
+        raw_map = {n["nodeId"]: n for n in raw}
+        refs = {n["nodeId"]: str(i) for i, n in enumerate(retained)}  # 短数字 ref（ComponentBench 风格，模型易抄）
+        nodes = []
+        # 保留完整本地缓存。区域筛选和上下文预算发生在读取侧，不提前截掉尾部结果。
+        for n in retained:
+            backend = n.get("backendDOMNodeId")
+            detail = layout.get(backend, {})
+            attrs = detail.get("attrs", {})
+            role = n.get("role", {}).get("value", "")
+            states = {p["name"]: p.get("value", {}).get("value") for p in n.get("properties", [])
+                      if p["name"] in {"checked", "selected", "expanded", "disabled", "focused", "required", "readonly", "level"}}
+            parent = n.get("parentId")
+            seen = set()
+            while parent and parent not in refs and parent not in seen:
+                seen.add(parent)
+                parent = raw_map.get(parent, {}).get("parentId")
+            bounds = detail.get("bounds")
+            visible = bool(bounds and bounds[2] > 0 and bounds[3] > 0 and
+                bounds[0] < viewport["x"] + viewport["width"] and bounds[0] + bounds[2] > viewport["x"] and
+                bounds[1] < viewport["y"] + viewport["height"] and bounds[1] + bounds[3] > viewport["y"])
+            node = {"ref": refs[n["nodeId"]], "parent": refs.get(parent), "role": role,
+                    "name": str(n.get("name", {}).get("value", ""))[:400], "states": states,
+                    "backend_id": backend, "frame_id": detail.get("frame_id"),
+                    "tag": detail.get("tag", ""), "bounds": bounds, "in_viewport": visible,
+                    "direct": bool(backend and role in INTERACTIVE and detail.get("frame_id") == main_frame)}
+            if "value" in n:
+                node["value"] = "[redacted]" if attrs.get("type") == "password" else str(n["value"].get("value", ""))[:400]
+            if attrs.get("href"):
+                node["href"] = attrs["href"][:500]
+            if attrs.get("id"):
+                node["id"] = attrs["id"][:200]
+            nodes.append(node)
+        warnings = []
+        if ax_quality == "degraded":
+            warnings.append("AX tree is not ready; use current viewport image or reobserve, never reuse old refs")
+        if len(page.frames) > 1:
+            warnings.append("iframe content may be incomplete; iframe actions use visual fallback")
+        screenshot = None
+        original_size = None
+        if include_image:
+            import io
+            from PIL import Image
+            self._check_deadline()
+            screenshot = Image.open(io.BytesIO(page.screenshot(full_page=False, scale="css", timeout=self._timeout_ms()))).convert("RGB")
+            original_size = list(screenshot.size)
+            edge = self.options.screenshot_max_edge
+            if edge > 0 and max(screenshot.size) > edge:
+                ratio = edge / max(screenshot.size)
+                screenshot = screenshot.resize((max(1, round(screenshot.width * ratio)),
+                                                max(1, round(screenshot.height * ratio))),
+                                               Image.Resampling.LANCZOS)
+        title = page.title()
+        doc_after = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
+        viewport_after = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+        if (doc_before != doc_after or page.url != url or viewport_after != viewport
+                or cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"] != page_id):
+            raise BrowserActionError("页面在观察期间发生变化，请重新观察")
+        self._check_deadline()
+        self.snapshot = {"kind": "browser_ax", "snapshot_id": snapshot_id, "url": url,
+            "page_id": page_id, "document_id": doc_before,
+            "ax_quality": ax_quality, "ax_capture": ax_capture,
+            "title": title, "viewport": viewport, "nodes": nodes, "warnings": warnings,
+            "captured_at": time.time(), "capture_ms": round((time.perf_counter() - start) * 1000, 2)}
+        self.nodes = {n["ref"]: n for n in nodes}
+        image_size = list(screenshot.size) if screenshot is not None else None
+        self.last_capture_info = {"page_id": page_id, "document_id": doc_before,
+            "ax_quality": ax_quality, "ax_capture": dict(ax_capture),
+            "snapshot_id": snapshot_id, "screenshot_coordinate_space": "css_viewport",
+            "viewport_css_size": [viewport["width"], viewport["height"]],
+            "screenshot_image_size": image_size,
+            "screenshot_scale": {"x": image_size[0] / viewport["width"],
+                                 "y": image_size[1] / viewport["height"]} if image_size else {"x": 1, "y": 1}}
+        self.last_capture_info["capture"] = {
+            "original_size": original_size, "input_size": image_size,
+            "viewport_css_size": [viewport["width"], viewport["height"]],
+            "scale": dict(self.last_capture_info["screenshot_scale"]),
+            "page_id": page_id, "document_id": doc_before, "snapshot_id": snapshot_id,
+            "timing_ms": self.snapshot["capture_ms"],
+        }
+        return {"screenshot": screenshot, "snapshot": self.snapshot, "info": dict(self.last_capture_info)}
 
     # ---- route ----
     def snapshot_route(self):
@@ -1439,9 +1526,27 @@ class BrowserSession:
                 pass
             else:
                 try:
-                    browser.new_browser_cdp_session().send("Target.disposeBrowserContext", {
-                        "browserContextId": self.context_id,
-                    })
+                    cdp = browser.new_browser_cdp_session()
+                    try:
+                        if self._adopted_launcher_context:
+                            # native context 可能有用户后来打开的其它 tabs，不能整体 dispose。
+                            # 只关执行期间已登记的启动页/弹出页；不能在关闭时把用户
+                            # 后来打开但具有同一 opener 的页面补认作本任务所有。
+                            targets = cdp.send("Target.getTargets")["targetInfos"]
+                            children = {target["targetId"]: target for target in targets
+                                        if target.get("type") == "page"
+                                        and target.get("browserContextId") == self.context_id}
+                            for target_id in self._owned_page_ids & children.keys():
+                                try:
+                                    cdp.send("Target.closeTarget", {"targetId": target_id})
+                                except Exception:
+                                    pass
+                        else:
+                            cdp.send("Target.disposeBrowserContext", {
+                                "browserContextId": self.context_id,
+                            })
+                    finally:
+                        cdp.detach()
                 except Exception:
                     pass
                 finally:
@@ -1449,3 +1554,5 @@ class BrowserSession:
         self.invalidate()
         self.page_id = None
         self.context_id = None
+        self._adopted_launcher_context = False
+        self._owned_page_ids.clear()
