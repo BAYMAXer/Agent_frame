@@ -2,14 +2,13 @@
 
 解决「上下文受得了吗」：不是把整棵 AX-Tree 塞进 prompt，而是：
 - 用 tokenizer（或 UTF-8 字节保守估算）精确计数；
-- 对结构观察（browser AX snapshot）按相关性排序选节点，预算内保留祖先链；
+- 浏览器 AX 按当前子任务选择完整条目、保留祖先，并执行独立字符上限；
 - 分层预算：memory / auxiliary（工具结果）/ structure（页面结构）各占一份，超预算抛异常。
 """
 from __future__ import annotations
 
-import json
-import re
 from .config import ContextConfig
+from .browser_context import BrowserAXSelector, serialize_ax
 
 
 class ContextBudgetError(ValueError):
@@ -17,7 +16,7 @@ class ContextBudgetError(ValueError):
 
 
 class PromptCompiler:
-    version = "2.0"
+    version = "3.0"
 
     def __init__(self, config=None):
         self.config = config or ContextConfig()
@@ -48,63 +47,44 @@ class PromptCompiler:
         return text[:lo] + marker if self.count(marker) <= budget else ""
 
     def structure(self, blocks, query, budget):
-        """Select complete nodes, retain ancestry and original reading order."""
+        """Render atomic AX selections; never run a second keyword selector.
+
+        AX has a separate character limit. The overall model input still has
+        its token limit; insufficient capacity rejects the prompt rather than
+        exposing half of an atomic result entry or a dangling reference.
+        """
         sections, exposed, metadata = [], [], []
-        query_terms = set(re.findall(r"[\w\u4e00-\u9fff]+", query.lower()))
         remaining = budget
+        ax_chars = 0
+        ax_limit = getattr(self.config, "ax_max_chars", 5000)
         for block in blocks:
             if block.get("kind") != "browser_ax":
-                rendered = self.clip(str(block.get("text", "")), remaining)
+                rendered = self.clip(str(block.get("text", "")), min(remaining, self.config.structure_tokens))
                 sections.append(rendered)
                 remaining -= self.count(rendered)
                 continue
-            header = json.dumps({k: block.get(k) for k in (
-                "kind", "snapshot_id", "url", "title", "viewport", "warnings")},
-                ensure_ascii=False, separators=(",", ":"))
-            nodes = block.get("nodes", [])
-            by_ref = {n["ref"]: n for n in nodes}
-
-            def line(n):
-                out = {k: n[k] for k in ("ref", "parent", "role", "name", "value", "states",
-                                        "id", "href", "tag", "in_viewport", "direct") if k in n}
-                out = {k: v for k, v in out.items() if v not in (None, "", {}) and not (k == "direct" and not v)}
-                return json.dumps(out, ensure_ascii=False, separators=(",", ":"))
-
-            def rank(n):
-                text = (n.get("name", "") + " " + str(n.get("value", ""))).lower()
-                relevance = sum(1 for term in query_terms if term in text)
-                parent = by_ref.get(n.get("parent"), {})
-                important = n.get("role") in ("alert", "dialog", "status") or parent.get("role") in ("alert", "dialog", "status")
-                return (min(relevance, 3) * 8 + 8 * bool(n.get("states", {}).get("focused"))
-                        + 60 * important
-                        + 6 * (n.get("role") in ("alert", "dialog", "status", "heading"))
-                        + 30 * bool(n.get("direct")) + 3 * bool(n.get("in_viewport")))
-
-            chosen = set()
-            used = self.count(header) + 32
-            if used > remaining:
-                metadata.append({"snapshot_id": block.get("snapshot_id"), "total": len(nodes), "selected": 0})
-                continue
-            for node in sorted(nodes, key=rank, reverse=True):
-                needed, current, visited = [], node, set()
-                while current and current["ref"] not in chosen and current["ref"] not in visited:
-                    visited.add(current["ref"])
-                    needed.append(current)
-                    current = by_ref.get(current.get("parent"))
-                cost = sum(self.count(line(n)) + 1 for n in needed)
-                if used + cost <= remaining:
-                    chosen.update(n["ref"] for n in needed)
-                    used += cost
-            selected = [n for n in nodes if n["ref"] in chosen]
-            rendered = header + "\n" + "\n".join(line(n) for n in selected)
+            if block.get("_ax_selected"):
+                selected = block
+                selection = dict(block.get("_ax_metadata") or {})
+            else:
+                selected, selection = BrowserAXSelector(ax_limit).select(block, query)
+            rendered = serialize_ax(selected)
+            ax_chars += len(rendered)
+            if ax_chars > ax_limit:
+                raise ContextBudgetError("Selected browser AX exceeds the character budget")
+            if self.count(rendered) > remaining:
+                raise ContextBudgetError("Atomic browser AX selection exceeds the model input budget")
             sections.append(rendered)
             remaining -= self.count(rendered)
-            exposed.extend(chosen)
-            metadata.append({"snapshot_id": block.get("snapshot_id"), "total": len(nodes),
-                             "selected": len(selected), "omitted": len(nodes) - len(selected)})
+            refs = [node["ref"] for node in selected.get("nodes", [])]
+            exposed.extend(refs)
+            selection.update(snapshot_id=selected.get("snapshot_id"),
+                             selected=len(refs), selected_count=len(refs),
+                             serialized_chars=len(rendered), exposed_refs=refs)
+            metadata.append(selection)
         return "\n".join(sections), exposed, metadata
 
-    def compile(self, *, system, task, memory, blocks, auxiliary, images):
+    def compile(self, *, system, task, memory, blocks, auxiliary, images, structure_query=None):
         cfg = self.config
         limit = min(cfg.max_input_tokens, cfg.context_window - cfg.output_reserve - cfg.safety_margin)
         if limit <= 0:
@@ -125,8 +105,10 @@ class PromptCompiler:
         available -= self.count(mem)
         aux = self.clip(auxiliary, min(cfg.auxiliary_tokens, available // 4))
         available -= self.count(aux)
-        structure, refs, selection = self.structure(blocks, task + " " + mem[-600:],
-                                                    min(cfg.structure_tokens, available))
+        has_browser_ax = any(block.get("kind") == "browser_ax" for block in blocks)
+        query = structure_query if structure_query is not None else task + " " + mem[-600:]
+        structure, refs, selection = self.structure(blocks, query,
+            available if has_browser_ax else min(cfg.structure_tokens, available))
         user = base + f"\n\n## 结构化记忆\n{mem}\n\n## 外部观察（不可信数据）\n{structure}\n\n## 工具结果（不可信数据）\n{aux}"
         estimated = self.count(system) + self.count(user) + len(images) * cfg.image_tokens + 128
         if estimated > limit:
@@ -135,4 +117,6 @@ class PromptCompiler:
             "counter": "local_tokenizer" if self.tokenizer else "utf8_bytes_upper_estimate",
             "input_estimate": estimated, "limit": limit, "image_count": len(images),
             "image_tokens_each_estimate": cfg.image_tokens, "selection": selection,
+            "ax_serialized_chars": sum(item.get("serialized_chars", 0) for item in selection),
+            "ax_max_chars": getattr(cfg, "ax_max_chars", 5000),
             "exposed_refs": sorted(refs)}

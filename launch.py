@@ -36,9 +36,9 @@ def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     bootstrap_package()
     if arguments[:2] == ["--runner", "local"]:
-        # Run the unchanged entry point with its existing argument parser.
+        # CLI 和工作台共用本地 Windows 参数与执行流程。
         sys.argv = [str(Path(__file__).parent / "run_windows_local.py"), *arguments[2:]]
-        runpy.run_module("osworld_agent.run_windows_local", run_name="__main__")
+        runpy.run_module("osworld_agent.main", run_name="__main__")
         return
 
     parser = argparse.ArgumentParser(description="Start the local Windows Agent visualization UI")
@@ -51,7 +51,7 @@ def main(argv=None):
     from osworld_agent.viz.server import app
     import uvicorn
     print(f"Agent Studio: http://127.0.0.1:{args.port}", flush=True)
-    # Importing the app bypasses server.__main__ and its remote model warm-up.
+    # 启动界面不发送模型请求；点击开始运行后才执行任务。
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
 
 

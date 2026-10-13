@@ -1,4 +1,4 @@
-"""skill 系统：确定性技能（本地精确计算 / 目标机文件与时钟查询）。
+"""skill 系统：确定性技能（精确计算 / Windows 本机文件与时钟查询）。
 
 - 注册表在 config/skills.yaml（description/params/enabled）；
 - 执行逻辑在 handlers.SKILL_HANDLERS；

@@ -10,6 +10,42 @@ import sys
 from pathlib import PureWindowsPath
 from typing import Any
 
+from ..actions import Action
+
+
+def to_pyautogui(action: Action) -> str:
+    """生成 Windows 点击、滚动、按键、拖拽和等待命令。
+
+    文本输入和应用切换由 WindowsEnvironment 的 Unicode/窗口接口处理。
+    """
+    args, name = action.args, action.action
+    if args.get("grounding_failed"):
+        return ""
+    head = "import pyautogui; import time; "
+    if name in ("click", "double_click", "right_click"):
+        x, y = args.get("x"), args.get("y")
+        if x is None or y is None or int(x) < 0 or int(y) < 0:
+            return ""
+        if name == "double_click":
+            return f"{head}pyautogui.doubleClick({x}, {y})"
+        suffix = ", button='right'" if name == "right_click" else ""
+        return f"{head}pyautogui.click({x}, {y}{suffix})"
+    if name == "scroll":
+        amount = int(args.get("amount", 1)) * (1 if args.get("direction") == "up" else -1)
+        return f"{head}pyautogui.scroll({amount})"
+    if name == "press":
+        return f"{head}pyautogui.press({str(args.get('key', ''))!r})"
+    if name == "hotkey":
+        return f"{head}pyautogui.hotkey(*{list(args.get('keys', []))!r})"
+    if name == "drag_and_drop":
+        if any(args.get(key) is None for key in ("x1", "y1", "x2", "y2")):
+            return ""
+        return (f"{head}pyautogui.moveTo({args['x1']}, {args['y1']}); "
+                f"pyautogui.dragTo({args['x2']}, {args['y2']}, duration=1.0)")
+    if name == "wait":
+        return f"{head}time.sleep({float(args.get('seconds', 1))})"
+    return ""
+
 
 class _MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx", ctypes.c_int32), ("dy", ctypes.c_int32),
@@ -69,7 +105,7 @@ def write_text(text: str, gui=None) -> None:
                       f"SendInput inserted {inserted}/{len(events)} Unicode events")
 
 
-def _enumerate_windows() -> list[dict[str, Any]]:
+def _enumerate_windows(*, include_untitled=False) -> list[dict[str, Any]]:
     """List visible top-level windows with executable names and full titles."""
     user32 = _load_user32()
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -99,7 +135,7 @@ def _enumerate_windows() -> list[dict[str, Any]]:
         if not user32.IsWindowVisible(hwnd):
             return 1
         length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
+        if length <= 0 and not include_untitled:
             return 1
         title = ctypes.create_unicode_buffer(length + 1)
         user32.GetWindowTextW(hwnd, title, len(title))
@@ -115,7 +151,8 @@ def _enumerate_windows() -> list[dict[str, Any]]:
                     executable = PureWindowsPath(path.value).name.casefold()
             finally:
                 kernel32.CloseHandle(process)
-        windows.append({"hwnd": hwnd, "title": title.value, "executable": executable})
+        windows.append({"hwnd": hwnd, "pid": process_id.value,
+                        "title": title.value, "executable": executable})
         return 1
 
     if not user32.EnumWindows(collect, 0):
@@ -169,7 +206,21 @@ def foreground_window():
     return user32.GetForegroundWindow()
 
 
-def activate_application(app_code: str, work_screen=None, *, allow_browsers=True) -> dict:
+def window_process_id(hwnd):
+    """Read the current owner of a full-width window handle; unknown returns zero."""
+    try:
+        user32 = _load_user32()
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
+        pid = ctypes.c_uint32()
+        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
+            return 0
+        return pid.value
+    except (OSError, AttributeError):
+        return 0
+
+
+def activate_application(app_code: str, work_screen=None, *, allow_browsers=True, presenter=None) -> dict:
     """Activate exactly one matching window; never substitute a blind Alt+Tab."""
     if not app_code or not app_code.strip():
         return {"status": "rejected", "dispatched": False, "error": "缺少目标应用 app_code"}
@@ -191,6 +242,23 @@ def activate_application(app_code: str, work_screen=None, *, allow_browsers=True
         return {"status": "rejected", "dispatched": False,
                 "error": "浏览器窗口须通过 goto 启动或激活本任务的无痕实例"}
     hwnd = window["hwnd"]
+    if presenter is not None:
+        pid = window.get("pid")
+        if not pid:
+            return {"status": "rejected", "dispatched": False,
+                    "error": "无法确认目标应用窗口 PID，未激活该窗口"}
+        result = dict(presenter.activate(hwnd, pid))
+        result.update(window_title=window["title"], window_executable=window["executable"])
+        if result.get("status") != "executed":
+            return result
+        if work_screen is not None and work_screen.detected and work_screen.monitor_count > 1:
+            from .windows_display import move_window_to_work_screen
+            if (foreground_window() != hwnd or window_process_id(hwnd) != pid
+                    or not move_window_to_work_screen(hwnd, work_screen)
+                    or foreground_window() != hwnd or window_process_id(hwnd) != pid):
+                result.update(status="uncertain", dispatched=True,
+                              error=f"目标窗口未能在主屏保持焦点: {window['title']}")
+        return result
     user32 = _load_user32()
     for name in ("IsIconic", "SetForegroundWindow"):
         getattr(user32, name).argtypes = [ctypes.c_void_p]

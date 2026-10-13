@@ -13,7 +13,11 @@
 import sys
 import time
 
-sys.path.insert(0, __file__.rsplit("\\", 1)[0] if "\\" in __file__ else ".")
+if __package__:
+    from .launch import bootstrap_package
+else:
+    from launch import bootstrap_package
+bootstrap_package()
 
 from osworld_agent.utils import (
     detect_foreground_browser,
@@ -30,6 +34,8 @@ URL = "https://www.baidu.com"  # 可换成任意网页
 
 
 def main():
+    if sys.platform != "win32":
+        raise RuntimeError("浏览器演示仅支持 Windows 本机")
     print(f"[1] 启动无痕 Chrome（remote debugging 端口 {PORT}）...")
     # 与本地 runner 共用启动/核验；完成后保留浏览器，仅释放会话资源。
     ensure_chrome(PORT, CHROME)

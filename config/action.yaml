@@ -78,18 +78,6 @@ actions:
     kind: env
     resolve: drag
 
-  set_cell_values:
-    params: [new_cell_values, app_name, sheet_name]
-    description: "批量直写表格单元格（不经 GUI）。new_cell_values 如 {\"A1\": 5, \"B1\": \"=SUM(A1:A10)\"}；app_name 填【文档标题/文件名】（从窗口标题栏看，如 NetIncome.xlsx），不是应用名；sheet_name 填工作表名（如 Sheet1）"
-    kind: uno
-    resolve: none
-
-  save:
-    params: []
-    description: "保存当前文档（程序化保存，避开格式确认弹窗）"
-    kind: uno
-    resolve: none
-
   switch_applications:
     params: [app_code]
     description: "切换活动应用窗口（app_code 如 libreoffice_calc / chrome / libreoffice_writer）"
@@ -121,6 +109,12 @@ actions:
     resolve: none
 
   # ---- 终止动作 ----
+  complete_subtask:
+    params: [step_id, result, evidence]
+    description: "申请完成当前子任务。step_id 必须等于当前子任务；result 保存结果，evidence 描述实际观察。浏览器任务另带当前 snapshot_id 和 evidence_refs（观察中的节点引用数组）。程序核验通过后才下发下一子任务；该响应不能同时执行其他动作"
+    kind: memory
+    resolve: none
+
   request_finish:
     params: [answer]
     description: "请求结束任务并给出最终答案（answer 直接写找到的结果）；程序会验证是否真的完成，未完成会被拒绝"

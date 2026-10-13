@@ -23,7 +23,7 @@ class Agent:
                  env: Environment, max_steps: int = 20, max_retries: int = 5,
                  enable_reflection: bool = True, early_stop_repeat: int = 3,
                  code_agent_budget: int = 20, step_callback=None, progress_callback=None,
-                 step_timeout: float = 120.0):
+                 step_timeout: float = 120.0, context_config=None):
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -34,7 +34,8 @@ class Agent:
         self.step_callback = step_callback
         self.progress_callback = progress_callback
         self.step_timeout = step_timeout
-        self.os_name = getattr(env, "os_name", "linux")
+        self.context_config = context_config
+        self.os_name = "windows"
         # 显式声明浏览器专用的环境用精简提示词；Windows 本机支持桌面与浏览器切换。
         self.browser_only = bool(getattr(env, "browser_only", False))
         supported = getattr(env, "supported_action_names", None)
@@ -59,5 +60,6 @@ class Agent:
             step_callback=self.step_callback,
             progress_callback=self.progress_callback,
             step_timeout=self.step_timeout,
+            context_config=self.context_config,
         )
         return pipeline.run(task)

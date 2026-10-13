@@ -4,7 +4,7 @@ const byId = id => document.getElementById(id);
 const viewNames = {run:'任务配置',live:'实时运行',local:'历史轨迹',chat:'模型对话'};
 let activeView = 'run';
 let followLatest = true;
-let ioTab = 'output';
+let ioTab = null;
 let runState = {status:'idle'};
 let launchPending = false;
 let stopPending = false;
@@ -17,10 +17,16 @@ let detailOpen = false;
 let processOutput = '';
 const liveImageCache = new Map();
 const orphanLogs = new Map();
+const inspectorPanels = new Map();
+let renderedEventScope = '';
+let followedEventKey = '';
+let forceFollowScroll = false;
+let lastEventScrollTop = 0;
+let expectedEventScrollTop = null;
 const draftKey = 'agent-studio.windows.config.v1';
-const draftFields = ['local-task','local-maxsteps','run-model','run-model-url','run-ground','run-ground-url','run-ground-type','model-timeout','ground-timeout','step-timeout'];
-const typeLabels = {decision:'决策模型',grounding:'定位模型',format_retry:'格式重试',verify:'完成核对',reflect:'执行反思',code_agent:'子 Agent'};
-const eventLabels = {task_start:'任务开始',step:'开始执行步骤',plan_update:'任务计划更新',executing:'正在执行动作',executed:'动作执行结果',task_end:'任务结束',error:'执行异常',interrupted:'已停止运行'};
+const draftFields = ['local-task','local-maxsteps','execution-mode','ax-max-chars','screenshot-max-edge','run-model','run-model-url','run-ground','run-ground-url','run-ground-type','model-timeout','ground-timeout','step-timeout'];
+const typeLabels = {decision:'决策模型',grounding:'定位模型',format_retry:'格式重试',verify:'完成核对',reflect:'执行反思',code_agent:'子 Agent',planning:'任务规划',region_selection:'网页选区',subtask_verification:'子任务核验',uncertain_verification:'操作效果核验'};
+const eventLabels = {task_start:'任务开始',step:'开始执行步骤',plan_update:'任务计划更新',browser_observation:'浏览器观察',browser_selection:'浏览器区域选择',executing:'正在执行动作',executed:'动作执行结果',task_end:'任务结束',error:'执行异常',interrupted:'已停止运行'};
 
 function toast(message) {
   document.querySelector('.toast')?.remove();
@@ -67,6 +73,8 @@ function updateSummary() {
   setText('summary-model',byId('run-model').value || '待配置');
   setText('summary-ground',byId('run-ground').value || '待配置');
   setText('summary-budget','最多 '+byId('local-maxsteps').value+' 步 · 单步 '+byId('step-timeout').value+' 秒');
+  setText('summary-mode',byId('execution-mode').value==='browser_first'?'浏览器优先':'通用桌面');
+  setText('execution-mode-help',byId('execution-mode').value==='browser_first'?'使用独立浏览器，按网页结构定位和执行':'操作本机应用，使用真实鼠标与键盘');
 }
 function applyPreset(type) {
   const decision=type==='decision';
@@ -102,15 +110,22 @@ async function initConfiguration() {
     if (data.error) feedback('模型预设读取失败，可手动填写模型和地址。',true);
   } catch { feedback('模型预设读取失败，可手动填写模型和地址。',true); }
   updateSummary();
-  api('/experiments/default-prompt?os_name=windows&browser_only=false').then(data => {
+  refreshPromptPreview();
+}
+function refreshPromptPreview() {
+  const browserOnly=byId('execution-mode').value==='browser_first';
+  api('/experiments/default-prompt?os_name=windows&browser_only='+browserOnly).then(data => {
     setText('preview-system-prompt',data.ok?data.prompt:'提示词读取失败：'+(data.error || '未知错误'));
   }).catch(() => setText('preview-system-prompt','提示词预览暂时不可用'));
 }
 draftFields.forEach(id => byId(id).addEventListener('input',() => { updateSummary(); saveDraft(); }));
 byId('run-model').addEventListener('change',() => { applyPreset('decision'); updateSummary(); saveDraft(); });
 byId('run-ground').addEventListener('change',() => { applyPreset('grounding'); updateSummary(); saveDraft(); });
+byId('execution-mode').addEventListener('change',refreshPromptPreview);
 document.querySelectorAll('[data-task]').forEach(button => button.addEventListener('click',() => {
-  byId('local-task').value=button.dataset.task; byId('local-task').focus(); saveDraft();
+  byId('local-task').value=button.dataset.task;
+  byId('execution-mode').value=button.dataset.mode || 'browser_first';
+  updateSummary(); refreshPromptPreview(); byId('local-task').focus(); saveDraft();
 }));
 
 function integerField(id,label,maximum) {
@@ -134,6 +149,9 @@ function configuration() {
   const task=byId('local-task').value.trim();
   if (!task) { byId('local-task').focus(); throw new Error('请先描述希望 Agent 完成的任务'); }
   return {mode:'local',task,...modelConfiguration(),max_steps:integerField('local-maxsteps','最大步数',100),
+    execution_mode:byId('execution-mode').value,
+    ax_max_chars:integerField('ax-max-chars','AX 字符预算',1000000),
+    screenshot_max_edge:integerField('screenshot-max-edge','截图最长边',16384),
     model_timeout:integerField('model-timeout','决策超时',3600),ground_timeout:integerField('ground-timeout','定位超时',3600),step_timeout:integerField('step-timeout','单步超时',3600)};
 }
 function updateRunControls() {
@@ -181,7 +199,7 @@ byId('btn-test').addEventListener('click',async () => {
   button.disabled=true; button.textContent='正在测试连接…'; feedback('正在发送视觉测试请求…');
   try { const data=await api('/run/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)}); if (!data.ok) throw new Error(data.error || 'HTTP '+data.status); feedback('连接成功 · 视觉请求正常'+(data.content?'：'+data.content:'')); }
   catch (error) { feedback('连接失败：'+error.message,true); }
-  finally { button.disabled=false; button.textContent='测试决策模型连接'; }
+  finally { button.disabled=false; button.textContent='测试模型连接'; }
 });
 async function stopRun() {
   if (stopPending) return; stopPending=true; updateRunControls();
@@ -252,6 +270,7 @@ function selectedEntry() {
 }
 function setFollow(follow) {
   followLatest=follow;
+  forceFollowScroll=follow;
   const button=byId('btn-follow'); button.classList.toggle('paused',!follow); button.setAttribute('aria-pressed',String(follow)); button.textContent=follow?'● 跟随最新':'Ⅱ 跟随已暂停';
   if (follow && taskGroups.length) { switchToGroup(taskGroups.length-1); const group=taskGroups[currentGroup]; group.selectedKey=group.entries?.at(-1)?.key; refreshWorkspace(); }
 }
@@ -260,38 +279,88 @@ function actionText(value) { return typeof value==='string'?value:value==null?''
 function entryTitle(entry) {
   if (entry.kind==='model') return entry.prompt || typeLabels[entry.type] || '模型调用';
   if (entry.event==='task_start') return entry.instruction || '任务开始';
+  if (entry.event==='browser_observation') {
+    const selection=entry.prompt_metadata?.browser_selection;
+    return selection?'网页结构 '+(selection.original_count ?? selection.original ?? '—')+' → '+(selection.selected_count ?? selection.selected ?? '—')+' 节点'+(entry.plan_step_id!=null?' · 子任务 '+entry.plan_step_id:''):'浏览器观察已更新';
+  }
   if (entry.action) return actionText(entry.action);
   if (entry.error) return actionText(entry.error);
   return eventLabels[entry.event] || entry.event || '状态更新';
 }
 function entryMatches(entry,filter,query) {
-  const decision=entry.kind==='model' && entry.type!=='grounding';
+  const decision=entry.kind==='model' && ['decision','format_retry'].includes(entry.type);
   const error=Boolean(entry.error) || entry.event==='error' || ['rejected','uncertain'].includes(entry.status);
   if (filter==='decision' && !decision || filter==='grounding' && entry.type!=='grounding' || filter==='status' && entry.kind!=='status' || filter==='error' && !error) return false;
+  if (['planning','region_selection'].includes(filter) && (entry.kind!=='model' || entry.type!==filter)) return false;
+  if (filter==='verification' && (entry.kind!=='model' || !['verify','subtask_verification','uncertain_verification','final_verification'].includes(entry.type))) return false;
   return !query || [entryTitle(entry),entry.prompt,entry.response,entry.raw_response,entry.step,entry.event,entry.type].join(' ').toLowerCase().includes(query.toLowerCase());
+}
+function scrollEventList(top) {
+  const list=byId('live-events'); list.scrollTop=top;
+  lastEventScrollTop=list.scrollTop; expectedEventScrollTop=list.scrollTop;
 }
 function renderEventList() {
   const list=byId('live-events'), group=taskGroups[currentGroup], entries=group?.entries || [];
   const filter=byId('live-filter').value, query=byId('live-search').value.trim();
   const visible=entries.filter(entry => entryMatches(entry,filter,query));
   setText('event-count',visible.length+' / '+entries.length);
-  const scrollTop=list.scrollTop;
-  if (!visible.length) { list.innerHTML='<div class="empty">'+(entries.length?'没有匹配的事件，试试其他筛选条件。':'任务启动后，执行步骤将在这里实时出现。')+'</div>'; return; }
-  const fragment=document.createDocumentFragment();
+  const scope=JSON.stringify([group?.config.ts,currentGroup,filter,query]);
+  const sameScope=scope===renderedEventScope;
+  const scrollTop=sameScope?list.scrollTop:0;
+  const bounds=list.getBoundingClientRect();
+  const anchor=sameScope?[...list.children].find(node => node.dataset.key && node.getBoundingClientRect().bottom>bounds.top):null;
+  const anchorOffset=anchor?anchor.getBoundingClientRect().top-bounds.top:0;
+  const existing=sameScope?new Map([...list.children].filter(node => node.dataset.key).map(node => [node.dataset.key,node])):new Map();
+  renderedEventScope=scope;
+  if (!visible.length) {
+    const emptyText=entries.length?'没有匹配的事件，试试其他筛选条件。':'任务启动后，执行步骤将在这里实时出现。';
+    if (list.firstElementChild?.textContent!==emptyText || !list.firstElementChild?.classList.contains('empty')) { const empty=document.createElement('div'); empty.className='empty'; empty.textContent=emptyText; list.replaceChildren(empty); }
+    return;
+  }
+  const visibleKeys=new Set(visible.map(entry => entry.key));
+  [...list.children].forEach(node => { if (!sameScope || !visibleKeys.has(node.dataset.key)) node.remove(); });
+  const nodes=[];
   visible.forEach(entry => {
-    const button=document.createElement('button'); button.className='event-item'; button.dataset.key=entry.key;
-    button.classList.toggle('selected',entry.key===group.selectedKey); button.setAttribute('aria-pressed',String(entry.key===group.selectedKey));
+    let button=existing.get(entry.key);
+    if (!button) {
+      button=document.createElement('button'); button.className='event-item'; button.dataset.key=entry.key;
+      button.addEventListener('click',() => { setFollow(false); group.selectedKey=button.dataset.key; refreshWorkspace(); });
+    }
     const error=Boolean(entry.error) || entry.event==='error' || ['rejected','uncertain'].includes(entry.status);
     const label=entry.kind==='model'?(typeLabels[entry.type] || '模型调用'):(eventLabels[entry.event] || entry.event);
     const time=entry.ts?new Date(entry.ts*1000).toLocaleTimeString('zh-CN',{hour12:false}):'';
-    button.innerHTML='<div class="event-top"><i class="event-dot '+(error?'error':entry.type==='grounding'?'grounding':entry.kind==='model'?'decision':'')+'"></i><span>'+esc(label)+'</span><span class="event-time">'+esc(time)+'</span></div><div class="event-title">'+esc(entryTitle(entry))+'</div><div class="event-bottom"><span>'+(entry.step!=null?'STEP '+esc(entry.step):'TASK')+'</span><span'+(error?' class="error-text"':'')+'>'+(entry.pending?'等待模型响应':error?'异常 / 未确认':entry.elapsed!=null?esc(formatElapsed(entry.elapsed)):entry.status?esc(entry.status):'已记录')+'</span></div>';
-    button.addEventListener('click',() => { setFollow(false); group.selectedKey=entry.key; refreshWorkspace(); });
-    fragment.appendChild(button);
+    const title=String(entryTitle(entry));
+    const displayTitle=title.length>180?title.slice(0,180)+'…':title;
+    const html='<div class="event-top"><i class="event-dot '+(error?'error':entry.type==='grounding'?'grounding':entry.kind==='model'?'decision':'')+'"></i><span>'+esc(label)+'</span><span class="event-time">'+esc(time)+'</span></div><div class="event-title">'+esc(displayTitle)+'</div><div class="event-bottom"><span>'+(entry.step!=null?'STEP '+esc(entry.step):'TASK')+'</span><span'+(error?' class="error-text"':'')+'>'+(entry.pending?'等待模型响应':error?'异常 / 未确认':entry.elapsed!=null?esc(formatElapsed(entry.elapsed)):entry.status?esc(entry.status):'已记录')+'</span></div>';
+    if (button._eventHtml!==html) { button.innerHTML=html; button._eventHtml=html; }
+    button.classList.toggle('selected',entry.key===group.selectedKey); button.setAttribute('aria-pressed',String(entry.key===group.selectedKey));
+    nodes.push(button);
   });
-  list.replaceChildren(fragment);
-  if (followLatest) list.querySelector('.selected')?.scrollIntoView({block:'nearest'});
-  else list.scrollTop=scrollTop;
+  nodes.forEach((node,index) => { if (list.children[index]!==node) list.insertBefore(node,list.children[index] || null); });
+  const selectionKey=scope+'|'+group.selectedKey;
+  if (followLatest && activeView==='live' && (forceFollowScroll || selectionKey!==followedEventKey)) {
+    const selected=list.querySelector('.selected');
+    if (selected) {
+      const row=selected.getBoundingClientRect(),container=list.getBoundingClientRect();
+      if (row.bottom>container.bottom) scrollEventList(list.scrollTop+row.bottom-container.bottom+8);
+      else if (row.top<container.top) scrollEventList(list.scrollTop+row.top-container.top-8);
+    }
+    followedEventKey=selectionKey; forceFollowScroll=false;
+  } else {
+    const retainedAnchor=anchor?.isConnected?anchor:null;
+    const delta=retainedAnchor?retainedAnchor.getBoundingClientRect().top-list.getBoundingClientRect().top-anchorOffset:0;
+    scrollEventList(scrollTop+delta);
+  }
 }
+const eventList=byId('live-events');
+eventList.addEventListener('wheel',event => { if (event.deltaY<0 && followLatest) setFollow(false); },{passive:true});
+eventList.addEventListener('keydown',event => { if (['ArrowUp','PageUp','Home'].includes(event.key) || event.key===' ' && event.shiftKey) setFollow(false); });
+eventList.addEventListener('scroll',() => {
+  const top=eventList.scrollTop;
+  if (expectedEventScrollTop!=null && Math.abs(top-expectedEventScrollTop)<2) expectedEventScrollTop=null;
+  else if (followLatest && top<lastEventScrollTop-2) setFollow(false);
+  lastEventScrollTop=top;
+},{passive:true});
 ['live-search','live-filter'].forEach(id => byId(id).addEventListener(id==='live-search'?'input':'change',renderEventList));
 function renderGroupStatus() {
   const group=taskGroups[currentGroup];
@@ -319,6 +388,53 @@ function renderGroupStatus() {
   else { setStatus('running','运行中'); setText('st-result','—'); }
   byId('btn-prev').disabled=currentGroup<=0; byId('btn-next').disabled=currentGroup>=taskGroups.length-1;
 }
+function browserContextText(entry,planPayload) {
+  const lines=[];
+  const plan=entry?.plan_snapshot || planPayload?.plan;
+  const steps=(Array.isArray(plan)?plan:plan?.steps || []).filter(step => step && typeof step==='object');
+  const stepId=entry?.plan_step_id ?? planPayload?.current_plan_step_id ?? plan?.current_plan_step_id ?? plan?.current_step_id;
+  const current=(stepId!=null?steps.find(step => String(step.id)===String(stepId)):null) || steps.find(step => ['in_progress','doing'].includes(step.status));
+  if (current) lines.push('当前子任务 '+(current.id || current.idx || '')+'：'+(current.goal || ''));
+  const selection=entry?.prompt_metadata?.browser_selection;
+  if (selection) {
+    lines.push('决策输入 · AX 节点 '+(selection.original_count ?? selection.original ?? selection.total ?? '—')+' → '+(selection.selected_count ?? selection.selected ?? '—')+' · '+(selection.serialized_chars ?? '—')+' 字符');
+    if (selection.snapshot_id) lines.push('输入快照：'+selection.snapshot_id);
+    if (selection.roi) lines.push('关注区域 ROI：'+JSON.stringify(selection.roi));
+    if (selection.reason) lines.push('选择 / 恢复：'+selection.reason);
+    if (selection.omitted_groups?.length) lines.push('省略的区域：'+selection.omitted_groups.join('、'));
+    if (selection.selection_ms!=null || selection.region_ms!=null) lines.push('选区耗时：'+formatElapsed(Number(selection.selection_ms ?? selection.region_ms)/1000));
+  }
+  const capture=entry?.observation?.info?.capture || entry?.capture;
+  if (capture) {
+    const size=value => Array.isArray(value)?value.join(' × '):typeof value==='object' && value?value.width+' × '+value.height:String(value ?? '—');
+    const original=capture.original_size || capture.source_size || capture.viewport_css_size || capture.viewport;
+    const input=capture.input_size || capture.screenshot_size;
+    if (original || input) lines.push('操作后观察 · 浏览器截图 '+size(original)+' → 输入 '+size(input));
+    if (capture.viewport_css_size) lines.push('CSS 视口：'+size(capture.viewport_css_size));
+    if (capture.snapshot_id) lines.push('观察快照：'+capture.snapshot_id);
+    if (capture.timing_ms!=null) lines.push('网页捕获：'+formatElapsed(Number(capture.timing_ms)/1000));
+  }
+  if (entry?.phase) lines.push('阶段：'+entry.phase);
+  if (entry?.previous_phase_elapsed_ms!=null) lines.push('上一阶段 '+(entry.previous_phase || '')+'：'+formatElapsed(Number(entry.previous_phase_elapsed_ms)/1000));
+  if (entry?.timing_ms) lines.push('阶段耗时：'+Object.entries(entry.timing_ms).map(([name,ms]) => name+' '+formatElapsed(Number(ms)/1000)).join(' · '));
+  return lines.join('\n');
+}
+function renderBrowserContext() {
+  const group=taskGroups[currentGroup],entry=selectedEntry();
+  if (!group) { setText('browser-context-meta','等待观察'); writeInspectorPanel('browser-context','等待浏览器子任务与观察数据','empty'); return; }
+  const candidates=(group.entries || []).filter(item => entry?.step==null || String(item.step)===String(entry.step));
+  const evidence=[...candidates].reverse().find(item => item.prompt_metadata?.browser_selection);
+  const timing=[...candidates].reverse().find(item => item.timing_ms);
+  const observation=[...candidates].reverse().find(item => item.observation?.info?.capture || item.capture);
+  const details={...evidence,...entry,
+    prompt_metadata:entry?.prompt_metadata?.browser_selection?entry.prompt_metadata:evidence?.prompt_metadata,
+    observation:entry?.observation?.info?.capture?entry.observation:observation?.observation,
+    capture:entry?.capture || observation?.capture,
+    timing_ms:entry?.timing_ms || timing?.timing_ms};
+  const selection=details.prompt_metadata?.browser_selection;
+  setText('browser-context-meta',selection?(selection.selected_count ?? selection.selected ?? '—')+' AX 节点':details.phase || '暂无选区');
+  writeInspectorPanel('browser-context',browserContextText(details,group.planPayload) || '此步骤尚无浏览器区域选择数据',group.config.ts+':'+entry?.key);
+}
 function screenForEntry(group,entry) {
   if (!entry) return null;
   const index=group.entries.indexOf(entry);
@@ -334,7 +450,7 @@ function renderScreen() {
   screenIdentity=identity;
   byId('btn-zoom').disabled=!source;
   if (!source || !(source.startsWith('/live/shot/') || source.startsWith('data:image/'))) {
-    stage.innerHTML='<div class="stage-empty"><div class="screen-icon"></div>'+(!taskGroups.length?'等待第一张屏幕截图':'此步骤尚无可用截图')+'<br><span>截图会随模型调用实时更新</span></div>'; setText('screen-meta','WAITING'); setText('screen-caption','模型观察到的屏幕'); return;
+    stage.innerHTML='<div class="stage-empty"><div class="screen-icon"></div>'+(!taskGroups.length?'等待屏幕观察':'此步骤使用网页结构，或尚未捕获截图')+'<br><span>浏览器决策可使用 AX 文本，截图随视觉调用更新</span></div>'; setText('screen-meta','WAITING'); setText('screen-caption','最近一次模型截图'); return;
   }
   const wrap=document.createElement('div'); wrap.className='shot';
   const img=document.createElement('img'); img.alt='Step '+(shot.step ?? '—')+' 模型输入截图'; img.title='点击放大';
@@ -354,44 +470,99 @@ function renderScreen() {
 byId('btn-zoom').addEventListener('click',() => byId('screen-stage').querySelector('img')?.click());
 function ioText(entry,tab) {
   if (tab==='logs') return processOutput || '等待进程输出…';
-  if (!entry) return ['failed','done'].includes(runState.status)?'进程已退出，尚未产生模型调用。\n\n选择“进程日志”查看启动失败或退出的原因。':'选择左侧步骤，查看对应的模型输入、输出和执行结果。';
+  if (!entry) {
+    if (['failed','done'].includes(runState.status)) return '进程已退出，尚未产生模型调用。\n\n选择“进程日志”查看启动失败或退出的原因。';
+    return tab==='input'?'选择左侧调用，查看发送给模型的输入。':tab==='output'?'模型返回的结果会与输入同时显示在这里。':'选择左侧调用，查看对应的完整消息与事件详情。';
+  }
   if (tab==='event') return JSON.stringify(entry,(key,value) => ['key','imageCacheKey'].includes(key)?undefined:value,2);
   if (tab==='messages') return entry.messages?.length?JSON.stringify(entry.messages,null,2):entry.kind==='model'?'本次调用未记录完整 messages。可在“输入”查看已捕获的文本。':'执行状态事件没有模型 messages。';
-  if (tab==='input') return entry.prompt || (entry.event==='task_start'?entry.instruction:'') || '该执行事件没有模型输入。';
-  if (entry.kind==='model') return entry.pending?'模型请求已发送，等待响应…':(entry.raw_response?entry.raw_response+'\n\n解析结果：\n'+(entry.response || ''):entry.response) || (entry.error?'模型调用失败，未返回文本。':'模型返回空文本。');
+  if (tab==='input') {
+    if (entry.prompt) return actionText(entry.prompt);
+    if (entry.kind==='model' && entry.messages?.length) {
+      const user=[...entry.messages].reverse().find(message => message.role==='user');
+      if (typeof user?.content==='string') return user.content;
+      if (Array.isArray(user?.content)) return user.content.filter(part => part.type==='text').map(part => part.text || '').join('\n\n') || '当前调用使用图片输入，可在完整消息中查看图片引用。';
+    }
+    return (entry.event==='task_start'?entry.instruction:'') || '该执行事件没有模型输入。';
+  }
+  if (entry.kind==='model') return entry.pending?'模型请求已发送，等待响应…':(entry.raw_response?actionText(entry.raw_response)+'\n\n解析结果：\n'+actionText(entry.response):actionText(entry.response)) || (entry.error?'模型调用失败，未返回文本。':'模型返回空文本。');
   const details={};
-  for (const key of ['action','status','error','result','success','reward','plan','verification','execution']) if (entry[key]!=null) details[key]=entry[key];
+  for (const key of ['action','status','error','result','success','reward','plan','verification','execution','prompt_metadata','observation','plan_step_id','timing_ms','phase']) if (entry[key]!=null) details[key]=entry[key];
   return (eventLabels[entry.event] || entry.event || '状态事件')+(Object.keys(details).length?'\n\n'+JSON.stringify(details,null,2):'\n\n'+(entry.instruction || '事件已记录。'));
+}
+function writeInspectorPanel(id,text,scope) {
+  const panel=byId(id), previous=inspectorPanels.get(id);
+  const sameScope=previous?.scope===scope;
+  if (sameScope && panel.textContent===String(text)) return;
+  const top=sameScope?panel.scrollTop:0, left=sameScope?panel.scrollLeft:0;
+  if (panel.textContent!==String(text)) panel.textContent=text;
+  panel.scrollTop=top; panel.scrollLeft=left;
+  inspectorPanels.set(id,{scope});
+}
+function positionInspectorDetails() {
+  if (ioTab==null || activeView!=='live') return;
+  const anchor=document.querySelector('.monitor-center').getBoundingClientRect();
+  const width=Math.min(anchor.width || 540,window.innerWidth-24);
+  const left=Math.max(12,Math.min(anchor.left,window.innerWidth-width-12));
+  const top=Math.max(12,Math.min(anchor.top,window.innerHeight-210));
+  const height=Math.max(150,Math.min(Math.max(anchor.height,200),window.innerHeight-top-12));
+  Object.assign(byId('io-details').style,{left:left+'px',top:top+'px',width:width+'px',height:height+'px'});
+}
+function closeInspectorDetails(returnFocus=false) {
+  const previousTab=ioTab; ioTab=null;
+  document.querySelectorAll('[data-io-tab]').forEach(item => { item.classList.remove('active'); item.setAttribute('aria-expanded','false'); });
+  renderInspector();
+  if (returnFocus && previousTab) document.querySelector('[data-io-tab="'+previousTab+'"]').focus({preventScroll:true});
 }
 function renderInspector() {
   const entry=selectedEntry();
-  if (ioTab==='logs') { setText('io-type','PROCESS'); setText('io-meta',runState.pid?'当前进程 · PID '+runState.pid:'进程输出'); setText('io-content',ioText(entry,ioTab)); setText('io-foot','最近 200 行 · 每 2 秒更新'); return; }
+  const scope=taskGroups[currentGroup]?.config.ts+':'+entry?.key;
   setText('io-type',entry?.kind==='model'?(typeLabels[entry.type] || 'MODEL'):'EVENT');
   setText('io-meta',entry?(entry.model || (entry.kind==='model'?'模型调用':'执行状态'))+(entry.step!=null?' · STEP '+entry.step:''):'选择一条调用或执行事件');
-  setText('io-content',ioText(entry,ioTab));
+  writeInspectorPanel('io-input',ioText(entry,'input'),scope);
+  writeInspectorPanel('io-output',ioText(entry,'output'),scope);
+  byId('io-details').hidden=ioTab==null;
+  if (ioTab!=null) {
+    setText('io-detail-title',{messages:'完整消息 · 图片以引用与元数据展示',event:'原始事件 JSON',logs:'进程日志 · 最近 200 行'}[ioTab]);
+    writeInspectorPanel('io-content',ioText(entry,ioTab),ioTab==='logs'?'process':scope+':'+ioTab);
+    positionInspectorDetails();
+  }
   const pieces=[];
   if (entry?.elapsed!=null) pieces.push('耗时 '+formatElapsed(entry.elapsed));
+  if (entry?.phase) pieces.push('阶段 '+entry.phase);
+  if (entry?.timing_ms) pieces.push(...Object.entries(entry.timing_ms).map(([name,ms]) => name+' '+formatElapsed(Number(ms)/1000)));
   if (entry?.usage) {
     const input=entry.usage.prompt_tokens ?? entry.usage.input_tokens,output=entry.usage.completion_tokens ?? entry.usage.output_tokens;
     if (input!=null) pieces.push('输入 '+input+' tokens'); if (output!=null) pieces.push('输出 '+output+' tokens');
   }
-  if (ioTab==='messages') pieces.push('图片以引用和元数据展示，文本保留原始内容');
   if (entry?.pending) pieces.push('等待真实模型结果');
-  setText('io-foot',pieces.join(' · ') || '实时事件通过 WebSocket 更新');
+  setText('io-foot',pieces.join(' · ') || '实时更新 · 向上滚动轨迹会暂停跟随');
 }
 document.querySelectorAll('[data-io-tab]').forEach(button => button.addEventListener('click',() => {
-  ioTab=button.dataset.ioTab;
-    document.querySelectorAll('[data-io-tab]').forEach(item => { item.classList.toggle('active',item===button); item.setAttribute('aria-selected',String(item===button)); }); renderInspector(); if (ioTab==='logs') loadProcessOutput();
+  ioTab=ioTab===button.dataset.ioTab?null:button.dataset.ioTab;
+  document.querySelectorAll('[data-io-tab]').forEach(item => { const active=item.dataset.ioTab===ioTab; item.classList.toggle('active',active); item.setAttribute('aria-expanded',String(active)); });
+  renderInspector(); if (ioTab==='logs') loadProcessOutput();
 }));
+byId('btn-close-io').addEventListener('click',() => closeInspectorDetails(true));
+window.addEventListener('resize',positionInspectorDetails);
+document.querySelectorAll('[data-copy-io]').forEach(button => button.addEventListener('click',async () => {
+  try { await navigator.clipboard.writeText(byId('io-'+button.dataset.copyIo).textContent); toast('已复制模型'+(button.dataset.copyIo==='input'?'输入':'输出')); }
+  catch { toast('复制失败，请选中文本后手动复制'); }
+}));
+['io-input','io-output','io-content'].forEach(id => {
+  byId(id).addEventListener('wheel',event => { if (event.deltaY<0 && followLatest) setFollow(false); },{passive:true});
+  byId(id).addEventListener('keydown',event => { if (['ArrowUp','PageUp','Home'].includes(event.key)) setFollow(false); });
+});
 async function loadProcessOutput() {
   try { const data=await api('/run/output'); processOutput=(data.output || []).join('\n'); setText('run-output',processOutput || '等待进程输出…'); if (ioTab==='logs' || !taskGroups.length) renderInspector(); }
   catch { /* Keep the last visible output while reconnecting. */ }
 }
 byId('btn-copy-io').addEventListener('click',async () => { try { await navigator.clipboard.writeText(byId('io-content').textContent); toast('已复制当前内容'); } catch { toast('复制失败，请选中文本后手动复制'); } });
 function refreshWorkspace() {
-  renderEventList(); renderGroupStatus(); renderScreen(); renderInspector();
+  renderEventList(); renderGroupStatus(); renderScreen(); renderInspector(); renderBrowserContext();
   const group=taskGroups[currentGroup];
-  byId('live-plan').innerHTML=group?.planCard?.outerHTML || '';
+  const host=byId('live-plan'), html=group?.planCard?.outerHTML || '';
+  if (host._planHtml!==html) { const top=host.scrollTop; host.innerHTML=html; host._planHtml=html; host.scrollTop=top; }
   byId('btn-export').disabled=!group?.entries?.length;
 }
 byId('btn-export').addEventListener('click',() => {
@@ -431,6 +602,7 @@ function recoverPlanSnapshot(snapshot) {
     if (Number.isFinite(revision) && group.planRevision!=null && revision<group.planRevision) return;
     updatePlanCard(group,update); group.planPayload=update; if (group===taskGroups[currentGroup]) refreshWorkspace();
   }
+  if (group && snapshot.browser_observation) consumeLog(snapshot.browser_observation);
 }
 async function loadHistory() {
   try {
@@ -473,7 +645,7 @@ loadLocalDetail=function(id) { detailOpen=true; originalLoadLocalDetail(id); };
 byId('history-search').addEventListener('input',() => { detailOpen=false; filterHistory(); });
 byId('history-filter').addEventListener('change',() => { detailOpen=false; filterHistory(); });
 byId('history-refresh').addEventListener('click',loadLocalRuns);
-document.addEventListener('keydown',event => { if (event.key==='Escape') { byId('overlay').style.display='none'; byId('chat-new-modal').style.display='none'; } });
+document.addEventListener('keydown',event => { if (event.key==='Escape') { byId('overlay').style.display='none'; byId('chat-new-modal').style.display='none'; closeInspectorDetails(true); } });
 window.addEventListener('beforeunload',() => { clearTimeout(pollTimer); if (socket) { socket.onclose=null; socket.close(); } });
 
 initConfiguration(); updateRunControls(); switchView('run'); refreshWorkspace(); loadHistory(); connect(); pollRunStatus();

@@ -1,0 +1,11 @@
+# Local Windows/browser runtime, verified with Python 3.12.
+# Chrome is supplied by the host; CDP does not require downloading Playwright browsers.
+requests==2.34.2
+PyYAML==6.0.3
+openai==3.29.0
+httpx==0.28.1
+fastapi==0.143.0
+uvicorn[standard]==0.54.0
+Pillow==12.3.0
+PyAutoGUI==0.9.54
+playwright==1.63.0

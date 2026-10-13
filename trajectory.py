@@ -110,6 +110,7 @@ def build_trajectory(
             "policy_input": s.get("policy_input"),
             "policy_output": s.get("policy_output"),
             "decision_calls": s.get("decision_calls", []),
+            "model_calls": s.get("model_calls", s.get("decision_calls", [])),
             "prompt_metadata": s.get("prompt_metadata", {}),
             "routing": s.get("routing", {}),
             "resolved_action": s.get("resolved_action"),

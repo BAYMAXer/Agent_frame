@@ -32,6 +32,7 @@ def get_collected() -> dict:
 def reset_collected() -> None:
     _decisions.clear()
     _groundings.clear()
+    _step[0] = 0
 
 
 def set_results_dir(path: str) -> None:
@@ -130,15 +131,23 @@ def _extract_last_user(messages) -> tuple:
 def _classify_mtype(text: str, screenshot) -> str:
     """给一次模型调用分类（供前端展示）。区分决策/格式重试/完成验证/反思/真子Agent，
     避免把「无截图的辅助调用」统统标成 code_agent（子Agent）。"""
-    if screenshot:
-        return "decision"
-    t = text or ""
+    t = (text or "").strip()
+    if t.startswith(("你是任务规划器", "计划不完整")):
+        return "planning"
+    if t.startswith("你是浏览器区域选择器"):
+        return "region_selection"
+    if t.startswith("核验当前子任务是否已完成"):
+        return "subtask_verification"
+    if t.startswith("上次操作已发送但结果不确定"):
+        return "uncertain_verification"
     if "不符合要求" in t or "漏了 next_action" in t or "重新只输出一个合法" in t:
         return "format_retry"
     if "任务完成度核对" in t:
         return "verify"
     if "回顾你上一步的操作" in t:
         return "reflect"
+    if screenshot or "输出一个完整决策 JSON" in t:
+        return "decision"
     return "code_agent"
 
 

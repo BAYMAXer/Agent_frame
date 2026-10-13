@@ -1,36 +1,41 @@
-# osworld_agent 示例配置
-# 换模型 = 改下面 model / grounding_model 的名字（对应 models.py 里的注册表）即可，不动代码。
-
-# ---------------- 决策模型 ----------------
+# 本地 Windows 配置示例。Config.load 可供集成代码读取；工作台与命令行使用各自的显式参数。
+# 决策/定位服务可以部署在本机或远程，执行环境固定为当前 Windows 主机。
 model:
-  name: "9b"                 # 注册表里的名字，见 model/decision_model.py 的 MODEL_REGISTRY
-  url: "http://7.246.80.237:9028/v1"
+  name: "Qwen3.5-9B"
+  url: "http://7.246.80.189:9028/v1"
   api_key: "EMPTY"
   temperature: 0.3
   max_tokens: 2048
-  vision: true               # 是否把截图喂给决策模型（纯文本模型设 false）
+  timeout: 60.0
+  vision: true
 
-# ---------------- 视觉定位模型 ----------------
 grounding_model:
-  name: "ui_tars_7b"
-  url: "http://7.246.80.237:49999/v1"
+  name: "UI-Venus-2-9B"
+  url: "http://7.246.80.189:8001/v1"
   api_key: "EMPTY"
+  type: "ui-venus2"
   width: 1920
   height: 1080
+  timeout: 60.0
 
-# ---------------- 智能体循环 ----------------
 agent:
-  max_steps: 20              # 单任务最大步数
-  max_retries: 3             # 动作解析失败最多重试几次
-  enable_reflection: true    # 是否开启反思（reflection）
-  early_stop_repeat: 3       # 连续相同动作 N 次即早停
+  max_steps: 20
+  max_retries: 3
+  enable_reflection: false
+  early_stop_repeat: 3
+  step_timeout: 120.0
 
-# ---------------- 环境 ----------------
 env:
-  provider: "osworld"        # 目前只支持 osworld
-  os: "linux"                # 目标机操作系统：linux / mac / windows（决定终端命令 shell）
-  vm_path: "/data/osworld-agent-s/vm/uploaded/Ubuntu.qcow2"
-  sleep_after_execution: 1.5 # 每步动作后等待秒数（截图前）
-  headless: false
+  execution_mode: "browser_first"
+  browser_port: 9222
+  chrome_path: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+  downloads_dir: null
+  action_settle_seconds: 0.3
   screen_width: 1920
   screen_height: 1080
+
+context:
+  ax_max_chars: 5000        # 精简网页 AX 的字符上限
+  screenshot_max_edge: 1280 # 浏览器模型输入截图最长边，保持宽高比例
+  max_input_tokens: 30000
+  output_reserve: 2048

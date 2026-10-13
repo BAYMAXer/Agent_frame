@@ -39,8 +39,7 @@ def observation_scene(observation) -> Dict[str, Any]:
 def browser_context(observation) -> List[dict]:
     """只有场景明确说「有可用结构」才返回 browser_ax 块；否则 []（走视觉）。
 
-    未设置 scene marker 的旧环境（如 VMware 适配器尚未接入）退回 obs.context 的
-    browser_ax 块，保证不破坏现有行为。
+    未设置 scene marker 的观察仍可从 obs.context 读取 browser_ax 块。
     """
     scene = observation_scene(observation)
     if scene.get("reason") == "no_scene_marker":

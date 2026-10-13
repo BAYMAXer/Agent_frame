@@ -1,9 +1,8 @@
 """框架工具集。
 
 集中放置框架复用的工具函数。当前主要内容是「浏览器工具」（browser use 场景）：
-- 焦点检测：判断当前活动窗口是否是浏览器（跨平台，零 token 系统调用）；
-- CDP 抓取：抓「当前页面」的 AX-Tree / HTML / URL（Chrome/Edge 走 CDP，Firefox 走 CDP 子集，
-  Safari 留 adapter 位；抓不到就降级为空，不抛异常）。
+- 焦点检测：通过 Windows 前台窗口进程判断浏览器；
+- CDP 抓取：读取本机 Chrome/Edge 页面 AX-Tree / HTML / URL。
 
 以后要添加浏览器操作工具（click_element / fill / navigate / evaluate 等）也加到这个文件，
 保持「浏览器相关工具都集中在这里」。
@@ -14,17 +13,10 @@ import ctypes
 import ntpath
 import platform
 import socket
-import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
-
-# 常见浏览器进程名 / 窗口类名关键词（用于焦点检测）
-_BROWSER_KEYWORDS = (
-    "chrome", "chromium", "msedge", "edge", "firefox", "safari",
-    "brave", "opera", "vivaldi", "browser",
-)
 
 # 浏览器内部/非网页 scheme，抓页面信息时要排除
 _INTERNAL_SCHEMES = (
@@ -57,16 +49,14 @@ class BrowserState:
 
 
 # --------------------------------------------------------------------------- #
-# 焦点检测（跨平台）
+# Windows 焦点检测
 # --------------------------------------------------------------------------- #
 def detect_foreground_browser(os_name: Optional[str] = None) -> bool:
-    """检测当前活动窗口是否是浏览器。返回 True/False（探测失败返回 False）。"""
+    """检测 Windows 活动窗口；非 Windows 参数或探测失败返回 False。"""
     os_name = (os_name or platform.system()).lower()
     try:
         if os_name == "windows":
             return _foreground_windows()
-        if os_name in ("linux", "mac", "darwin"):
-            return _foreground_linux_mac()
     except Exception:  # noqa: BLE001
         return False
     return False
@@ -122,32 +112,6 @@ def _foreground_windows() -> bool:
                 kernel32.CloseHandle(process)
             except Exception:  # noqa: BLE001
                 pass
-
-
-def _foreground_linux_mac() -> bool:
-    """Linux：用 xdotool 读活动窗口名；macOS：用 AppleScript 读前台 app 名。"""
-    os_name = platform.system().lower()
-    try:
-        if os_name == "darwin":
-            out = subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to get name of first process whose frontmost is true'],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-        else:
-            # Linux：优先 xdotool，回退 wmctrl
-            out = subprocess.run(
-                ["xdotool", "getactivewindow", "getwindowname"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout
-            if not out.strip():
-                out = subprocess.run(
-                    ["wmctrl", "-a", ":ACTIVE:"],
-                    capture_output=True, text=True, timeout=5,
-                ).stdout
-        return any(k in out.lower() for k in _BROWSER_KEYWORDS)
-    except Exception:  # noqa: BLE001
-        return False
 
 
 class _MIB_TCPROW_OWNER_PID(ctypes.Structure):

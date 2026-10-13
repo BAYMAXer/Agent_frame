@@ -46,7 +46,7 @@ def _completion_check(value: Any) -> Dict[str, str]:
     return check
 
 
-def normalize_plan(raw: Any, task: str = "") -> Dict[str, Any]:
+def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dict[str, Any]:
     """Create consecutive, stable IDs and a safe, bounded initial plan.
 
     Planner indices are ignored; goals retain their list order and get fresh
@@ -76,8 +76,9 @@ def normalize_plan(raw: Any, task: str = "") -> Dict[str, Any]:
         criteria = _text(source.get("completion_criteria")) or goal
         check = _completion_check(source.get("completion_check"))
         step_key = (" ".join(goal.split()).casefold(), " ".join(criteria.split()).casefold(),
-                    tuple(sorted(check.items())))
-        if step_key in seen_steps:
+                    tuple(sorted(check.items())), source.get("mode"),
+                    _text(source.get("instructions")), _text(source.get("target_url")))
+        if deduplicate and step_key in seen_steps:
             continue
         seen_steps.add(step_key)
         number = len(steps) + 1
@@ -87,7 +88,15 @@ def normalize_plan(raw: Any, task: str = "") -> Dict[str, Any]:
             "status": status if status in _STATUSES else "pending",
             "completion_criteria": criteria,
             "completion_check": check,
+            "mode": source.get("mode") if source.get("mode") in {"browser", "desktop"}
+                    else ("browser" if check["kind"] in {"navigation", "download"} else "desktop"),
+            "instructions": _text(source.get("instructions")) or goal,
         }
+        target_url = _text(source.get("target_url"))
+        if target_url and _http_url(target_url):
+            step["target_url"] = target_url
+        if canonical and isinstance(source.get("result"), str):
+            step["result"] = source["result"]
         if canonical:
             for key in ("evidence", "blocked_reason", "update_source"):
                 if _text(source.get(key)):
@@ -114,9 +123,42 @@ def normalize_plan(raw: Any, task: str = "") -> Dict[str, Any]:
         "steps": steps, "keywords": list(dict.fromkeys(_text(k) for k in keywords if _text(k))),
         "final_check": _text(obj.get("final_check")) or _text(task),
         "current_step_id": None,
+        "constraints": [_text(c) for c in obj.get("constraints", []) if _text(c)]
+                       if isinstance(obj.get("constraints"), list) else [],
     }
     _select_current(plan)
     return plan
+
+
+def validate_executable_plan(raw: Any) -> Optional[str]:
+    """Strict browser-first plans must cover the task before any action starts."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("steps"), list):
+        return "计划必须包含 steps 数组"
+    if not 1 <= len(raw["steps"]) <= 8:
+        return "计划需要 1～8 个完整子任务"
+    for index, step in enumerate(raw["steps"], 1):
+        if not isinstance(step, dict):
+            return f"子任务 {index} 必须是对象"
+        if step.get("mode") not in {"browser", "desktop"}:
+            return f"子任务 {index} 的 mode 必须是 browser 或 desktop"
+        if any(not _text(step.get(key)) for key in ("goal", "instructions", "completion_criteria")):
+            return f"子任务 {index} 缺少 goal、instructions 或 completion_criteria"
+        if step.get("target_url") and not _http_url(_text(step["target_url"])):
+            return f"子任务 {index} 的 target_url 必须是完整 HTTP(S) 网址"
+    return None
+
+
+def record_subtask_completion(plan, step_id, evidence, result, event_step=0):
+    """Commit only the active subtask after the caller has verified observation evidence."""
+    if step_id != get_current_step_id(plan) or not _observed_evidence(evidence):
+        return False
+    step = next((s for s in plan["steps"] if s["id"] == step_id), None)
+    if step is None or step.get("completion_check", {}).get("kind") != "observation":
+        return False
+    _record(step, "done", evidence, "subtask_verification", event_step)
+    step["result"] = _text(result)
+    _select_current(plan)
+    return True
 
 
 def get_current_step_id(plan: Optional[Dict[str, Any]]) -> Optional[str]:

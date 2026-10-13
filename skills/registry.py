@@ -2,11 +2,11 @@
 
 分层：
 - SkillSpec：一个 skill 的声明（description/params/enabled），来自 config/skills.yaml；
-- SkillContext：执行时传给 handler 的上下文，提供 env / controller 访问；
+- SkillContext：执行时传给 handler 的上下文，提供 Windows 本机 env 访问；
 - run_skill：按 name 分发到 handlers.SKILL_HANDLERS 执行。
 
 与「动作」的区别：动作最终落到环境（鼠标键盘），skill 是确定性能力
-（本地精确计算 / 目标机文件与时钟查询），返回一个字符串结果给决策模型。
+（精确计算 / Windows 本机文件与时钟查询），返回一个字符串结果给决策模型。
 """
 from __future__ import annotations
 
@@ -26,16 +26,8 @@ class SkillSpec:
 
 @dataclass
 class SkillContext:
-    """传给 skill handler 的上下文，用于访问环境（目标机）。
-
-    环境接入后（env.controller 非空），verify_file / get_current_time 这类
-    需要查询目标机的 skill 就走 controller；未接入时 handler 自行回退。
-    """
+    """传给 handler 的 Windows 本机环境；不提供远端控制器通道。"""
     env: Any = None
-
-    @property
-    def controller(self):
-        return getattr(self.env, "controller", None) if self.env is not None else None
 
 
 def load_skill_registry() -> Dict[str, SkillSpec]:

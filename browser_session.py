@@ -1,8 +1,7 @@
-"""Chromium AX/DOM 观察 + 快照范围内的确定性动作（借鉴 osworld_agent_v2）。
+"""Windows Chromium AX/DOM 观察和快照范围内的确定性动作。
 
-与 v2 的差异（重要）：**每次 collect/execute 都用 with sync_playwright() 临时连接、
-用完即关**，不长期持有 playwright 连接——否则会和 OSWorld 的 setup/evaluator
-（同样用 playwright sync API）在同一个进程里产生 asyncio loop 冲突。
+每次观察或执行使用临时 Playwright/CDP 连接，用完释放连接。
+capture_observation 在同一连接中采集截图和结构，绑定本次运行的页面及文档。
 
 策略输出语义目标 target_ref（快照节点引用），执行器按 backend_id 精确定位。
 DOM 坐标是 CSS viewport 坐标，不是桌面截图像素。
@@ -14,6 +13,8 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+
+from .model.request_deadline import ModelRequestTimeout
 
 
 class BrowserActionError(RuntimeError):
@@ -36,6 +37,8 @@ class BrowserOptions:
     max_snapshot_age: float = 180.0
     require_focus: bool = True   # True=只选择聚焦页面；普通桌面/浏览器混合任务保持 True
     require_incognito: bool = False  # Windows 本地受管会话每次连接都核验无痕上下文
+    bind_page: bool = False          # 专用浏览器任务按 target ID 操作，不依赖桌面焦点
+    screenshot_max_edge: int = 1280
 
 
 class BrowserSession:
@@ -50,20 +53,46 @@ class BrowserSession:
             os.path.dirname(os.path.abspath(__file__)), "downloads")
         self.snapshot = None
         self.nodes = {}
+        self.page_id = None
+        self.context_id = None
+        self.last_capture_info = {}
+        self.request_deadline = None
         self._downloaded = {}  # url -> path，本次会话已下载的文件（幂等去重）
 
     # ---- 临时连接的 attach 帮助 ----
+    def _check_deadline(self):
+        if self.request_deadline is not None and self.request_deadline <= time.monotonic():
+            raise ModelRequestTimeout("浏览器操作已超过本步共享预算")
+
+    def _timeout_seconds(self, default):
+        if self.request_deadline is None:
+            return float(default)
+        remaining = self.request_deadline - time.monotonic()
+        if remaining <= 0:
+            raise ModelRequestTimeout("浏览器操作已超过本步共享预算")
+        return min(float(default), remaining)
+
+    def _timeout_ms(self, default=30000):
+        return max(1, int(self._timeout_seconds(default / 1000) * 1000))
+
     def _connect(self):
+        self._check_deadline()
         from playwright.sync_api import sync_playwright
         p = sync_playwright().start()
         browser = None
         try:
-            browser = p.chromium.connect_over_cdp(self.options.endpoint, timeout=self.options.timeout_ms)
+            browser = p.chromium.connect_over_cdp(self.options.endpoint, timeout=self._timeout_ms(self.options.timeout_ms))
+            self._check_deadline()
+            if self.request_deadline is not None:
+                for context in browser.contexts:
+                    context.set_default_timeout(self._timeout_ms())
+                    context.set_default_navigation_timeout(self._timeout_ms())
             if self.options.require_incognito:
                 from .utils import _browser_pages_are_incognito
                 try:
                     if not _browser_pages_are_incognito(browser):
                         raise BrowserActionError("无法确认调试浏览器仅包含无痕页面，拒绝接入")
+                    self._check_deadline()
                 except Exception:
                     self.invalidate()
                     if self.incognito_failure_callback is not None:
@@ -114,12 +143,108 @@ class BrowserSession:
 
     def _pick_page(self, browser):
         """按 require_focus 选页面：聚焦模式用 _focused_page，否则 _any_page。"""
+        self._check_deadline()
+        if self.options.bind_page:
+            if not self.page_id:
+                return None
+            for ctx in browser.contexts:
+                for page in ctx.pages:
+                    try:
+                        self._check_deadline()
+                        target_id = self._page_id(page)
+                        self._check_deadline()
+                        if target_id == self.page_id:
+                            if self.request_deadline is not None:
+                                page.set_default_timeout(self._timeout_ms())
+                            return page
+                    except ModelRequestTimeout:
+                        raise
+                    except Exception:
+                        continue
+            self.invalidate()
+            return None
         if self.foreground_check and not self.foreground_check():
             self.invalidate()
             return None
         if self.options.require_focus:
             return self._focused_page(browser)
         return self._any_page(browser)
+
+    @staticmethod
+    def _page_id(page):
+        cdp = page.context.new_cdp_session(page)
+        try:
+            return cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+        finally:
+            cdp.detach()
+
+    @staticmethod
+    def _disconnect(playwright, browser):
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+
+    def _follow_owned_popup(self, browser):
+        self._check_deadline()
+        if not self.options.bind_page or not self.context_id:
+            return {}
+        cdp = browser.new_browser_cdp_session()
+        try:
+            children = [target for target in cdp.send("Target.getTargets")["targetInfos"]
+                        if target.get("type") == "page" and target.get("openerId") == self.page_id
+                        and target.get("browserContextId") == self.context_id]
+            self._check_deadline()
+            if len(children) == 1:
+                self.page_id = children[0]["targetId"]
+                self.invalidate()
+                return {"page_id": self.page_id, "followed_popup": True}
+            if len(children) > 1:
+                return {"warning": "操作打开多个页面，保留当前绑定页，请明确选择目标页"}
+            return {}
+        except ModelRequestTimeout:
+            raise
+        except Exception:
+            self._check_deadline()
+            return {"warning": "无法确认操作是否打开新页面，请重新观察"}
+        finally:
+            cdp.detach()
+
+    def bind_owned_page(self):
+        """首次创建本次运行专属的空白标签页；后续子任务复用同一 target。"""
+        self._check_deadline()
+        p, browser = self._connect()
+        try:
+            if self.page_id:
+                if self._pick_page(browser) is None:
+                    raise BrowserActionError("本任务的浏览器页面已关闭，不能切换到其他页面")
+                return self.page_id
+            cdp = browser.new_browser_cdp_session()
+            try:
+                # --incognito 的原生窗口 context 不能用于 Target.createTarget。
+                # CDP 显式创建运行专属私有 context，临时连接断开后继续保留。
+                self.context_id = cdp.send("Target.createBrowserContext", {
+                    "disposeOnDetach": False,
+                })["browserContextId"]
+                try:
+                    self.page_id = cdp.send("Target.createTarget", {
+                        "url": "about:blank", "browserContextId": self.context_id,
+                    })["targetId"]
+                except Exception:
+                    cdp.send("Target.disposeBrowserContext", {"browserContextId": self.context_id})
+                    self.context_id = None
+                    raise
+            finally:
+                cdp.detach()
+            self.invalidate()
+            self._check_deadline()
+            return self.page_id
+        finally:
+            self._disconnect(p, browser)
 
     @staticmethod
     def _visible_page(browser):
@@ -138,19 +263,28 @@ class BrowserSession:
 
     def activate(self):
         """显式访问网址时激活浏览器；普通观察不会调用或改变焦点。"""
+        self._check_deadline()
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return False
         try:
             page = self._focused_page(browser)
             if page is None:
                 page = self._visible_page(browser)
+            self._check_deadline()
             if page is None:
                 return False
             page.bring_to_front()
+            self._check_deadline()
             return True
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return False
         finally:
             try:
@@ -164,25 +298,42 @@ class BrowserSession:
 
     # ---- collect ----
     def collect(self):
+        return self._capture(include_image=False).get("snapshot")
+
+    def capture_observation(self):
+        """一次连接捕获同一页面/文档的截图和 AX；失败不混用旧结构。"""
+        return self._capture(include_image=True)
+
+    def _capture(self, include_image):
+        self._check_deadline()
         start = time.perf_counter()
+        result = {"screenshot": None, "snapshot": None, "info": {}}
         if self.foreground_check and not self.foreground_check():
-            self.snapshot = None
-            self.nodes = {}
-            return None
+            self.invalidate()
+            return result
         try:
             p, browser = self._connect()
-        except Exception:
-            return None
+        except ModelRequestTimeout:
+            self.invalidate()
+            raise
+        except Exception as exc:
+            self._check_deadline()
+            self.invalidate()
+            result["info"]["capture_error"] = str(exc)[:300]
+            return result
         try:
             page = self._pick_page(browser)
             if page is None:
-                return None
+                raise BrowserActionError("本任务的浏览器页面不可用")
             cdp = page.context.new_cdp_session(page)
             cdp.send("Accessibility.enable")
             doc_before = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
+            page_id = cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"]
             url = page.url
             viewport = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+            self._check_deadline()
             dom = cdp.send("DOMSnapshot.captureSnapshot", {"computedStyles": []})
+            self._check_deadline()
             strings, layout = dom["strings"], {}
             for doc in dom["documents"]:
                 dn = doc["nodes"]
@@ -195,12 +346,14 @@ class BrowserSession:
                                        "attrs": at, "frame_id": strings[doc["frameId"]]}
             main_frame = cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
             raw = cdp.send("Accessibility.getFullAXTree")["nodes"]
+            self._check_deadline()
             snapshot_id = uuid.uuid4().hex[:12]
             retained = [n for n in raw if not n.get("ignored") and n.get("role", {}).get("value") not in SKIP]
             raw_map = {n["nodeId"]: n for n in raw}
             refs = {n["nodeId"]: str(i) for i, n in enumerate(retained)}  # 短数字 ref（ComponentBench 风格，模型易抄）
             nodes = []
-            for n in retained[:self.options.max_nodes]:
+            # 保留完整本地缓存。区域筛选和上下文预算发生在读取侧，不提前截掉尾部结果。
+            for n in retained:
                 backend = n.get("backendDOMNodeId")
                 detail = layout.get(backend, {})
                 attrs = detail.get("attrs", {})
@@ -229,33 +382,115 @@ class BrowserSession:
                     node["id"] = attrs["id"][:200]
                 nodes.append(node)
             warnings = []
-            if len(retained) > self.options.max_nodes:
-                warnings.append("node_limit: additional nodes omitted")
             if len(page.frames) > 1:
                 warnings.append("iframe content may be incomplete; iframe actions use visual fallback")
+            screenshot = None
+            original_size = None
+            if include_image:
+                import io
+                from PIL import Image
+                self._check_deadline()
+                screenshot = Image.open(io.BytesIO(page.screenshot(full_page=False, scale="css", timeout=self._timeout_ms()))).convert("RGB")
+                original_size = list(screenshot.size)
+                edge = self.options.screenshot_max_edge
+                if edge > 0 and max(screenshot.size) > edge:
+                    ratio = edge / max(screenshot.size)
+                    screenshot = screenshot.resize((max(1, round(screenshot.width * ratio)),
+                                                    max(1, round(screenshot.height * ratio))),
+                                                   Image.Resampling.LANCZOS)
+            title = page.title()
+            doc_after = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
+            viewport_after = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+            if (doc_before != doc_after or page.url != url or viewport_after != viewport
+                    or cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"] != page_id):
+                raise BrowserActionError("页面在观察期间发生变化，请重新观察")
+            self._check_deadline()
             self.snapshot = {"kind": "browser_ax", "snapshot_id": snapshot_id, "url": url,
-                "title": page.title(), "viewport": viewport, "nodes": nodes, "warnings": warnings,
+                "page_id": page_id, "document_id": doc_before,
+                "title": title, "viewport": viewport, "nodes": nodes, "warnings": warnings,
                 "captured_at": time.time(), "capture_ms": round((time.perf_counter() - start) * 1000, 2)}
             self.nodes = {n["ref"]: n for n in nodes}
-            return self.snapshot
-        except Exception:
-            self.snapshot = None
-            self.nodes = {}
-            return None
+            image_size = list(screenshot.size) if screenshot is not None else None
+            self.last_capture_info = {"page_id": page_id, "document_id": doc_before,
+                "snapshot_id": snapshot_id, "screenshot_coordinate_space": "css_viewport",
+                "viewport_css_size": [viewport["width"], viewport["height"]],
+                "screenshot_image_size": image_size,
+                "screenshot_scale": {"x": image_size[0] / viewport["width"],
+                                     "y": image_size[1] / viewport["height"]} if image_size else {"x": 1, "y": 1}}
+            self.last_capture_info["capture"] = {
+                "original_size": original_size, "input_size": image_size,
+                "viewport_css_size": [viewport["width"], viewport["height"]],
+                "scale": dict(self.last_capture_info["screenshot_scale"]),
+                "page_id": page_id, "document_id": doc_before, "snapshot_id": snapshot_id,
+                "timing_ms": self.snapshot["capture_ms"],
+            }
+            result.update(screenshot=screenshot, snapshot=self.snapshot, info=dict(self.last_capture_info))
+            return result
+        except ModelRequestTimeout:
+            self.invalidate()
+            raise
+        except Exception as exc:
+            self.invalidate()
+            self._check_deadline()
+            result["info"]["capture_error"] = str(exc)[:300]
+            return result
         finally:
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                p.stop()
-            except Exception:
-                pass
+            self._disconnect(p, browser)
 
     # ---- route ----
+    def snapshot_route(self):
+        snapshot = self.snapshot or {}
+        return {key: snapshot.get(key) for key in ("snapshot_id", "page_id", "document_id")}
+
+    def validate_action_snapshot(self, action):
+        """模型可省略绑定字段；一旦显式提供，必须与当前快照严格一致。"""
+        self._check_deadline()
+        provided = {key: action.args[key] for key in ("snapshot_id", "page_id", "document_id")
+                    if key in action.args}
+        if not provided:
+            return
+        self._validate_snapshot()
+        for key, value in provided.items():
+            if value != self.snapshot.get(key):
+                raise BrowserActionError(f"动作携带过期的 {key}，请重新观察")
+
+    def validate_observation_snapshot(self, observation):
+        self._check_deadline()
+        if not self.snapshot:
+            raise BrowserActionError("没有有效网页快照，请重新观察")
+        info = observation.info or {}
+        scene = info.get("scene") or {}
+        for key in ("snapshot_id", "page_id", "document_id"):
+            observed = info.get(key, scene.get(key))
+            if observed is not None and observed != self.snapshot.get(key):
+                raise BrowserActionError(f"Observation {key} changed")
+
+    def _validate_snapshot(self, route=None, page=None, cdp=None):
+        self._check_deadline()
+        snapshot = self.snapshot
+        if not snapshot:
+            raise BrowserActionError("没有有效网页快照，请重新观察")
+        for key in ("snapshot_id", "page_id", "document_id"):
+            if route is not None and snapshot.get(key) is not None and route.get(key) != snapshot[key]:
+                raise BrowserActionError(f"过期的 {key}，请重新观察")
+        captured = snapshot.get("captured_at")
+        if captured is not None and time.time() - captured > self.options.max_snapshot_age:
+            raise BrowserActionError("网页快照已过期，请重新观察")
+        if page is not None:
+            if page.url != snapshot.get("url"):
+                raise BrowserActionError("页面已导航，请重新观察")
+            if snapshot.get("page_id") is not None:
+                if cdp.send("Target.getTargetInfo")["targetInfo"]["targetId"] != snapshot["page_id"]:
+                    raise BrowserActionError("网页 target 已变化，请重新观察")
+            if snapshot.get("document_id") is not None:
+                document = cdp.send("DOM.getDocument", {"depth": 0})["root"]["backendNodeId"]
+                if document != snapshot["document_id"]:
+                    raise BrowserActionError("网页文档已刷新，请重新观察")
+        self._check_deadline()
+
     def _ref_hint(self, observation, limit=20):
         """生成"当前可用元素编号"提示，帮模型从编造/过期的 ref 里纠正过来。"""
-        refs = observation.info.get("exposed_refs") or list(self.nodes.keys())
+        refs = observation.info.get("exposed_refs", list(self.nodes.keys()))
         parts = []
         for ref in refs:
             n = self.nodes.get(ref)
@@ -270,38 +505,56 @@ class BrowserSession:
         return "；".join(parts) if parts else "（无）"
 
     def route(self, action, observation):
+        self._check_deadline()
+        info = observation.info or {}
+        try:
+            self.validate_action_snapshot(action)
+        except BrowserActionError as exc:
+            return {"channel": "reobserve", "refresh_observation": True, "reason": str(exc)}
+        if self.snapshot:
+            try:
+                self.validate_observation_snapshot(observation)
+            except BrowserActionError as exc:
+                return {"channel": "reobserve", "refresh_observation": True, "reason": str(exc)}
+        allowed = info.get("exposed_refs", [] if self.options.bind_page else self.nodes)
         ref = action.args.get("target_ref")
         if not ref:
             # 模型输出 HTML id → 解析成 ref（比 12 位 hex ref 更短、更易抄）
             eid = action.args.get("element_id")
             if eid:
-                ref = self.resolve_id(str(eid))
+                ref = self.resolve_id(str(eid), allowed=allowed)
         if not ref:
             return None
-        if ref not in observation.info.get("exposed_refs", self.nodes):
+        if ref not in allowed:
             hint = self._ref_hint(observation)
-            return {"channel": "reobserve",
+            return {"channel": "reobserve", "refresh_observation": True,
                     "reason": f"target_ref '{ref}' 不在当前页面里，可能是编造或过期的编号。"
                               f"当前页面可用的元素编号（部分）：{hint}。"
                               f"请从中选一个正确的 ref，或改用 element_id / 英文 target。"}
         if not self.snapshot or ref not in self.nodes:
-            return {"channel": "reobserve", "reason": "Unknown or stale target_ref"}
+            return {"channel": "reobserve", "refresh_observation": True, "reason": "Unknown or stale target_ref"}
+        observed = info.get("snapshot_id") or (info.get("scene") or {}).get("snapshot_id")
+        if observed and observed != self.snapshot.get("snapshot_id"):
+            return {"channel": "reobserve", "refresh_observation": True, "reason": "Observation snapshot changed"}
+        try:
+            self._validate_snapshot()
+        except BrowserActionError as exc:
+            return {"channel": "reobserve", "refresh_observation": True, "reason": str(exc)}
         if action.action not in {"click", "double_click", "right_click", "type", "select", "scroll"}:
             return None
         node = self.nodes[ref]
         if not node["direct"] and action.action != "scroll":
             return None
-        return {"channel": "browser_dom", "snapshot_id": self.snapshot["snapshot_id"],
+        return {"channel": "browser_dom", **self.snapshot_route(), "exposed_refs": list(allowed),
                 "target_ref": ref, "coordinate_space": "css_viewport"}
 
-    def resolve_id(self, element_id):
+    def resolve_id(self, element_id, allowed=None):
         """按 HTML id 属性找节点，返回 ref 或 None。"""
         if not self.nodes or not element_id:
             return None
-        for ref, n in self.nodes.items():
-            if n.get("id") == element_id:
-                return ref
-        return None
+        matches = [ref for ref, n in self.nodes.items() if n.get("id") == element_id
+                   and (allowed is None or ref in allowed)]
+        return matches[0] if len(matches) == 1 else None
 
     # ---- 语义回退：target 描述 → 节点 ref ----
     _STOPWORDS = {
@@ -336,8 +589,8 @@ class BrowserSession:
         # 方括号里的短语（模型写成 "The [PDF] xxx link" 这种）也当精确短语提取
         quoted += re.findall(r"\[([^\[\]]{2,80})\]", t)
         tokens = set(re.findall(r"[a-z0-9]+", t)) - self._STOPWORDS
-        allowed_set = set(allowed) if allowed else None
-        best_ref, best_score = None, 0
+        allowed_set = set(allowed) if allowed is not None else None
+        best_ref, best_score, tied = None, 0, False
         for ref, n in self.nodes.items():
             if allowed_set is not None and ref not in allowed_set:
                 continue
@@ -361,25 +614,38 @@ class BrowserSession:
             if role and role in t:
                 score += 4
             if score > best_score:
-                best_score, best_ref = score, ref
+                best_score, best_ref, tied = score, ref, False
+            elif score == best_score and score > 0:
+                tied = True
         # 只信「引号精确命中」这一档（≥24）或足够强的 token 命中；宁可不匹配走视觉定位，
         # 也不要在 DOM 里点错节点。
-        if best_ref and best_score >= 24:
+        if best_ref and best_score >= 24 and not tied:
             return best_ref
         return None
 
     # ---- execute ----
     def execute(self, action, route):
+        self._check_deadline()
         ref = route.get("target_ref")
         node = self.nodes.get(ref)
         if node is None:
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Unknown target_ref"}
+        if self.options.bind_page and ref not in route.get("exposed_refs", []):
+            return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Target was not exposed"}
+        try:
+            self.validate_action_snapshot(action)
+            self._validate_snapshot(route)
+        except BrowserActionError as exc:
+            return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": str(exc)}
         if (self.foreground_check and not self.foreground_check()):
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Browser lost focus"}
         started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": str(exc)[:200]}
         try:
             page = self._pick_page(browser)
@@ -388,11 +654,14 @@ class BrowserSession:
             if page.url != self.snapshot.get("url"):
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Page navigated"}
             cdp = page.context.new_cdp_session(page)
+            self._validate_snapshot(route, page, cdp)
             backend_id = node["backend_id"]
             obj = cdp.send("DOM.resolveNode", {"backendNodeId": backend_id})["object"].get("objectId")
+            self._check_deadline()
             if not obj:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Target detached"}
             cdp.send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
+            self._check_deadline()
             inspect = """function() {
               if (!this.isConnected || !(this instanceof Element)) return {error:'detached'};
               if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true' || this.closest('[inert]')) return {error:'disabled'};
@@ -409,19 +678,24 @@ class BrowserSession:
                       editable:this.isContentEditable || this.tagName==='TEXTAREA' || (this.tagName==='INPUT' && !['button','submit','checkbox','radio','file'].includes(this.type))};
             }"""
             def call(obj, fn, args=None):
+                self._check_deadline()
                 r = cdp.send("Runtime.callFunctionOn", {"objectId": obj, "functionDeclaration": fn,
                     "arguments": [{"value": a} for a in (args or [])], "returnByValue": True})
                 if r.get("exceptionDetails"):
                     raise BrowserActionError("DOM inspection failed")
+                self._check_deadline()
                 return r.get("result", {}).get("value")
             first = call(obj, inspect)
-            page.wait_for_timeout(35)
+            self._check_deadline()
+            page.wait_for_timeout(min(35, self._timeout_ms(35)))
+            self._check_deadline()
             point = call(obj, inspect)
             if not point or point.get("error"):
                 raise BrowserActionError((point or {}).get("error", "Target not actionable"))
             if first != point:
                 raise BrowserActionError("Target moved during actionability check")
             name, args = action.action, action.args
+            self._check_deadline()
             # 点击的是 PDF 链接 → 直接 HTTP 下载保存（而非浏览器打开 PDF 查看器）
             if name in ("click", "right_click", "double_click") and node.get("href"):
                 try:
@@ -443,6 +717,7 @@ class BrowserSession:
                 if len(matches) != 1:
                     raise BrowserActionError("Select option is absent or ambiguous")
                 dispatched = True
+                self._check_deadline()
                 call(obj, """function(i){ this.selectedIndex=i; this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); }""", [matches[0]])
             elif name == "scroll":
                 dispatched = True
@@ -456,13 +731,21 @@ class BrowserSession:
                     if not call(obj, "function(){let a=document.activeElement;while(a&&a.shadowRoot&&a.shadowRoot.activeElement)a=a.shadowRoot.activeElement;return a===this || this.contains(a)}"):
                         raise BrowserActionError("Focus changed after click", dispatched=True)
                     if args.get("overwrite"):
+                        self._check_deadline()
                         page.keyboard.press("ControlOrMeta+A")
+                        self._check_deadline()
                         page.keyboard.press("Backspace")
+                    self._check_deadline()
                     page.keyboard.insert_text(str(args["text"]))
+            self._check_deadline()
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "target_ref": ref, "coord": [point["x"], point["y"]],
+                    **self._follow_owned_popup(browser),
                     "coordinate_space": "css_viewport", "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "error": str(exc)[:500],
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
@@ -493,6 +776,7 @@ class BrowserSession:
 
     def goto(self, url):
         """CDP 导航（虚拟，不动真实鼠标键盘）。"""
+        self._check_deadline()
         url = (url or "").strip()
         if not url:
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
@@ -502,7 +786,10 @@ class BrowserSession:
         started = time.perf_counter()
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "error": str(exc)[:200]}
         try:
@@ -517,11 +804,16 @@ class BrowserSession:
             if page is None:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "error": "No page"}
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            self._check_deadline()
+            page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_ms())
+            self._check_deadline()
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "action": "goto", "url": page.url[:300],
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "uncertain", "dispatched": False, "channel": "browser_dom",
                     "error": str(exc)[:300]}
         finally:
@@ -536,23 +828,40 @@ class BrowserSession:
 
     def get_page_source(self, max_chars=20000):
         """读取当前焦点页面；使用同一连接的无痕核验，不回退到其他标签页。"""
+        self._check_deadline()
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return ""
         try:
             page = self._pick_page(browser)
             if page is None:
                 return ""
+            cdp = None
+            if self.options.bind_page:
+                cdp = page.context.new_cdp_session(page)
+                self._validate_snapshot(page=page, cdp=cdp)
             if self.foreground_check and not self.foreground_check():
                 self.invalidate()
                 return ""
             html = page.content()
+            self._check_deadline()
+            if cdp is not None:
+                self._validate_snapshot(page=page, cdp=cdp)
             if self.foreground_check and not self.foreground_check():
                 self.invalidate()
                 return ""
             return html[:max(0, int(max_chars))]
+        except ModelRequestTimeout:
+            self.invalidate()
+            raise
         except Exception:
+            if self.options.bind_page:
+                self.invalidate()
+            self._check_deadline()
             return ""
         finally:
             try:
@@ -566,19 +875,27 @@ class BrowserSession:
 
     def screenshot(self):
         """截当前页面 viewport（返回 PIL Image），不受其他窗口遮挡。"""
+        self._check_deadline()
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return None
         try:
             page = self._pick_page(browser)
             if page is None:
                 return None
-            data = page.screenshot(full_page=False)
+            data = page.screenshot(full_page=False, timeout=self._timeout_ms())
+            self._check_deadline()
             import io
             from PIL import Image
             return Image.open(io.BytesIO(data))
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return None
         finally:
             try:
@@ -592,17 +909,25 @@ class BrowserSession:
 
     def viewport_size(self):
         """返回当前页面 viewport 尺寸 (width, height)。"""
+        self._check_deadline()
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return None
         try:
             page = self._pick_page(browser)
             if page is None:
                 return None
             vp = page.evaluate("({w: innerWidth, h: innerHeight})")
+            self._check_deadline()
             return int(vp["w"]), int(vp["h"])
+        except ModelRequestTimeout:
+            raise
         except Exception:
+            self._check_deadline()
             return None
         finally:
             try:
@@ -620,10 +945,14 @@ class BrowserSession:
         与 click_at_screen 的区别：坐标已经是 viewport 坐标（因为截图就是 viewport），
         不再做屏幕→viewport 换算。
         """
+        self._check_deadline()
         started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "resolved": "visual", "error": str(exc)[:200]}
         try:
@@ -631,25 +960,46 @@ class BrowserSession:
             if page is None:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "visual", "error": "No page"}
+            if self.options.bind_page:
+                self.validate_action_snapshot(action)
+                cdp = page.context.new_cdp_session(page)
+                self._validate_snapshot(page=page, cdp=cdp)
+                current = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+                if current != self.snapshot.get("viewport"):
+                    raise BrowserActionError("视口在视觉定位后发生变化，请重新观察")
+                if not (0 <= vx < current["width"] and 0 <= vy < current["height"]):
+                    raise BrowserActionError("视觉坐标超出网页视口")
             name = action.action
+            self._check_deadline()
             if name in ("click", "double_click", "right_click"):
+                dispatched = True
                 page.mouse.click(vx, vy, button="right" if name == "right_click" else "left",
                                  click_count=2 if name == "double_click" else 1)
-                dispatched = True
             elif name == "type":
+                dispatched = True
                 page.mouse.click(vx, vy)
+                self._check_deadline()
                 if action.args.get("overwrite"):
                     page.keyboard.press("ControlOrMeta+A")
+                    self._check_deadline()
                     page.keyboard.press("Backspace")
+                self._check_deadline()
                 page.keyboard.insert_text(str(action.args.get("text", "")))
-                dispatched = True
             else:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "visual", "error": f"不支持的视觉动作 {name}"}
+            self._check_deadline()
             return {"status": "executed" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "resolved": "visual",
+                    **self._follow_owned_popup(browser),
                     "coord": [vx, vy], "coordinate_space": "css_viewport",
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
+        except Exception as exc:
+            self._check_deadline()
+            return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
+                    "channel": "browser_dom", "resolved": "visual", "error": str(exc)[:300]}
         finally:
             try:
                 browser.close()
@@ -660,11 +1010,59 @@ class BrowserSession:
             except Exception:
                 pass
 
+    def image_to_viewport(self, x, y):
+        """缩略图像素转换为原网页 CSS viewport 坐标。"""
+        self._check_deadline()
+        scale = self.last_capture_info.get("screenshot_scale") or {"x": 1, "y": 1}
+        return float(x) / scale["x"], float(y) / scale["y"]
+
+    def drag_at_viewport(self, start, end):
+        self._check_deadline()
+        dispatched = False
+        try:
+            p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
+        except Exception as exc:
+            self._check_deadline()
+            return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": str(exc)[:300]}
+        try:
+            page = self._pick_page(browser)
+            if page is None:
+                raise BrowserActionError("本任务的浏览器页面不可用")
+            cdp = page.context.new_cdp_session(page)
+            self._validate_snapshot(page=page, cdp=cdp)
+            current = page.evaluate("({width:innerWidth,height:innerHeight,x:scrollX,y:scrollY,dpr:devicePixelRatio})")
+            if current != self.snapshot.get("viewport"):
+                raise BrowserActionError("拖拽前视口已变化，请重新观察")
+            for x, y in (start, end):
+                if not (0 <= x < current["width"] and 0 <= y < current["height"]):
+                    raise BrowserActionError("拖拽坐标超出网页视口")
+            page.mouse.move(*start)
+            self._check_deadline()
+            dispatched = True
+            page.mouse.down()
+            try:
+                page.mouse.move(*end, steps=12)
+            finally:
+                page.mouse.up()
+            self._check_deadline()
+            return {"status": "executed", "dispatched": True, "channel": "browser_dom", "resolved": "visual"}
+        except ModelRequestTimeout:
+            raise
+        except Exception as exc:
+            self._check_deadline()
+            return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
+                    "channel": "browser_dom", "error": str(exc)[:300]}
+        finally:
+            self._disconnect(p, browser)
+
     def download(self, url):
         """用 HTTP 下载文件（论文 PDF 等）到 downloads 目录，返回结果 dict。
 
         带浏览器 User-Agent、跟随重定向；从 Content-Disposition 或 URL 提取文件名。
         """
+        self._check_deadline()
         import requests
         import urllib3
         from urllib.parse import urlparse, unquote
@@ -690,10 +1088,13 @@ class BrowserSession:
         headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")}
         started = time.perf_counter()
+        r = None
+        partial_path = None
         try:
             # verify=False：公司网络走 MITM 代理，Python CA 库缺公司根证书（仅影响下载，模型走 HTTP 内网）
-            r = requests.get(url, headers=headers, timeout=90, stream=True,
+            r = requests.get(url, headers=headers, timeout=self._timeout_seconds(90), stream=True,
                              allow_redirects=True, verify=False)
+            self._check_deadline()
             if r.status_code != 200:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "action": "download", "error": f"HTTP {r.status_code}"}
@@ -723,11 +1124,17 @@ class BrowserSession:
                 filename = f"{base}_{i}{ext}"
                 path = os.path.join(self.downloads_dir, filename)
             size = 0
-            with open(path, "wb") as f:
+            partial_path = path + "." + uuid.uuid4().hex + ".part"
+            with open(partial_path, "xb") as f:
                 for chunk in r.iter_content(65536):
+                    self._check_deadline()
                     f.write(chunk)
                     size += len(chunk)
+            self._check_deadline()
+            os.replace(partial_path, path)
+            partial_path = None
             self._downloaded[url] = path
+            self._check_deadline()
             # 落盘校验：写完后读回，确认真实存在 + 大小匹配（不靠模型自评）
             verified = False
             try:
@@ -740,22 +1147,48 @@ class BrowserSession:
                     "message": (f"✅ 已成功下载到 {path}（{size} 字节），已核实此文件落盘" if verified
                                 else f"⚠️ 下载写入异常：{path} 落盘校验失败"),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:  # noqa: BLE001
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "action": "download", "error": str(exc)[:300]}
+        finally:
+            if r is not None and hasattr(r, "close"):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            if partial_path is not None:
+                try:
+                    os.remove(partial_path)
+                except OSError:
+                    pass
 
-    def execute_target(self, action, target, allowed=None):
+    def execute_target(self, action, target, allowed=None, route=None):
         """纯 target 描述执行：先 resolve ref → DOM 点击；否则 Playwright locator 匹配。
 
         全程 CDP，不动真实鼠标。allowed = 已暴露给模型的 ref 集合。
         """
+        self._check_deadline()
+        if self.options.bind_page:
+            try:
+                self.validate_action_snapshot(action)
+                if route is not None:
+                    self._validate_snapshot(route)
+            except BrowserActionError as exc:
+                return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": str(exc)}
         if action.action == "scroll":
             return self._scroll(action)
         ref = self.resolve_target(target, allowed=allowed)
         if ref:
             action.args["target_ref"] = ref
-            route = {"channel": "browser_dom", "target_ref": ref, "coordinate_space": "css_viewport"}
+            route = {"channel": "browser_dom", **self.snapshot_route(), "exposed_refs": list(allowed or []),
+                     "target_ref": ref, "coordinate_space": "css_viewport"}
             return self.execute(action, route)
+        if self.options.bind_page and action.action not in ("press", "hotkey"):
+            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
+                    "error": "目标未唯一匹配当前暴露节点，请重新观察或选择区域"}
         return self._execute_locator(action, target)
 
     def _locator_for(self, page, target):
@@ -794,10 +1227,14 @@ class BrowserSession:
 
     def _execute_locator(self, action, target):
         """CDP locator 执行浏览器动作（虚拟输入）。"""
+        self._check_deadline()
         started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "resolved": "locator", "error": str(exc)[:200]}
         try:
@@ -805,46 +1242,60 @@ class BrowserSession:
             if page is None:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "locator", "error": "No page"}
+            if self.options.bind_page:
+                self._validate_snapshot(page=page, cdp=page.context.new_cdp_session(page))
             name = action.action
             if name in ("press", "hotkey"):
                 # 键盘动作不需要 locator
+                self._check_deadline()
+                dispatched = True
                 if name == "press":
                     page.keyboard.press(self._norm_key(str(action.args.get("key", ""))))
                 else:
                     keys = [self._norm_key(k) for k in (action.args.get("keys") or [])]
                     if keys:
                         page.keyboard.press("+".join(keys))
-                dispatched = True
+                self._check_deadline()
                 return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                         "resolved": "locator", "action": name,
                         "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
             loc = self._locator_for(page, target)
+            self._check_deadline()
             if loc is None:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "locator",
                         "error": "Target not found in DOM（换一种 target 描述，或该目标在 canvas/iframe）"}
+            if loc.count() != 1:
+                raise BrowserActionError("目标名称存在歧义，请指定唯一节点")
             if name in ("click", "double_click", "right_click"):
                 dispatched = True
                 loc.first.click(button="right" if name == "right_click" else "left",
-                                click_count=2 if name == "double_click" else 1, timeout=5000)
+                                click_count=2 if name == "double_click" else 1, timeout=self._timeout_ms(5000))
             elif name == "type":
                 l = loc.first
-                l.click(timeout=5000)
+                dispatched = True
+                l.click(timeout=self._timeout_ms(5000))
+                self._check_deadline()
                 if action.args.get("overwrite"):
                     page.keyboard.press("ControlOrMeta+A")
+                    self._check_deadline()
                     page.keyboard.press("Backspace")
+                self._check_deadline()
                 page.keyboard.insert_text(str(action.args.get("text", "")))
-                dispatched = True
             elif name == "select":
-                loc.first.select_option(str(action.args.get("option", "")), timeout=5000)
                 dispatched = True
+                loc.first.select_option(str(action.args.get("option", "")), timeout=self._timeout_ms(5000))
             else:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "locator", "error": f"unsupported action {name}"}
+            self._check_deadline()
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "resolved": "locator", "action": name,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "resolved": "locator", "error": str(exc)[:300]}
         finally:
@@ -859,12 +1310,16 @@ class BrowserSession:
 
     def _scroll(self, action):
         """页面级滚动（window.scrollBy），无需 target。"""
+        self._check_deadline()
         amount = int(action.args.get("amount", 1))
         delta = amount * 300 * (-1 if action.args.get("direction", "up") == "up" else 1)
         started = time.perf_counter()
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "error": str(exc)[:200]}
         try:
@@ -872,11 +1327,18 @@ class BrowserSession:
             if page is None:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "error": "No page"}
+            if self.options.bind_page:
+                self._validate_snapshot(page=page, cdp=page.context.new_cdp_session(page))
+            self._check_deadline()
             page.evaluate(f"window.scrollBy(0, {delta})")
+            self._check_deadline()
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "action": "scroll", "delta": delta,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "error": str(exc)[:200]}
         finally:
@@ -907,10 +1369,14 @@ class BrowserSession:
 
     def click_at_screen(self, action, sx, sy):
         """视觉定位回退：在屏幕坐标 (sx, sy) 处用 CDP 虚拟点击/输入，不动真实鼠标。"""
+        self._check_deadline()
         started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                     "resolved": "visual", "error": str(exc)[:200]}
         try:
@@ -942,7 +1408,10 @@ class BrowserSession:
                     "resolved": "visual", "action": name, "coord": [vx, vy],
                     "coordinate_space": "css_viewport",
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+        except ModelRequestTimeout:
+            raise
         except Exception as exc:
+            self._check_deadline()
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "resolved": "visual", "error": str(exc)[:300]}
         finally:
@@ -958,6 +1427,25 @@ class BrowserSession:
     def invalidate(self):
         self.snapshot = None
         self.nodes = {}
+        self.last_capture_info = {}
 
     def close(self):
+        # 清理运行专属资源不受已经结束的步骤预算影响。
+        self.request_deadline = None
+        if self.context_id is not None:
+            try:
+                p, browser = self._connect()
+            except Exception:
+                pass
+            else:
+                try:
+                    browser.new_browser_cdp_session().send("Target.disposeBrowserContext", {
+                        "browserContextId": self.context_id,
+                    })
+                except Exception:
+                    pass
+                finally:
+                    self._disconnect(p, browser)
         self.invalidate()
+        self.page_id = None
+        self.context_id = None

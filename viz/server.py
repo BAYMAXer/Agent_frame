@@ -1,11 +1,6 @@
-"""viz 服务器：前端启动 / 实时看过程 / 看历史。
+"""本地 Windows 工作台：自由文本任务、实时模型调用与本机历史轨迹。
 
-适配新框架（osworld_agent）：
-- 核心端点 /log /history /ws /run/* /runs /tasks 保留，契约与原 Agent-S3 viz 一致；
-- /experiments/* 和 /debug/* 是原框架的进阶功能，这里做最小 stub，避免前端报错；
-- /run/start 启动的是新框架的 osworld_agent.viz.runner（跑 VMware 真实任务）。
-
-运行：python -m osworld_agent.viz.server
+启动：python launch.py。所有任务通过本机 runner 执行。
 """
 from __future__ import annotations
 
@@ -13,6 +8,7 @@ import json
 import os
 import base64
 import hashlib
+import math
 from collections import OrderedDict
 import subprocess
 import sys
@@ -30,56 +26,17 @@ from .logging import compact_messages
 app = FastAPI(title="osworld_agent Viz")
 
 # ---- 配置（环境变量覆盖）----
-_PKG = Path(__file__).resolve().parent.parent          # osworld_agent 包目录
-_PROJECT_ROOT = _PKG.parent                            # 项目根（含 osworld_agent 与 AgentS）
-AGENT_ROOT = os.getenv("OSWORLD_AGENT_ROOT", str(_PROJECT_ROOT))  # 跑 runner 的 cwd
-EXAMPLES_DIR = os.getenv("OSWORLD_EXAMPLES_DIR", "")
-DESKTOP_ENV_PATH = os.getenv("OSWORLD_DESKTOP_ENV_PATH", "")
-VM_PATH = os.getenv("OSWORLD_VM_PATH", "")
-RESULTS_DIR = os.getenv("AGENTS_RESULTS_DIR", str(_PKG / "viz" / "runs"))
+_PKG = Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = _PKG.parent
+AGENT_ROOT = os.getenv("OSWORLD_AGENT_ROOT", str(_PROJECT_ROOT))
 LOCAL_RUNS_DIR = os.getenv("OSWORLD_LOCAL_RUNS_DIR", str(_PKG / "local_runs"))
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+STATIC_DIR = str(Path(__file__).resolve().parent / "static")
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
 
 def _runner_python() -> str:
-    """确定跑 runner 的 Python 解释器。
-
-    desktop_env 的依赖（gymnasium 等）装在 AgentS 的 .venv 里，而 viz server 自身可能
-    用系统 Python（只装了 fastapi/uvicorn）启动。若 runner 直接复用 sys.executable，会在
-    import desktop_env 时崩（ModuleNotFoundError: gymnasium）。因此优先用 AgentS 的 .venv。
-    """
-    env_py = os.getenv("OSWORLD_RUNNER_PYTHON")
-    if env_py:
-        return env_py
-    if DESKTOP_ENV_PATH:
-        for rel in (os.path.join(".venv", "Scripts", "python.exe"),   # Windows
-                    os.path.join(".venv", "bin", "python")):           # POSIX
-            venv_py = os.path.join(DESKTOP_ENV_PATH, rel)
-            if os.path.isfile(venv_py):
-                return venv_py
-    return sys.executable
-
-
-def _detect_vm_path() -> str:
-    """自动探测已解压的 VMware VM（.vmx）。
-
-    OSWorld 的 vmware manager 用 registry（.vmware_vms）记录空闲 VM，registry 一旦为空
-    就会走 _install_vm 从 HF 重新下载 Ubuntu-x86.zip（被内网代理 SSL 拦截）。而 VM 本体
-    早已解压在 {DESKTOP_ENV_PATH}/vmware_vm_data/ 下，直接把 .vmx 路径传给 DesktopEnv
-    （path_to_vm 非空即跳过 registry/下载），即可复用。
-    """
-    if not DESKTOP_ENV_PATH:
-        return ""
-    vms_dir = os.path.join(DESKTOP_ENV_PATH, "vmware_vm_data")
-    if not os.path.isdir(vms_dir):
-        return ""
-    for name in sorted(os.listdir(vms_dir)):
-        d = os.path.join(vms_dir, name)
-        vmx = os.path.join(d, name + ".vmx")
-        if os.path.isdir(d) and os.path.isfile(vmx):
-            return vmx
-    return ""
+    """使用显式指定的本机解释器，默认与工作台保持一致。"""
+    return os.getenv("OSWORLD_RUNNER_PYTHON") or sys.executable
 
 
 MAX_LOGS = 200
@@ -145,14 +102,14 @@ _agent_state = {
     "status": "idle", "proc": None, "task_name": None, "config": None,
     "start_time": None, "output": [], "current_step": 0, "max_steps": 0, "task_total": 0,
     "plan": None, "current_plan_step_id": None, "plan_revision": None,
-    "plan_update": None, "task_start": None,
+    "plan_update": None, "task_start": None, "browser_observation": None,
 }
 
 
 def _clear_plan_state():
     """A new task must not recover a previous task's plan after reconnecting."""
     _agent_state.update(plan=None, current_plan_step_id=None, plan_revision=None,
-                        plan_update=None, task_start=None)
+                        plan_update=None, task_start=None, browser_observation=None)
 
 
 def _plan_revision(payload):
@@ -164,7 +121,25 @@ def _plan_revision(payload):
         return None
 
 
-def _reader_thread(proc):
+def _recover_local_window_presentation(proc, config):
+    """The runner can be force-killed; recover only its recorded task window."""
+    cfg = config or {}
+    if proc is None or cfg.get("mode") != "local" or not cfg.get("result_dir"):
+        return True
+    try:
+        from ..adapters.windows_window import recover_window_presentation
+        recovered = recover_window_presentation(
+            Path(cfg["result_dir"]) / "window_presentation.json", expected_runner_pid=proc.pid)
+    except Exception:
+        recovered = False
+    if not recovered:
+        _agent_state.setdefault("output", []).append(
+            "[window] 任务已退出，但窗口置顶状态未能恢复；已保留恢复记录")
+    return recovered
+
+
+def _reader_thread(proc, config=None):
+    cfg = dict(config if config is not None else (_agent_state.get("config") or {}))
     try:
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -176,7 +151,8 @@ def _reader_thread(proc):
         pass
     finally:
         rc = proc.wait()
-        if _agent_state["status"] == "running":
+        _recover_local_window_presentation(proc, cfg)
+        if _agent_state.get("proc") is proc and _agent_state["status"] == "running":
             _agent_state["status"] = "done" if rc == 0 else "failed"
 
 
@@ -223,6 +199,8 @@ async def _publish_log(payload: dict):
                     "current_plan_step_id", plan.get("current_plan_step_id", plan.get("current_step_id")) if isinstance(plan, dict) else None)
                 _agent_state["plan_revision"] = revision
                 _agent_state["plan_update"] = stored
+        if (payload.get("prompt_metadata") or {}).get("browser_selection") is not None:
+            _agent_state["browser_observation"] = stored
     msg = json.dumps(payload, ensure_ascii=False)
     dead = []
     for ws in clients:
@@ -240,7 +218,8 @@ async def history():
     # MAX_LOGS can evict task_start/plan_update during a long run. Keep the current
     # snapshot available without growing the log buffer indefinitely.
     return {"logs": logs, "task_start": _agent_state.get("task_start"),
-            "plan_update": _agent_state.get("plan_update")}
+            "plan_update": _agent_state.get("plan_update"),
+            "browser_observation": _agent_state.get("browser_observation")}
 
 
 @app.get("/live/shot/{token}")
@@ -256,8 +235,10 @@ async def live_shot(token: str):
 @app.get("/capabilities")
 async def capabilities():
     return {
-        "run_modes": ["local", "vm"],
-        "local": {"task_text": True, "timeouts": ["model_timeout", "ground_timeout", "step_timeout"]},
+        "run_modes": ["local"],
+        "local": {"task_text": True, "timeouts": ["model_timeout", "ground_timeout", "step_timeout"],
+                  "execution_modes": ["browser_first", "desktop"],
+                  "browser_context": ["ax_max_chars", "screenshot_max_edge"]},
         "model_io": {"messages": True, "image_metadata": True, "usage": True,
                      "grounding_raw_response": True},
         "live_screenshots": {"max_count": MAX_LIVE_SHOTS, "max_bytes": MAX_LIVE_SHOT_BYTES,
@@ -285,89 +266,6 @@ async def ws_endpoint(ws: WebSocket):
 async def index():
     with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as f:
         return HTMLResponse(f.read())
-
-
-# ================= 任务列表 & 历史 ================= #
-@app.get("/tasks")
-async def list_tasks(test_all_meta_path: str = "evaluation_examples/test_small.json"):
-    """返回所选测试集内的任务，按域名分组。
-
-    优先读测试集 meta（如 evaluation_examples/test_small.json，相对 DESKTOP_ENV_PATH 即 AgentS 根目录），
-    只返回该测试集的任务子集；meta 读不到时回退到扫描全部 examples。
-    """
-    if DESKTOP_ENV_PATH:
-        meta_path = os.path.abspath(os.path.join(DESKTOP_ENV_PATH, test_all_meta_path))
-        try:
-            if meta_path.endswith(".json"):
-                with open(meta_path, encoding="utf-8") as f:
-                    meta = json.load(f)
-                if isinstance(meta, dict):
-                    return {"tasks": {
-                        domain: ids for domain, ids in sorted(meta.items())
-                        if isinstance(ids, list)
-                    }}
-        except Exception:
-            pass
-
-    # 回退：扫描全部 examples
-    tasks = {}
-    if EXAMPLES_DIR and os.path.isdir(EXAMPLES_DIR):
-        for domain in sorted(os.listdir(EXAMPLES_DIR)):
-            domain_dir = os.path.join(EXAMPLES_DIR, domain)
-            if not os.path.isdir(domain_dir):
-                continue
-            ids = sorted(f[:-5] for f in os.listdir(domain_dir) if f.endswith(".json"))
-            if ids:
-                tasks[domain] = ids
-    if not tasks and EXAMPLES_DIR and os.path.isdir(EXAMPLES_DIR):
-        flat = sorted(f[:-5] for f in os.listdir(EXAMPLES_DIR) if f.endswith(".json"))
-        if flat:
-            tasks["all"] = flat
-    return {"tasks": tasks}
-
-
-@app.get("/runs")
-async def list_runs():
-    runs = []
-    base = os.path.join(RESULTS_DIR, "pyautogui", "screenshot")
-    if os.path.isdir(base):
-        for model in os.listdir(base):
-            model_dir = os.path.join(base, model)
-            if not os.path.isdir(model_dir):
-                continue
-            for domain in os.listdir(model_dir):
-                domain_dir = os.path.join(model_dir, domain)
-                if not os.path.isdir(domain_dir):
-                    continue
-                for task_id in os.listdir(domain_dir):
-                    task_dir = os.path.join(domain_dir, task_id)
-                    if not os.path.isdir(task_dir):
-                        continue
-                    instruction = result = None
-                    try:
-                        with open(os.path.join(task_dir, "instruction.txt"), encoding="utf-8") as f:
-                            instruction = f.read().strip()
-                    except Exception:
-                        pass
-                    try:
-                        with open(os.path.join(task_dir, "result.txt")) as f:
-                            result = float(f.read().strip())
-                    except Exception:
-                        pass
-                    shots = [f for f in os.listdir(task_dir)
-                             if f.startswith("step_") and f.endswith(".png")]
-                    example_id, run_ts = task_id, ""
-                    if "__" in task_id:
-                        example_id, run_ts = task_id.rsplit("__", 1)
-                    runs.append({
-                        "model": model, "domain": domain, "task_id": task_id,
-                        "example_id": example_id, "run_ts": run_ts,
-                        "instruction": instruction or "", "result": result,
-                        "steps": len(shots), "mtime": os.path.getmtime(task_dir),
-                        "error": None, "experiment": {},
-                    })
-    runs.sort(key=lambda r: r.get("mtime", 0), reverse=True)
-    return {"runs": runs}
 
 
 # ================= 本地运行（Windows 本机任务，local_runs/ 目录）================= #
@@ -449,6 +347,10 @@ def _local_traj_to_frontend(traj):
             "timing_ms": timing,
             "decision_elapsed_ms": decision_elapsed,
             "subagent": subagent,
+            "prompt_metadata": s.get("prompt_metadata") or {},
+            "observation": {"info": (s.get("observation") or {}).get("info") or {}},
+            "plan_step_id": s.get("plan_step_id"),
+            "plan_snapshot": s.get("plan_snapshot"),
         })
     pending = traj.get("pending_step")
     if isinstance(pending, dict):
@@ -461,6 +363,9 @@ def _local_traj_to_frontend(traj):
                       "outcome": "未完成阶段: " + str(pending.get("phase") or pending.get("event") or "")
                                  + " " + str((traj.get("outcome") or {}).get("error") or ""),
                       "done": False})
+        lines[-1].update({key: pending.get(key) for key in
+                         ("prompt_metadata", "plan_step_id", "timing_ms")})
+        lines[-1]["observation"] = {"info": (pending.get("observation") or {}).get("info") or {}}
     return lines
 
 
@@ -494,67 +399,6 @@ async def local_shot(run: str, filename: str):
     if shot.is_file():
         return FileResponse(str(shot))
     return Response(status_code=404)
-
-
-@app.get("/run/traj")
-async def get_traj(model: str, domain: str, task_id: str):
-    base = os.path.join(RESULTS_DIR, "pyautogui", "screenshot", model, domain, task_id)
-    lines = []
-    traj_path = os.path.join(base, "traj.jsonl")
-    if os.path.exists(traj_path):
-        with open(traj_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        lines.append(json.loads(line))
-                    except Exception:
-                        pass
-    instruction = ""
-    ip = os.path.join(base, "instruction.txt")
-    if os.path.exists(ip):
-        with open(ip, encoding="utf-8") as f:
-            instruction = f.read().strip()
-    return {"traj": lines, "instruction": instruction, "config": {}, "system_prompt": ""}
-
-
-@app.get("/run/trajectory")
-async def get_trajectory(model: str, domain: str, task_id: str):
-    """返回标准训练轨迹（trajectory.json，供前端展示 + 训练管线取用）。"""
-    base = os.path.join(RESULTS_DIR, "pyautogui", "screenshot", model, domain, task_id)
-    traj_path = os.path.join(base, "trajectory.json")
-    if os.path.exists(traj_path):
-        try:
-            with open(traj_path, encoding="utf-8") as f:
-                return {"ok": True, "trajectory": json.load(f)}
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"轨迹解析失败：{exc}"}
-    return {"ok": False, "error": "该运行未导出标准轨迹（trajectory.json 不存在）"}
-
-
-@app.get("/run/shot")
-async def get_shot(model: str, domain: str, task_id: str, filename: str):
-    shot_path = os.path.join(RESULTS_DIR, "pyautogui", "screenshot", model, domain, task_id, filename)
-    if os.path.exists(shot_path):
-        return FileResponse(shot_path)
-    return Response(status_code=404)
-
-
-@app.post("/run/delete")
-async def delete_run(request: Request):
-    import shutil
-    try:
-        cfg = await request.json()
-    except Exception:
-        return {"ok": False, "error": "invalid json"}
-    model, domain, task_id = cfg.get("model"), cfg.get("domain"), cfg.get("task_id")
-    if not (model and domain and task_id):
-        return {"ok": False, "error": "missing params"}
-    task_dir = os.path.join(RESULTS_DIR, "pyautogui", "screenshot", model, domain, task_id)
-    if os.path.isdir(task_dir):
-        shutil.rmtree(task_dir)
-        return {"ok": True}
-    return {"ok": False, "error": "not found"}
 
 
 # ================= 进程管理 ================= #
@@ -598,10 +442,31 @@ def _start_local(cfg: dict):
     ground_model = cfg.get("ground_model") or os.getenv("OSWORLD_LOCAL_GROUND_MODEL", "UI-Venus-2-9B")
     ground_url = cfg.get("ground_url") or os.getenv("OSWORLD_LOCAL_GROUND_URL", "http://7.246.80.189:8001/v1")
     ground_type = cfg.get("ground_type") or os.getenv("OSWORLD_LOCAL_GROUND_TYPE", "ui-venus2")
-    max_steps = int(cfg.get("max_steps", 15))
+    execution_mode = cfg.get("execution_mode", os.getenv("OSWORLD_LOCAL_EXECUTION_MODE", "browser_first"))
+    if not isinstance(execution_mode, str) or execution_mode not in {"browser_first", "desktop"}:
+        return {"ok": False, "error": "执行模式必须是 browser_first 或 desktop"}
+    from osworld_agent.config import ContextConfig
+    try:
+        max_steps = cfg.get("max_steps", 20)
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+            raise ValueError("最大步数必须为正整数")
+        browser_context = ContextConfig(ax_max_chars=cfg.get("ax_max_chars", 5000),
+                                        screenshot_max_edge=cfg.get("screenshot_max_edge", 1280))
+        timeouts = {name: cfg.get(name, float(os.getenv(env_name, default)))
+                    for name, env_name, default in
+                    (("model_timeout", "OSWORLD_LOCAL_MODEL_TIMEOUT", "60"),
+                     ("ground_timeout", "OSWORLD_LOCAL_GROUND_TIMEOUT", "60"),
+                     ("step_timeout", "OSWORLD_LOCAL_STEP_TIMEOUT", "120"))}
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or value <= 0 or not math.isfinite(value) for value in timeouts.values()):
+            raise ValueError("模型、定位及每步超时必须为有限正数")
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
     result_dir = cfg.get("result_dir") or os.path.join(
         LOCAL_RUNS_DIR, "ui_" + time.strftime("%Y%m%d_%H%M%S"))
-    cfg = {**cfg, "result_dir": result_dir}
+    cfg = {**cfg, "result_dir": result_dir, "execution_mode": execution_mode,
+           "max_steps": max_steps, **timeouts, "ax_max_chars": browser_context.ax_max_chars,
+           "screenshot_max_edge": browser_context.screenshot_max_edge}
 
     cmd = [
         _runner_python(), str(_PKG / "launch.py"), "--runner", "local",
@@ -611,9 +476,12 @@ def _start_local(cfg: dict):
         "--ground-model", ground_model,
         "--ground-url", ground_url,
         "--ground-type", ground_type,
-        "--model-timeout", str(cfg.get("model_timeout") or os.getenv("OSWORLD_LOCAL_MODEL_TIMEOUT", "60")),
-        "--ground-timeout", str(cfg.get("ground_timeout") or os.getenv("OSWORLD_LOCAL_GROUND_TIMEOUT", "60")),
-        "--step-timeout", str(cfg.get("step_timeout") or os.getenv("OSWORLD_LOCAL_STEP_TIMEOUT", "120")),
+        "--model-timeout", str(timeouts["model_timeout"]),
+        "--ground-timeout", str(timeouts["ground_timeout"]),
+        "--step-timeout", str(timeouts["step_timeout"]),
+        "--execution-mode", execution_mode,
+        "--ax-max-chars", str(browser_context.ax_max_chars),
+        "--screenshot-max-edge", str(browser_context.screenshot_max_edge),
         "--max-steps", str(max_steps),
         "--result-dir", result_dir,
     ]
@@ -625,7 +493,6 @@ def _start_local(cfg: dict):
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
     env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{os.getenv('AGENTS_VIZ_PORT', '8088')}"
-    env["AGENTS_RESULTS_DIR"] = RESULTS_DIR
     env["NO_PROXY"] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
     env["no_proxy"] = env["NO_PROXY"]
 
@@ -646,7 +513,7 @@ def _start_local(cfg: dict):
                                 text=True, encoding="utf-8", errors="replace")
         _agent_state["proc"] = proc
         _agent_state["status"] = "running"
-        threading.Thread(target=_reader_thread, args=(proc,), daemon=True).start()
+        threading.Thread(target=_reader_thread, args=(proc, dict(cfg)), daemon=True).start()
         return {"ok": True, "task": _agent_state["task_name"], "task_total": 1}
     except Exception as e:
         _agent_state["status"] = "failed"
@@ -655,86 +522,18 @@ def _start_local(cfg: dict):
 
 @app.post("/run/start")
 async def start_run(request: Request):
-    if _agent_state["status"] == "running":
-        return {"ok": False, "error": "已有任务在运行中，请先停止"}
     try:
         cfg = await request.json()
     except Exception:
         return {"ok": False, "error": "invalid json"}
-
-    if cfg.get("mode") == "local":
-        return _start_local(cfg)
-
-    domain = cfg.get("domain", "all")
-    task_id = cfg.get("task_id")
-    if not task_id:
-        return {"ok": False, "error": "请选择一个具体任务 task_id"}
-    if not EXAMPLES_DIR:
-        return {"ok": False, "error": "未配置 OSWORLD_EXAMPLES_DIR（evaluation_examples/examples）"}
-    if not DESKTOP_ENV_PATH:
-        return {"ok": False, "error": "未配置 OSWORLD_DESKTOP_ENV_PATH（包含 desktop_env 的目录）"}
-
-    model = cfg.get("model", "Qwen3.5-9B")
-    model_url = cfg.get("model_url", "http://7.246.80.237:9028/v1")
-    model_api_key = cfg.get("model_api_key") or "EMPTY"
-    ground_model = cfg.get("ground_model", "UI-TARS-1.5-7B")
-    ground_url = cfg.get("ground_url", "http://7.246.80.237:49999/v1")
-    ground_api_key = cfg.get("ground_api_key", "EMPTY")
-    ground_type = cfg.get("ground_type", "ui-tars")
-    max_steps = int(cfg.get("max_steps", 20))
-
-    cmd = [
-        _runner_python(), "-m", "osworld_agent.viz.runner",
-        "--task-id", task_id,
-        "--examples-dir", EXAMPLES_DIR,
-        "--domain", domain,
-        "--model", model,
-        "--model-url", model_url,
-        "--model-api-key", model_api_key,
-        "--ground-model", ground_model,
-        "--ground-url", ground_url,
-        "--ground-api-key", ground_api_key,
-        "--ground-type", ground_type,
-        "--max-steps", str(max_steps),
-        "--desktop-env-path", DESKTOP_ENV_PATH,
-        "--cache-dir", os.path.join(DESKTOP_ENV_PATH, "cache"),
-    ]
-    vm_path = VM_PATH or _detect_vm_path()
-    if vm_path:
-        cmd += ["--vm-path", vm_path]
-
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["AGENTS_VIZ_SERVER_URL"] = f"http://127.0.0.1:{os.getenv('AGENTS_VIZ_PORT', '8088')}"
-    env["AGENTS_RESULTS_DIR"] = RESULTS_DIR
-    env["NO_PROXY"] = "192.168.0.0/16,10.0.0.0/8,7.0.0.0/8,localhost,127.0.0.1"
-    env["no_proxy"] = env["NO_PROXY"]
-    # 本地 proxy 任务的上游代理：用 HIS 活 IP，否则 _proxy_setup 起不来 tinyproxy
-    env["OSWORLD_UPSTREAM_PROXY"] = os.environ.get("OSWORLD_UPSTREAM_PROXY") or "http://172.18.94.109:8080"
-
-    _agent_state["task_name"] = f"{domain}/{task_id}"
-    _agent_state["task_total"] = 1
-    _agent_state["config"] = cfg
-    _agent_state["output"] = []
-    _agent_state["current_step"] = 0
-    _agent_state["max_steps"] = max_steps
-    _agent_state["start_time"] = time.time()
-    _agent_state["status"] = "starting"
-    _clear_plan_state()
-    logs.clear()
-    _clear_live_screenshots()
-    try:
-        proc = subprocess.Popen(cmd, cwd=AGENT_ROOT, env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, encoding="utf-8", errors="replace")
-        _agent_state["proc"] = proc
-        _agent_state["status"] = "running"
-        threading.Thread(target=_reader_thread, args=(proc,), daemon=True).start()
-        return {"ok": True, "task": _agent_state["task_name"], "task_total": 1}
-    except Exception as e:
-        _agent_state["status"] = "failed"
-        return {"ok": False, "error": str(e)}
+    if not isinstance(cfg, dict):
+        return {"ok": False, "error": "任务配置必须是 JSON 对象"}
+    mode = cfg.get("mode", "local")
+    if mode != "local":
+        return {"ok": False, "error": "仅支持本地 Windows 任务，mode 必须为 local"}
+    if _agent_state["status"] in {"running", "starting"}:
+        return {"ok": False, "error": "已有任务在运行中，请先停止"}
+    return _start_local({**cfg, "mode": "local"})
 
 
 @app.get("/run/status")
@@ -752,12 +551,14 @@ async def run_status():
         "plan_revision": _agent_state.get("plan_revision"),
         "plan_update": _agent_state.get("plan_update"),
         "task_start": _agent_state.get("task_start"),
+        "browser_observation": _agent_state.get("browser_observation"),
     }
 
 
 @app.post("/run/stop")
 async def stop_run():
     proc = _agent_state["proc"]
+    cfg = dict(_agent_state.get("config") or {})
     was_running = (_agent_state.get("status") in {"running", "starting"}
                    or (proc is not None and proc.poll() is None))
     stopped_task = _agent_state.get("task_name")
@@ -765,8 +566,6 @@ async def stop_run():
     if proc and proc.poll() is None:
         try:
             command = ["taskkill"]
-            if (_agent_state.get("config") or {}).get("mode") != "local":
-                command.append("/T")
             # 本机任务只停止 runner，保留它按需启动的 Chrome 子进程。
             command.extend(["/F", "/PID", str(proc.pid)])
             subprocess.run(command,
@@ -778,7 +577,6 @@ async def stop_run():
                 proc.wait(timeout=5)
             except Exception as exc:
                 return {"ok": False, "error": f"未能确认任务已停止: {exc}"}
-        cfg = _agent_state.get("config") or {}
         if cfg.get("mode") == "local" and cfg.get("result_dir"):
             # /F 不会运行 runner 的 finally，保留已写入的未完成步骤并标记中断。
             base = Path(cfg["result_dir"])
@@ -799,6 +597,8 @@ async def stop_run():
                                                     ensure_ascii=False) + "\n")
                 except (OSError, ValueError, TypeError):
                     pass
+    if proc is not None:
+        _recover_local_window_presentation(proc, cfg)
     _agent_state["status"] = "idle"
     _agent_state["proc"] = None
     _agent_state["task_name"] = None
@@ -838,11 +638,14 @@ async def manual_eval():
 # ================= 实验/调试 stub（防止前端报错）================= #
 @app.get("/experiments/default-prompt")
 async def get_default_prompt(backend: str = "native", browser_only: bool = False,
-                             os_name: str = "linux"):
+                             os_name: str = "windows"):
+    if os_name != "windows":
+        return {"ok": False, "error": "当前框架仅支持本地 Windows"}
     try:
-        from osworld_agent.prompts import build_system_prompt
+        from osworld_agent.prompts import build_system_prompt, build_subtask_system_prompt
         return {"ok": True, "backend": "native",
-                "prompt": build_system_prompt(os_name=os_name, browser_only=browser_only)}
+                "prompt": (build_subtask_system_prompt(os_name=os_name, mode="browser") if browser_only
+                           else build_system_prompt(os_name=os_name))}
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 

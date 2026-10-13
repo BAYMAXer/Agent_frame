@@ -3,15 +3,18 @@
 跑一个本地 GUI 任务（重点：浏览器任务），逐步回放 + 落盘轨迹/截图。
 
 用法：
-    python run_windows_local.py --task "用谷歌学术(scholar.google.com)搜索 'attention is all you need'，告诉我第一个搜索结果"
+    python launch.py --runner local --task "用谷歌学术搜索 'attention is all you need'，告诉我第一个搜索结果"
 
 说明：
-- 执行访问网址的动作时，始终启动或核验带 remote-debugging 的无痕 Chrome；
-- browser use 仅操作已核验调试端口所属的前台窗口；CDP 失败不向个人浏览器发送导航输入；
-- 任务结束后保留浏览器窗口及页面；
-- 模型默认走 189 的决策(9028) + grounding(8001)，可用 --model-url / --ground-url 覆盖；
+- 默认 browser_first：按计划子任务进入独立浏览器；--execution-mode desktop 保留桌面兼容流程；
+- 浏览器输入截图最长边默认 1280 像素，精简 AX 默认最多 5000 字符；
+- 进入网页子任务时，启动或核验带 remote-debugging 的无痕 Chrome；
+- browser_first 绑定本次运行的私有网页，不依赖桌面焦点；
+- 目标应用在任务期间置顶，切换应用或任务结束时恢复原置顶状态；
+- 任务结束后释放本次运行的私有会话，浏览器进程由用户关闭；
+- 模型连接可用 --model-url / --ground-url 覆盖；
 - 屏幕分辨率自动检测（grounding 按它换算坐标），也可用 --width/--height 覆盖；
-- 运行时会【真】控制你的鼠标键盘，跑的时候别动鼠标。
+- 网页操作使用 CDP 虚拟输入；显式桌面子任务使用本机鼠标键盘。
 """
 from __future__ import annotations
 
@@ -31,7 +34,13 @@ _parent = os.path.dirname(_here)
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
-from osworld_agent.config import ModelConfig          # noqa: E402
+if __package__:
+    from .launch import bootstrap_package
+else:
+    from launch import bootstrap_package
+bootstrap_package()
+
+from osworld_agent.config import ContextConfig, ModelConfig  # noqa: E402
 from osworld_agent.model import ChatModel             # noqa: E402
 from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
 from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
@@ -289,7 +298,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Windows 本地手动任务运行器")
     parser.add_argument("--task", required=True, help="自由文本任务描述")
     parser.add_argument("--model", default=os.getenv("OSWORLD_LOCAL_MODEL", "Qwen3.5-9B"))
-    parser.add_argument("--model-url", default=os.getenv("OSWORLD_LOCAL_MODEL_URL", "http://7.246.80.189:9028/v1"))
+    parser.add_argument("--model-url", default=os.getenv("OSWORLD_LOCAL_MODEL_URL", "http://7.246.80.237:9028/v1"))
     parser.add_argument("--ground-model", default=os.getenv("OSWORLD_LOCAL_GROUND_MODEL", "UI-Venus-2-9B"))
     parser.add_argument("--ground-url", default=os.getenv("OSWORLD_LOCAL_GROUND_URL", "http://7.246.80.189:8001/v1"))
     parser.add_argument("--ground-type", choices=("ui-venus2", "ui-tars"),
@@ -298,6 +307,12 @@ def main() -> int:
     parser.add_argument("--ground-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_GROUND_TIMEOUT", "60")))
     parser.add_argument("--step-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_STEP_TIMEOUT", "120")))
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--execution-mode", choices=("browser_first", "desktop"),
+                        default=os.getenv("OSWORLD_LOCAL_EXECUTION_MODE", "browser_first"),
+                        help="browser_first 优先按计划进入独立浏览器；desktop 保留通用桌面流程")
+    parser.add_argument("--ax-max-chars", type=int, default=5000, help="浏览器精简 AX 的字符上限")
+    parser.add_argument("--screenshot-max-edge", type=int, default=1280,
+                        help="浏览器模型输入截图最长边像素数")
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
@@ -308,6 +323,10 @@ def main() -> int:
     if any(value <= 0 or not math.isfinite(value)
            for value in (args.model_timeout, args.ground_timeout, args.step_timeout)):
         parser.error("模型、定位及每步超时必须为有限正数")
+    if min(args.max_steps, args.ax_max_chars, args.screenshot_max_edge) <= 0:
+        parser.error("最大步数、AX 字符预算及截图最长边必须为正整数")
+    context_config = ContextConfig(ax_max_chars=args.ax_max_chars,
+                                   screenshot_max_edge=args.screenshot_max_edge)
 
     # 0) 在 GUI 库初始化前统一 DPI；每次任务按 Windows 主屏标志选择默认工作屏幕。
     dpi_awareness = initialize_dpi_awareness()
@@ -333,6 +352,8 @@ def main() -> int:
     print(f"[grounding] {args.ground_model} type={args.ground_type} url={args.ground_url} "
           f"timeout={args.ground_timeout:g}s attempts=1; step_budget={args.step_timeout:g}s", flush=True)
     print(f"[trajectory] 执行前记录和每步轨迹实时保存到: {args.result_dir}", flush=True)
+    print(f"[browser] mode={args.execution_mode} AX<={args.ax_max_chars} chars "
+          f"screenshot_edge<={args.screenshot_max_edge}px", flush=True)
     env = None
     result = None
     try:
@@ -352,16 +373,21 @@ def main() -> int:
         env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
                                  downloads_dir=args.download_dir,
                                  browser_launcher=lambda: ensure_chrome(args.browser_port, args.chrome),
-                                 work_screen=work_screen)
+                                 execution_mode=args.execution_mode,
+                                 screenshot_max_edge=args.screenshot_max_edge,
+                                 work_screen=work_screen,
+                                 presentation_state_path=os.path.join(args.result_dir, "window_presentation.json"))
 
         # 4) 组装 + 跑，保留 1010 的规划流水线
         agent = Agent(decision_model=model, grounding=grounding, env=env,
                       max_steps=args.max_steps, enable_reflection=False,
                       step_callback=_live_step, progress_callback=recorder.on_progress,
-                      step_timeout=args.step_timeout)
+                      step_timeout=args.step_timeout, context_config=context_config)
         reset_collected()
         log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps,
-                    "work_screen": work_screen.to_dict(), "dpi_awareness": dpi_awareness})
+                    "work_screen": work_screen.to_dict(), "dpi_awareness": dpi_awareness,
+                    "execution_mode": args.execution_mode,
+                    "ax_max_chars": args.ax_max_chars, "screenshot_max_edge": args.screenshot_max_edge})
         print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)
     except BaseException as exc:

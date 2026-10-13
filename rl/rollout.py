@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import List
 
 from .semantic import semantic_action
 
@@ -20,7 +20,7 @@ class RolloutResult:
     """一次 rollout 的产物（RL 训练最小可用）。"""
     instruction: str
     semantic_actions: List[str] = field(default_factory=list)  # 每步语义动作（不含坐标）
-    score: float = 0.0                 # OSWorld 最终 reward（0/1）
+    score: float = 0.0                 # 保留 AgentResult.score；不冒充独立环境 reward
     success: bool = False
     steps: int = 0
     final_answer: str = ""
@@ -32,11 +32,22 @@ class RolloutResult:
 def run_rollout(agent, instruction: str, max_steps: int = 20) -> RolloutResult:
     """跑一条 rollout（单任务）。
 
-    agent：本框架的 Agent（含 decision_model / grounding / env）。
-    每次调用都会 env.reset（Agent.run 内部 Pipeline 第一次 preprocess 时 reset），
-    所以可复用同一个 agent 对同一任务跑 N 次。
+    agent：连接 Windows 本机环境的 Agent（含 model / grounding / env）。
+    reset 仅刷新会话与观察，不还原用户文件或网页状态。重复实验前，调用方
+    必须自行恢复本机任务初始状态。max_steps 只在本次运行期间生效。
     """
-    result = agent.run(instruction)
+    env = getattr(agent, "env", None)
+    if (getattr(env, "os_name", None) != "windows"
+            or getattr(env, "local_environment", False) is not True):
+        raise ValueError("rollout 仅支持 Windows 本机环境")
+    if type(max_steps) is not int or max_steps <= 0:
+        raise ValueError("max_steps 必须是正整数")
+    previous_max_steps = agent.max_steps
+    try:
+        agent.max_steps = max_steps
+        result = agent.run(instruction)
+    finally:
+        agent.max_steps = previous_max_steps
 
     semantic_actions: List[str] = []
     for step in (result.trajectory or []):
@@ -55,5 +66,10 @@ def run_rollout(agent, instruction: str, max_steps: int = 20) -> RolloutResult:
 
 
 def run_rollouts(agent, instruction: str, n: int, max_steps: int = 20) -> List[RolloutResult]:
-    """对同一任务跑 N 次 rollout，返回 N 条语义轨迹（语义树的输入）。"""
+    """收集 N 条连续本机轨迹，不承诺自动恢复相同初始状态。
+
+    需要独立样本时，调用方应逐次调用 run_rollout 并在两次之间恢复任务状态。
+    """
+    if type(n) is not int or n < 0:
+        raise ValueError("n 必须是非负整数")
     return [run_rollout(agent, instruction, max_steps) for _ in range(n)]

@@ -33,7 +33,7 @@ class ActionSpec:
     name: str
     params: List[str] = field(default_factory=list)
     description: str = ""
-    kind: str = "env"          # env / uno / shell / subagent / terminal / memory
+    kind: str = "env"          # env / shell / subagent / terminal / memory
     resolve: str = "none"      # none / point / select / drag
 
 
@@ -171,6 +171,13 @@ def validate_action(act: Action) -> Optional[str]:
         keys = act.args.get("keys")
         if not isinstance(keys, list) or not keys:
             return "hotkey 的 keys 必须是非空列表"
+    if act.action == "complete_subtask":
+        if any(not isinstance(act.args.get(k), str) or not act.args[k].strip()
+               for k in ("step_id", "result", "evidence")):
+            return "complete_subtask 的 step_id、result、evidence 必须是非空字符串"
+        refs = act.args.get("evidence_refs", [])
+        if not isinstance(refs, list) or any(not isinstance(ref, str) or not ref for ref in refs):
+            return "evidence_refs 必须是节点引用字符串数组"
     return None
 
 

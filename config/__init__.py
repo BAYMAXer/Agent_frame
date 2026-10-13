@@ -32,8 +32,8 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 @dataclass
 class ModelConfig:
     """决策模型的连接配置。"""
-    name: str = "9b"
-    url: str = "http://7.246.80.237:9028/v1"
+    name: str = "Qwen3.5-9B"
+    url: str = "http://7.246.80.189:9028/v1"
     api_key: str = "EMPTY"
     temperature: float = 0.3
     max_tokens: int = 2048
@@ -46,12 +46,13 @@ class ModelConfig:
 @dataclass
 class GroundingConfig:
     """视觉定位模型的连接配置。"""
-    name: str = "ui_tars_7b"
-    url: str = "http://7.246.80.237:49999/v1"
+    name: str = "UI-Venus-2-9B"
+    url: str = "http://7.246.80.189:8001/v1"
     api_key: str = "EMPTY"
     width: int = 1920
     height: int = 1080
     timeout: float = 60.0
+    type: str = "ui-venus2"
 
 
 @dataclass
@@ -61,18 +62,23 @@ class AgentConfig:
     max_retries: int = 3
     enable_reflection: bool = True
     early_stop_repeat: int = 3
+    step_timeout: float = 120.0
 
 
 @dataclass
 class EnvConfig:
-    """环境（OSWorld）的配置。"""
-    provider: str = "osworld"
-    os: str = "linux"               # 目标机操作系统：linux / mac / windows（决定终端命令的 shell）
-    vm_path: str = "/data/osworld-agent-s/vm/uploaded/Ubuntu.qcow2"
-    sleep_after_execution: float = 1.5
-    headless: bool = False
+    """本地 Windows 环境；浏览器默认使用独立无痕实例。"""
     screen_width: int = 1920
     screen_height: int = 1080
+    execution_mode: str = "browser_first"
+    browser_port: int = 9222
+    chrome_path: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    downloads_dir: Optional[str] = None
+    action_settle_seconds: float = 0.3
+
+    def __post_init__(self):
+        if not isinstance(self.execution_mode, str) or self.execution_mode not in {"desktop", "browser_first"}:
+            raise ValueError("execution_mode 必须是 desktop 或 browser_first")
 
 
 @dataclass
@@ -88,7 +94,15 @@ class ContextConfig:
     memory_tokens: int = 2200
     auxiliary_tokens: int = 1200
     structure_tokens: int = 5000
+    ax_max_chars: int = 5000  # 浏览器精简 AX 的字符上限，与 structure_tokens 的 token 预算独立
+    screenshot_max_edge: int = 1280  # 浏览器模型输入截图最长边；保留原始坐标用于操作
     tokenizer_path: str = ""  # 本地 tokenizer；不填则按 UTF-8 字节保守预算
+
+    def __post_init__(self):
+        for name in ("ax_max_chars", "screenshot_max_edge"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} 必须是正整数")
 
 
 @dataclass

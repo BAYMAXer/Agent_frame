@@ -2,7 +2,7 @@
 
 对齐原 Agent-S3 的 code_agent：
 - 独立的对话循环 + 步数预算（默认 20 步）；
-- 每步生成 python / bash / note 代码块，在目标机执行；
+- 每步生成 python / cmd / note 代码块，在 Windows 本机执行；
 - 自己的 notes（key->value），跨步持久，最后随结果返回主 Agent；
 - 返回结构化结果：task / steps / budget / completion_reason / summary / notes / execution_history。
 
@@ -15,11 +15,11 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-CODE_AGENT_PROMPT = """你是一个代码执行子 Agent，有有限的步数预算，通过逐步执行 Python / Bash 代码完成任务。
+CODE_AGENT_PROMPT = """你是一个 Windows 本机代码执行子 Agent，有有限的步数预算，通过逐步执行 Python / cmd 代码完成任务。
 
 ## 工作方式
 - 增量逐步：每步只做一件小事，写完整、独立的代码片段（每步的代码不会跨步持久）。
-- 用 sudo 时：echo password | sudo -S <命令>；用户名是 user。
+- 命令使用 Windows cmd 语法（dir / type / findstr），复杂文件操作优先用 Python 标准库。
 - 执行后打印结果，出错就根据报错改下一步。
 - 【重要】直接输出代码块或 DONE/FAIL，不要输出任何思考、解释、分析或重复内容。
 
@@ -28,13 +28,13 @@ Python 代码：
 ```python
 你的代码
 ```
-Bash 命令：
-```bash
+Windows cmd 命令（由 cmd /c 执行）：
+```cmd
 你的命令
 ```
 【看图片】读取一张图片（照片/截图/扫描件）的内容，直接输出图片文件路径：
 ```view
-/home/user/Desktop/receipt.png
+C:/Users/Administrator/Desktop/receipt.png
 ```
 存一条中间结果（供后续步骤和主 Agent 使用）：
 ```note
@@ -48,32 +48,23 @@ FAIL
 
 ## 关键原则
 - 你能【看图】：要读取图片/截图/扫描件里的数据时，用 ```view 块输出文件路径（下一步图片会显示给你看），不要 pip install tesseract 装 OCR。
-- 要读网页上的内容（Google 地图/搜索等 JS 渲染的页面），先用 pyautogui.screenshot 存成 PNG，再用 ```view 看，不要用 requests 抓（业务数据是 JS 渲染的，HTML 里没有）。
+- 网页操作交由主智能体的 browser use 链路处理，本子 Agent 只处理本机文件和数据。
 - 完成前，把所有主 Agent 后续需要的数据都存进 ```note 块（key=值）。
-- 修改文件后，用 cat / print 打印最终内容验证。
-- 只读文件用 unzip -p / python 标准库，别浪费步数 pip install 缺的包。
-- 用 openpyxl/python-docx 改表格/文档时，直接改已打开的文件（原地改），别新建文件；改完 store 落盘。
+- 修改文件后，用 type / print 打印最终内容验证。
+- 只读文件用 Python 标准库（zipfile / pathlib），避免无必要的依赖安装。
+- 用 openpyxl/python-docx 改表格/文档时，直接改指定文件；改完保存到原文件。
 """
 
 
-def build_code_agent_prompt(os_name: str) -> str:
-    """让子 Agent 的命令语法与目标机一致。"""
-    if (os_name or "linux").lower() != "windows":
-        return CODE_AGENT_PROMPT
-    return (CODE_AGENT_PROMPT
-            .replace("Python / Bash", "Python / Windows cmd")
-            .replace("- 用 sudo 时：echo password | sudo -S <命令>；用户名是 user。",
-                     "- 目标机是 Windows。命令使用 cmd 语法（dir / type / findstr），复杂文件操作优先用 Python 标准库。")
-            .replace("Bash 命令：", "Windows cmd 命令（仍用 bash 标签提交，执行器实际调用 cmd /c）：")
-            .replace("/home/user/Desktop/receipt.png", "C:/Users/Administrator/Desktop/receipt.png")
-            .replace("用 cat / print 打印最终内容验证", "用 type / print 打印最终内容验证")
-            .replace("只读文件用 unzip -p / python 标准库", "只读文件用 Python 标准库（如 zipfile / pathlib）")
-            .replace("改完 store 落盘", "改完保存到原文件"))
+def build_code_agent_prompt(os_name: str = "windows") -> str:
+    if (os_name or "windows").lower() != "windows":
+        raise ValueError("仅支持 Windows 本机子 Agent")
+    return CODE_AGENT_PROMPT
 
 
 def _extract_code_block(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """从 code agent 输出里提取第一个 ```python/```bash/```note/```view 块。返回 (type, code)。"""
-    m = re.search(r"```(python|bash|note|view)\s*\n(.*?)```", text, re.DOTALL)
+    """提取第一个 Windows 本机代码块。"""
+    m = re.search(r"```(python|cmd|note|view)\s*\n(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1), m.group(2).strip()
     return None, None
@@ -102,16 +93,6 @@ class CodeAgent:
 
     def _read_image(self, path: str):
         """读目标机里的图片文件，返回 bytes（供 view 块给模型看）。失败返回 None。"""
-        ctrl = getattr(self.env, "controller", None)
-        if ctrl is not None:
-            get_file = getattr(ctrl, "get_file", None)
-            if get_file is not None:
-                try:
-                    data = get_file(path)
-                    if data:
-                        return data
-                except Exception:  # noqa: BLE001
-                    pass
         if getattr(self.env, "local_environment", False) is True:
             try:
                 return Path(path).read_bytes()
@@ -121,7 +102,7 @@ class CodeAgent:
 
     def execute(self, task_instruction: str) -> Dict[str, Any]:
         messages = [
-            {"role": "system", "content": build_code_agent_prompt(getattr(self.env, "os_name", "linux"))},
+            {"role": "system", "content": build_code_agent_prompt(getattr(self.env, "os_name", "windows"))},
             {"role": "user", "content": f"## 任务\n{task_instruction}\n\n请开始第一步。"},
         ]
         execution_history: List[Dict[str, str]] = []
@@ -148,7 +129,7 @@ class CodeAgent:
                     summary = "连续多次未输出代码块（模型陷入无效思考），提前终止。"
                     break
                 messages.append({"role": "assistant", "content": raw})
-                messages.append({"role": "user", "content": "请只输出一个 ```python / ```bash / ```note 代码块，或 DONE / FAIL。不要输出思考或解释。"})
+                messages.append({"role": "user", "content": "请只输出一个 ```python / ```cmd / ```note 代码块，或 DONE / FAIL。不要输出思考或解释。"})
                 continue
 
             no_code_streak = 0
@@ -157,9 +138,9 @@ class CodeAgent:
             if code_type == "python":
                 result = self.env.run_python(code)
                 history_entry = {"type": "python", "code": code[:200], "result": result[:500]}
-            elif code_type == "bash":
+            elif code_type == "cmd":
                 result = self.env.run_command(code)
-                history_entry = {"type": "bash", "code": code[:200], "result": result[:500]}
+                history_entry = {"type": "cmd", "code": code[:200], "result": result[:500]}
             elif code_type == "view":
                 viewed_image = self._read_image(code)
                 if viewed_image is not None:

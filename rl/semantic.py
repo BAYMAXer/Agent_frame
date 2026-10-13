@@ -27,7 +27,6 @@ _SEMANTIC_ARGS: Dict[str, Tuple[str, ...]] = {
     "goto": ("url",),
     "select": ("target", "option", "target_ref"),
     "drag_and_drop": ("from_target", "to_target"),
-    "set_cell_values": ("new_cell_values", "app_name", "sheet_name"),
     "save": ("app_name",),
     "switch_applications": ("app_code",),
     "wait": ("seconds",),
