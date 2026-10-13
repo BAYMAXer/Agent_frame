@@ -503,6 +503,15 @@ class WindowsEnvironment(Environment):
         info = dict(result)
         return StepResult(observation=obs, info=info)
 
+    def probe_actionability(self, action, route):
+        """Read current DOM hit testing without dispatching an environment action."""
+        if not self._focus_is_browser():
+            return {"actionable": False, "dispatched": False, "error": "Browser lost focus"}
+        session = self._get_browser_session()
+        if session is None:
+            return {"actionable": False, "dispatched": False, "error": "Browser session unavailable"}
+        return session.probe_actionability(action, route)
+
     def _browser_focus_rejected(self):
         self._invalidate_browser_snapshot()
         return StepResult(observation=self._fresh_obs_after_action(),

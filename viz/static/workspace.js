@@ -418,6 +418,14 @@ function browserContextText(entry,planPayload) {
     if (capture.snapshot_id) lines.push('观察快照：'+capture.snapshot_id);
     if (capture.timing_ms!=null) lines.push('网页捕获：'+formatElapsed(Number(capture.timing_ms)/1000));
   }
+  const execution=entry?.execution_info || entry?.execution || {};
+  if (execution.actionability) lines.push('点击位置：'+execution.actionability.point_source+' · 检查 '+execution.actionability.candidates_checked+' 个候选点');
+  if (execution.occlusion) {
+    const blocker=execution.occlusion.blocker || {};
+    lines.push('遮挡者：'+[blocker.role,blocker.tag,blocker.name].filter(Boolean).join(' · '));
+    if (execution.occlusion.suggestion) lines.push('恢复建议：'+execution.occlusion.suggestion);
+  }
+  if (execution.recovery) lines.push('程序恢复：'+execution.recovery.kind+' · '+(execution.recovery.succeeded?'已解决':'未解决'));
   if (entry?.phase) lines.push('阶段：'+entry.phase);
   if (entry?.previous_phase_elapsed_ms!=null) lines.push('上一阶段 '+(entry.previous_phase || '')+'：'+formatElapsed(Number(entry.previous_phase_elapsed_ms)/1000));
   if (entry?.timing_ms) lines.push('阶段耗时：'+Object.entries(entry.timing_ms).map(([name,ms]) => name+' '+formatElapsed(Number(ms)/1000)).join(' · '));
@@ -430,10 +438,12 @@ function renderBrowserContext() {
   const evidence=[...candidates].reverse().find(item => item.prompt_metadata?.browser_selection);
   const timing=[...candidates].reverse().find(item => item.timing_ms);
   const observation=[...candidates].reverse().find(item => item.observation?.info?.capture || item.capture);
+  const execution=[...candidates].reverse().find(item => item.execution_info);
   const details={...evidence,...entry,
     prompt_metadata:entry?.prompt_metadata?.browser_selection?entry.prompt_metadata:evidence?.prompt_metadata,
     observation:entry?.observation?.info?.capture?entry.observation:observation?.observation,
     capture:entry?.capture || observation?.capture,
+    execution_info:entry?.execution_info || execution?.execution_info,
     timing_ms:entry?.timing_ms || timing?.timing_ms};
   const selection=details.prompt_metadata?.browser_selection;
   setText('browser-context-meta',selection?(selection.selected_count ?? selection.selected ?? '—')+' AX 节点':details.phase || '暂无选区');
@@ -491,7 +501,7 @@ function ioText(entry,tab) {
   }
   if (entry.kind==='model') return entry.pending?'模型请求已发送，等待响应…':(entry.raw_response?actionText(entry.raw_response)+'\n\n解析结果：\n'+actionText(entry.response):actionText(entry.response)) || (entry.error?'模型调用失败，未返回文本。':'模型返回空文本。');
   const details={};
-  for (const key of ['action','status','error','result','success','reward','plan','verification','execution','prompt_metadata','observation','plan_step_id','timing_ms','phase']) if (entry[key]!=null) details[key]=entry[key];
+  for (const key of ['action','status','error','result','success','reward','plan','verification','execution','execution_info','prompt_metadata','observation','plan_step_id','timing_ms','phase']) if (entry[key]!=null) details[key]=entry[key];
   return (eventLabels[entry.event] || entry.event || '状态事件')+(Object.keys(details).length?'\n\n'+JSON.stringify(details,null,2):'\n\n'+(entry.instruction || '事件已记录。'));
 }
 function writeInspectorPanel(id,text,scope) {

@@ -295,6 +295,7 @@ def build_subtask_system_prompt(os_name="windows", mode="browser", action_regist
 - 找不到节点时先刷新观察、扩大 AX，再使用浏览器图像兜底；不调用桌面截图定位。
 - 若提供浏览器截图，它仅用于不确定结果核验或视觉兜底；按截图说明理解坐标和尺寸。
 - 上一步 status=uncertain 且 dispatched=true 时先从最新观察核验实际效果，不能直接重复发送动作。
+- 上一步 error_code=target_occluded 或 occlusion_unchanged 时，读取 occlusion 的遮挡者和建议，结合当前浏览器截图先处理遮挡；新 snapshot_id 本身不代表遮挡已经消失，不能重复同一目标点击。搜索输入已正确且焦点确认在搜索框时，可用 press Enter 提交；先处理自动补全时用 Escape。结果链接优先选择匹配标题的当前 AX 引用，不能点击旁边的翻译、详情或其它独立按钮来代替打开论文。
 - complete_subtask 另带当前 snapshot_id 和 evidence_refs（支持结论的节点引用）；result 保存具体答案、网址或产物，evidence 描述观察事实。动作已发送不代表目标已完成。
 - 若 AX 标记 degraded 或当前输入要求视觉兜底，以当前浏览器截图中的内容作证；没有可用节点时 evidence_refs 可为空，由程序独立核验截图。URL和网页标题含关键词不能代替实际结果内容。
 - 完成申请被拒后读取拒绝原因和新观察，不原样重发同一申请。先取得新的完成证据，或改变操作策略；搜索结果中相似论文不等于已找到指定论文。

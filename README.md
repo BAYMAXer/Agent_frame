@@ -2,7 +2,7 @@
 
 Windows 本机浏览器与桌面 Agent 框架。默认采用浏览器优先流程，保留通用 Windows 桌面兼容模式。
 
-当前版本：**0.3.1**（[v0.3.1 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.3.1)）。
+当前版本：**0.3.2**（[v0.3.2 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.3.2)）。
 
 源码直接位于仓库根目录，不同版本通过 Git 标签保存。本版本的发布源码不包含测试文件。
 
@@ -32,4 +32,5 @@ python -m venv .venv
 | [v0.2.2](https://github.com/BAYMAXer/Agent_frame/tree/v0.2.2) | osworld_agent_1010 的 0.2.2 版本，不含测试文件 |
 | [v0.2.3](https://github.com/BAYMAXer/Agent_frame/tree/v0.2.3) | osworld_agent_1010 的 0.2.3 版本，不含测试文件 |
 | [v0.3.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.0) | osworld_agent_1010 的 0.3.0 版本，不含测试文件 |
-| [v0.3.1](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.1) | osworld_agent_1010 当前版本，不含测试文件 |
+| [v0.3.1](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.1) | osworld_agent_1010 的 0.3.1 版本，不含测试文件 |
+| [v0.3.2](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.2) | osworld_agent_1010 当前版本，不含测试文件 |

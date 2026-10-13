@@ -118,6 +118,7 @@ class StepState:
     browser_refresh_pending: bool = False
     browser_selection_cache: Dict[str, Any] = field(default_factory=dict)
     rejected_completion: Dict[str, Any] = field(default_factory=dict)
+    occluded_action: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -318,6 +319,7 @@ class Pipeline:
                     _viz_log_status({"event": "executed", "step": step_no,
                                      "status": (execution.info or {}).get("status", ""),
                                      "action": (execution.info or {}).get("action", "") or action.action,
+                                     "execution_info": copy.deepcopy(execution.info),
                                      "error": (execution.info or {}).get("error", "")})
                 except Exception:  # noqa: BLE001
                     pass
@@ -361,6 +363,7 @@ class Pipeline:
                     _viz_log_status({"event": "browser_observation", "step": step_no,
                         "plan_step_id": state.action_plan_step_id,
                         "prompt_metadata": state.prompt_metadata,
+                        "execution_info": copy.deepcopy(execution.info),
                         "observation": {"info": copy.deepcopy(state.obs.info) if state.obs else {}},
                         "timing_ms": entry.get("timing_ms", {}) if entry else {}})
                 except Exception:
@@ -463,6 +466,7 @@ class Pipeline:
                 state.browser_visual_required = False
                 state.browser_refresh_pending = False
                 state.rejected_completion = {}
+                state.occluded_action = {}
                 state.uncertain_action = {}
                 state.no_change_count = 0
                 state.action_keys.clear()
@@ -701,6 +705,33 @@ class Pipeline:
         except Exception:  # noqa: BLE001
             state.route = None
         if state.route is not None:
+            if (self.browser_first and state.route.get("channel") == "browser_dom"
+                    and state.occluded_action and action.action in {"click", "double_click", "right_click"}
+                    and self._browser_action_identity(action, state) == state.occluded_action.get("identity")
+                    and self._completion_fingerprint(state, {}, images=(True,)) == state.occluded_action.get("observation")):
+                probe = getattr(self.env, "probe_actionability", None)
+                checked = None
+                if callable(probe):
+                    self._check_step_budget("occlusion_probe")
+                    try:
+                        checked = probe(action, state.route)
+                    except ModelRequestTimeout:
+                        raise
+                    except Exception as exc:
+                        checked = {"actionable": False, "error": f"遮挡复查失败：{type(exc).__name__}"}
+                occlusion = (checked or {}).get("occlusion", state.occluded_action.get("occlusion", {}))
+                new_autocomplete = (occlusion.get("recovery_allowed") is True
+                    and occlusion.get("autocomplete") != state.occluded_action.get("occlusion", {}).get("autocomplete"))
+                if checked and (checked.get("actionable") is True or new_autocomplete):
+                    state.occluded_action = {}
+                else:
+                    still_occluded = checked is None or checked.get("error_code") == "target_occluded"
+                    reason = ("目标仍被遮挡，观察没有改变，已阻止重复点击。先处理遮挡控件、改变滚动位置或选择当前暴露的标题链接；"
+                              "搜索框已输入正确查询时可在确认焦点后按 Enter 提交。" if still_occluded else
+                              str(checked.get("error") or "无法确认目标当前可点击，请重新观察"))
+                    state.route = {"channel": "reobserve", "refresh_observation": True,
+                        "error_code": "occlusion_unchanged" if still_occluded else checked.get("error_code", "actionability_probe_failed"),
+                        "occlusion": occlusion, "reason": reason}
             state.last_grounding_coord = None
             state.resolved_action = action
             return action
@@ -781,7 +812,9 @@ class Pipeline:
             obs = refresh() if state.route.get("refresh_observation") and callable(refresh) else None
             return Execution(kind="browser_dom", outcome=state.route.get("reason", "需重新观察"),
                              executed="rejected", obs=obs,
-                             info={"status": "rejected", "dispatched": False})
+                             info={"status": "rejected", "dispatched": False,
+                                   "error": state.route.get("reason", "需重新观察"),
+                                   **{key: state.route[key] for key in ("error_code", "occlusion") if key in state.route}})
 
         if is_skill(name):
             out = run_skill(name, action.args, state.skill_ctx)
@@ -942,11 +975,23 @@ class Pipeline:
             if subtask and subtask["mode"] == "browser":
                 if info.get("status") in {"rejected", "failed", "failure", "error"}:
                     state.browser_recovery_level = min(2, state.browser_recovery_level + 1)
+                    occluded = (info.get("error_code") in {"target_occluded", "occlusion_unchanged"}
+                                or str(info.get("error", "")).strip() == "occluded")
+                    if occluded:
+                        state.browser_recovery_level = 2
+                        state.occluded_action = {
+                            "identity": state.action_identity or self._browser_action_identity(decision.action, state),
+                            "observation": self._completion_fingerprint(state, {}, images=(True,)),
+                            "occlusion": copy.deepcopy(info.get("occlusion", {}))}
+                        state.memory.add_event("检测到持续遮挡：下轮提供浏览器 viewport 截图和遮挡者信息，先处理遮挡或换操作方式，不能重发相同点击。")
                     state.browser_no_progress_count += 1
                     state.memory.add_event(f"当前子任务恢复 {state.browser_recovery_level}：{info.get('error') or execution.outcome}")
                 elif info.get("status") in {"executed", "already_downloaded"}:
                     state.browser_no_progress_count = 0
                     state.rejected_completion = {}
+                    if (state.occluded_action and self._completion_fingerprint(state, {}, images=(True,))
+                            != state.occluded_action.get("observation")):
+                        state.occluded_action = {}
             if plan_changed:
                 state.no_change_count = 0
                 state.action_keys.clear()
@@ -1202,6 +1247,8 @@ class Pipeline:
                     "control_state": memory.control_state,
                     "browser_recovery_level": state.browser_recovery_level,
                     "browser_visual_required": state.browser_visual_required,
+                    "occlusion_recovery": {key: value for key, value in state.occluded_action.items()
+                                           if key != "observation"},
                     "recent_events": memory.recent_events[-2:],
                     "failure_memory": memory.failure_memory[-2:],
                     "forbidden_repeats": memory.forbidden_repeats[-2:]}

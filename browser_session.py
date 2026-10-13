@@ -711,6 +711,180 @@ class BrowserSession:
         return None
 
     # ---- execute ----
+    _ACTIONABILITY_INSPECT = """function() {
+      const target=this;
+      if (!target.isConnected || !(target instanceof Element)) return {error:'detached'};
+      if (target.matches(':disabled') || target.getAttribute('aria-disabled')==='true' || target.closest('[inert]')) return {error:'disabled'};
+      const rect=target.getBoundingClientRect(), style=getComputedStyle(target);
+      if (rect.width<=0 || rect.height<=0 || style.visibility!=='visible' || style.display==='none') return {error:'hidden'};
+      const parent=el=>el.parentElement || (el.getRootNode && el.getRootNode().host) || null;
+      const within=(root,el)=>{for(let i=0;el && i<64;i++,el=parent(el))if(el===root)return true;return false};
+      const independent=el=>el.hasAttribute('onclick') || typeof el.onclick==='function' || el.matches('a[href],button,input,select,textarea,summary,label[for],[contenteditable]:not([contenteditable="false"]),[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[role="textbox"],[role="searchbox"],[role="menuitem"],[role="option"],[role="tab"]');
+      const nestedControl=el=>{for(let i=0;el && el!==target && i<64;i++,el=parent(el))if(independent(el))return el;return null};
+      const role=el=>el.getAttribute('role') || ({BUTTON:'button',A:'link',SELECT:'combobox',TEXTAREA:'textbox',INPUT:el.type==='submit' || el.type==='button'?'button':el.type==='search'?'searchbox':'textbox'}[el.tagName] || '');
+      const describe=el=>{
+        if(!el)return {role:'',tag:'',name:'',id:''};
+        const labelled=(el.getAttribute('aria-labelledby') || '').split(/\\s+/).slice(0,4).map(id=>document.getElementById(id)?.textContent || '').join(' ');
+        return {role:role(el),tag:el.tagName.toLowerCase(),name:String(el.getAttribute('aria-label') || labelled || el.getAttribute('alt') || el.getAttribute('title') || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0,160),id:(el.id || '').slice(0,160)};
+      };
+      const visible=el=>{const r=el.getBoundingClientRect(),s=getComputedStyle(el);return r.width>0 && r.height>0 && s.display!=='none' && s.visibility==='visible'};
+      const candidates=[],seen=new Set();
+      const addRect=(r,source,grid=false)=>{
+        const left=Math.max(0,r.left),right=Math.min(innerWidth,r.right),top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom);
+        if(right-left<1 || bottom-top<1)return;
+        for(const [fx,fy] of grid?[[.5,.5],[.2,.5],[.8,.5],[.5,.2],[.5,.8]]:[[.5,.5]]){
+          if(candidates.length>=24)return;
+          const x=left+(right-left)*fx,y=top+(bottom-top)*fy,key=x.toFixed(2)+','+y.toFixed(2);
+          if(!seen.has(key)){seen.add(key);candidates.push({x,y,source})}
+        }
+      };
+      // Titles are a better point than the center of an entire result/card link.
+      for(const heading of Array.from(target.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]')).slice(0,3)){
+        if(!nestedControl(heading))for(const r of Array.from(heading.getClientRects()).slice(0,2))addRect(r,'heading');
+      }
+      const walker=document.createTreeWalker(target,NodeFilter.SHOW_TEXT);
+      for(let n=walker.nextNode(),visited=0;n && visited<64 && candidates.length<10;n=walker.nextNode(),visited++){
+        if(!n.textContent.trim() || nestedControl(n.parentElement))continue;
+        const range=document.createRange();range.selectNodeContents(n);
+        for(const r of Array.from(range.getClientRects()).slice(0,2))addRect(r,'text');
+      }
+      for(const r of Array.from(target.getClientRects()).slice(0,3))addRect(r,'client_rect',true);
+      addRect(rect,'bounding_rect',true);
+      let blocker=null,nested=null;
+      for(const point of candidates){
+        let hit=document.elementFromPoint(point.x,point.y);
+        for(let i=0;hit && hit.shadowRoot && hit.shadowRoot.elementFromPoint && i<16;i++){
+          const next=hit.shadowRoot.elementFromPoint(point.x,point.y);if(!next || next===hit)break;hit=next;
+        }
+        const own=hit && within(target,hit),child=own?nestedControl(hit):null;
+        if(own && !child)return {x:point.x,y:point.y,w:rect.width,h:rect.height,tag:target.tagName.toLowerCase(),readOnly:!!target.readOnly,
+          editable:target.isContentEditable || target.tagName==='TEXTAREA' || (target.tagName==='INPUT' && !['button','submit','checkbox','radio','file'].includes(target.type)),point_source:point.source,candidates_checked:candidates.indexOf(point)+1};
+        if(!blocker || (nested && !child)){blocker=child || hit;nested=child}
+      }
+      let active=document.activeElement;
+      for(let i=0;active?.shadowRoot?.activeElement && i<16;i++)active=active.shadowRoot.activeElement;
+      const modalSelector='[aria-modal="true"],dialog[open],[role="dialog"],[role="alertdialog"]';
+      let modal=null,modalScanComplete=true;
+      const roots=[document],knownRoots=new Set(roots);
+      const addRoot=root=>{if(root && !knownRoots.has(root)){knownRoots.add(root);roots.push(root)}};
+      // Modal ownership may cross a shadow boundary. Check relevant composed
+      // ancestors first, including a root reached by a resolved closed-shadow node.
+      for(const seed of [target,active,blocker]){
+        let el=seed,i=0;
+        for(;el && i<64;i++,el=parent(el)){
+          addRoot(el.getRootNode());
+          if(el.matches(modalSelector) && visible(el)){modal=el;break}
+        }
+        if(el && i>=64)modalScanComplete=false;
+        if(modal)break;
+      }
+      // Scan all accessible open roots, without declaring the first 16 hidden
+      // dialogs to be exhaustive. An unfinished bounded scan cannot authorize Esc.
+      let inspected=0;
+      for(let rootIndex=0;!modal && rootIndex<roots.length;rootIndex++){
+        if(rootIndex>=64){modalScanComplete=false;break}
+        const elements=document.createTreeWalker(roots[rootIndex],NodeFilter.SHOW_ELEMENT);
+        for(let el=elements.nextNode();el;el=elements.nextNode()){
+          if(++inspected>8192){modalScanComplete=false;break}
+          if(el.matches(modalSelector) && visible(el)){modal=el;break}
+          if(el.shadowRoot)addRoot(el.shadowRoot);
+        }
+        if(!modalScanComplete)break;
+      }
+      let popup=null,association=null;
+      const input=active && (active.matches('textarea') || active.isContentEditable ||
+        (active.tagName==='INPUT' && ['text','search','email','url','tel','number'].includes(active.type)));
+      if(input && active.getAttribute('aria-expanded')!=='false' && !modal && modalScanComplete && !nested){
+        const ids=((active.getAttribute('aria-controls') || '')+' '+(active.getAttribute('aria-owns') || '')).trim().split(/\\s+/).slice(0,8);
+        for(const id of ids){
+          const root=active.getRootNode().getElementById?.(id) || document.getElementById(id);
+          if(!root || !visible(root) || !within(root,blocker))continue;
+          const list=root.matches('[role="listbox"]')?root:root.querySelector('[role="listbox"]');
+          if(list && visible(list) && within(list,blocker)){popup=root;break}
+        }
+        const form=target.form || target.closest('form'),inputForm=active.form || active.closest('form');
+        const search=target.closest('[role="search"]'),inputSearch=active.closest('[role="search"]');
+        const button=target.matches('button,input[type="submit"],input[type="button"],[role="button"]');
+        const submit=target.matches('button,input') && target.type==='submit';
+        const searchButton=button && /search|搜索|搜尋/i.test(describe(target).name);
+        const menu=target.hasAttribute('aria-haspopup') && target.getAttribute('aria-haspopup')!=='false';
+        if(target===active)association='focused_input';
+        else if(button && !menu && (submit || searchButton) && ((form && form===inputForm) || (search && search===inputSearch)))association=submit?'same_form_submit':'same_search_button';
+      }
+      const allowed=!!(popup && association);
+      const relationship=modal?'modal':!modalScanComplete?'unverified_modal_state':allowed?'focused_autocomplete':nested?'nested_control':'unrelated';
+      return {error:'occluded',error_code:'target_occluded',occlusion:{blocker:describe(blocker),relationship,recovery_allowed:allowed,
+        modal_check:modal?'visible_modal':modalScanComplete?'clear':'incomplete',
+        autocomplete:allowed?{input:describe(active),popup_id:popup.id,target_relation:association}:null,candidates_checked:candidates.length,
+        suggestion:allowed?'已确认当前搜索输入关联的自动补全列表，可发送一次 Escape 后重新定位。':modal?'先明确操作弹窗的关闭或同意控件，再重新观察。':!modalScanComplete?'弹窗检查未完成，不能自动发送 Escape；请重新观察并明确处理遮挡。':'重新观察遮挡控件或选择可见标题节点，不要原样重复点击此目标。'}};
+    }"""
+
+    def probe_actionability(self, action, route):
+        """只读核验当前精确节点是否可点；不滚动、点击或发送辅助键。"""
+        self._check_deadline()
+        ref = route.get("target_ref")
+        node = self.nodes.get(ref)
+        base = {"actionable": False, "dispatched": False, "channel": "browser_dom", "target_ref": ref}
+        if node is None:
+            return {**base, "error_code": "target_unknown", "error": "Unknown target_ref"}
+        if self.options.bind_page and ref not in route.get("exposed_refs", []):
+            return {**base, "error_code": "target_not_exposed", "error": "Target was not exposed"}
+        try:
+            self.validate_action_snapshot(action)
+            self._validate_snapshot(route)
+        except BrowserActionError as exc:
+            return {**base, "error_code": "stale_snapshot", "error": str(exc)}
+        if self.foreground_check and not self.foreground_check():
+            return {**base, "error_code": "browser_lost_focus", "error": "Browser lost focus"}
+        try:
+            runtime, browser = self._connect()
+        except ModelRequestTimeout:
+            raise
+        except Exception as exc:
+            self._check_deadline()
+            return {**base, "error_code": "browser_unavailable", "error": str(exc)[:300]}
+        cdp = None
+        try:
+            page = self._pick_page(browser)
+            if page is None:
+                raise BrowserActionError("本任务的浏览器页面不可用")
+            cdp = page.context.new_cdp_session(page)
+            self._validate_snapshot(route, page, cdp)
+            obj = cdp.send("DOM.resolveNode", {"backendNodeId": node["backend_id"]})["object"].get("objectId")
+            self._check_deadline()
+            if not obj:
+                return {**base, "error_code": "target_detached", "error": "Target detached"}
+            inspected = cdp.send("Runtime.callFunctionOn", {"objectId": obj,
+                "functionDeclaration": self._ACTIONABILITY_INSPECT, "arguments": [], "returnByValue": True})
+            self._check_deadline()
+            if inspected.get("exceptionDetails"):
+                return {**base, "error_code": "target_inspection_failed", "error": "DOM inspection failed"}
+            point = inspected.get("result", {}).get("value") or {}
+            self._validate_snapshot(route, page, cdp)
+            if point.get("error") or "x" not in point or "y" not in point:
+                return {**base, "error_code": point.get("error_code") or
+                        "target_" + str(point.get("error", "not_actionable")),
+                        "error": point.get("error", "Target not actionable"),
+                        **({"occlusion": point["occlusion"]} if point.get("occlusion") else {})}
+            return {**base, "actionable": True, "error_code": "", "coord": [point["x"], point["y"]],
+                    "actionability": {"point_source": point.get("point_source", "center"),
+                                      "candidates_checked": point.get("candidates_checked", 1)}}
+        except ModelRequestTimeout:
+            raise
+        except BrowserActionError as exc:
+            self._check_deadline()
+            return {**base, "error_code": "stale_snapshot", "error": str(exc)[:300]}
+        except Exception as exc:
+            self._check_deadline()
+            return {**base, "error_code": "target_inspection_failed", "error": str(exc)[:300]}
+        finally:
+            if cdp is not None:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
+            self._disconnect(runtime, browser)
+
     def execute(self, action, route):
         self._check_deadline()
         ref = route.get("target_ref")
@@ -727,6 +901,7 @@ class BrowserSession:
         if (self.foreground_check and not self.foreground_check()):
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Browser lost focus"}
         started, dispatched = time.perf_counter(), False
+        failure_info, recovery_info = {}, {}
         try:
             p, browser = self._connect()
         except ModelRequestTimeout:
@@ -749,21 +924,7 @@ class BrowserSession:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Target detached"}
             cdp.send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
             self._check_deadline()
-            inspect = """function() {
-              if (!this.isConnected || !(this instanceof Element)) return {error:'detached'};
-              if (this.matches(':disabled') || this.getAttribute('aria-disabled') === 'true' || this.closest('[inert]')) return {error:'disabled'};
-              const r=this.getBoundingClientRect(), s=getComputedStyle(this);
-              if (r.width<=0 || r.height<=0 || s.visibility!=='visible' || s.display==='none') return {error:'hidden'};
-              const x=(Math.max(0,r.left)+Math.min(innerWidth,r.right))/2;
-              const y=(Math.max(0,r.top)+Math.min(innerHeight,r.bottom))/2;
-              let hit=document.elementFromPoint(x,y);
-              while(hit && hit.shadowRoot && hit.shadowRoot.elementFromPoint) {
-                const next=hit.shadowRoot.elementFromPoint(x,y); if (!next || next===hit) break; hit=next;
-              }
-              if (!hit || !(this===hit || this.contains(hit))) return {error:'occluded'};
-              return {x,y,w:r.width,h:r.height,tag:this.tagName.toLowerCase(),readOnly:!!this.readOnly,
-                      editable:this.isContentEditable || this.tagName==='TEXTAREA' || (this.tagName==='INPUT' && !['button','submit','checkbox','radio','file'].includes(this.type))};
-            }"""
+            inspect = self._ACTIONABILITY_INSPECT
             def call(obj, fn, args=None):
                 self._check_deadline()
                 r = cdp.send("Runtime.callFunctionOn", {"objectId": obj, "functionDeclaration": fn,
@@ -772,15 +933,50 @@ class BrowserSession:
                     raise BrowserActionError("DOM inspection failed")
                 self._check_deadline()
                 return r.get("result", {}).get("value")
-            first = call(obj, inspect)
-            self._check_deadline()
-            page.wait_for_timeout(min(35, self._timeout_ms(35)))
-            self._check_deadline()
-            point = call(obj, inspect)
+            def stable_pair():
+                first = call(obj, inspect)
+                page.wait_for_timeout(min(35, self._timeout_ms(35)))
+                self._check_deadline()
+                return first, call(obj, inspect)
+
+            first, point = stable_pair()
+            first_occlusion = (first or {}).get("occlusion") or {}
+            occlusion = (point or {}).get("occlusion") or {}
+            if (action.action in ("click", "double_click", "type")
+                    and (first or {}).get("error_code") == "target_occluded"
+                    and (point or {}).get("error_code") == "target_occluded"
+                    and first_occlusion.get("recovery_allowed") and occlusion.get("recovery_allowed")
+                    and first_occlusion.get("autocomplete") == occlusion.get("autocomplete")):
+                # One Escape is allowed only for the focused input's proven, associated
+                # listbox. Never auto-dismiss a modal/cookie panel or send Enter.
+                self._validate_snapshot(route, page, cdp)
+                self._check_deadline()
+                recovery_info = {"recovery": {"kind": "dismiss_autocomplete", "attempted": True,
+                                             "succeeded": False},
+                                 "auxiliary_action": {"action": "press", "key": "Escape", "dispatched": True}}
+                page.keyboard.press("Escape")
+                self._check_deadline()
+                self._validate_snapshot(route, page, cdp)
+                obj = cdp.send("DOM.resolveNode", {"backendNodeId": backend_id})["object"].get("objectId")
+                self._check_deadline()
+                if not obj:
+                    raise BrowserActionError("Target detached after autocomplete recovery")
+                cdp.send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
+                page.wait_for_timeout(min(75, self._timeout_ms(75)))
+                self._check_deadline()
+                first, point = stable_pair()
             if not point or point.get("error"):
+                failure_info = {"error_code": (point or {}).get("error_code") or
+                                "target_" + str((point or {}).get("error", "not_actionable"))}
+                if (point or {}).get("occlusion"):
+                    failure_info["occlusion"] = point["occlusion"]
                 raise BrowserActionError((point or {}).get("error", "Target not actionable"))
             if first != point:
+                failure_info = {"error_code": "target_moved"}
                 raise BrowserActionError("Target moved during actionability check")
+            if recovery_info:
+                recovery_info["recovery"]["succeeded"] = True
+            self._validate_snapshot(route, page, cdp)
             name, args = action.action, action.args
             self._check_deadline()
             # 点击的是 PDF 链接 → 直接 HTTP 下载保存（而非浏览器打开 PDF 查看器）
@@ -794,7 +990,9 @@ class BrowserSession:
                 # PDF 链接判定：.pdf 后缀 / 查询/锚点参数 / 路径含 /pdf/（arXiv 的 /pdf/1706.03762 这类）
                 if (_u.endswith(".pdf") or ".pdf?" in _u or ".pdf#" in _u
                         or "/pdf/" in _u or _u.endswith("/pdf")):
-                    return self.download(full)
+                    return {**self.download(full), **recovery_info, "target_ref": ref,
+                            "actionability": {"point_source": point.get("point_source", "center"),
+                                              "candidates_checked": point.get("candidates_checked", 1)}}
             if name == "type" and (not point["editable"] or point["readOnly"]):
                 raise BrowserActionError("Target is not editable")
             if name == "select" and point["tag"] != "select":
@@ -828,6 +1026,9 @@ class BrowserSession:
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "target_ref": ref, "coord": [point["x"], point["y"]],
                     **self._follow_owned_popup(browser),
+                    **recovery_info,
+                    "actionability": {"point_source": point.get("point_source", "center"),
+                                      "candidates_checked": point.get("candidates_checked", 1)},
                     "coordinate_space": "css_viewport", "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except ModelRequestTimeout:
             raise
@@ -835,6 +1036,7 @@ class BrowserSession:
             self._check_deadline()
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "error": str(exc)[:500],
+                    "target_ref": ref, **failure_info, **recovery_info,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         finally:
             try:
