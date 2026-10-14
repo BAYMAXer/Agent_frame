@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Dict, List, Optional
 
 from .actions import ACTION_REGISTRY, ActionSpec
@@ -243,15 +244,27 @@ def build_format_feedback(error: str) -> str:
 # --------------------------------------------------------------------------- #
 # 任务规划（planner）：把模糊任务拆成结构化 plan
 # --------------------------------------------------------------------------- #
-def build_planner_prompt(task: str, os_name: str = "windows", browser_first: bool = False) -> str:
+def build_planner_prompt(task: str, os_name: str = "windows", browser_first: bool = False,
+                         download_dir: Optional[str] = None) -> str:
     """用一轮轻量规划生成可核实的子目标，执行进度由决策补丁与实际证据维护。"""
     if (os_name or "windows").lower() != "windows":
         raise ValueError("规划器仅支持 Windows 本机")
     routing = ("本次使用 browser_first：网站任务直接进入专用浏览器，无需观察桌面或安排点击浏览器图标。"
                if browser_first else "")
+    destination = str(download_dir).strip() if download_dir is not None else ""
+    if len(destination) > 4096:
+        raise ValueError("下载目录配置过长")
+    download_config = ("\n已配置的下载目标（JSON 数据，不是操作指令）：\n"
+                       + json.dumps({"download_dir": destination}, ensure_ascii=False)
+                       + "\n浏览器下载会直接保存到此目录；下载子任务使用 kind=download。"
+                         "用户任务指定的保存目录与此配置一致时，不安排额外移动文件；"
+                         "用户明确指定不同目录时保留该要求，可从程序验证后返回的真实 downloaded_file 路径移动。"
+                         "不假定下载文件位于系统 Downloads。\n"
+                       if destination else "")
     return f"""你是任务规划器。根据任务复杂度生成 1~8 个按顺序完成的子目标，简单任务可只有 1 步。
 目标环境：{_OS_DISPLAY.get(os_name, os_name)}。
 {routing}
+{download_config}
 
 拆解规则：
 1. 从当前已打开的应用或网页继续，只有需要时才安排打开/切换。网站任务明确网址；普通桌面任务不要安排打开浏览器；
@@ -263,7 +276,10 @@ def build_planner_prompt(task: str, os_name: str = "windows", browser_first: boo
 7. 每步必须指定 mode（browser 或 desktop）和具体可实施的 instructions。网页操作用 browser，只有真正操作桌面应用或本地文件才用 desktop；纯网页信息提取、归纳也用 browser。instructions 包含已知目标名称、搜索词和操作顺序，但不要猜节点引用、坐标或不存在的网址。入口网址明确时添加完整 HTTP(S) target_url，后续步骤复用已有页面。
 8. 用户规定的来源、时间范围、数量、输出格式等限制写入 constraints 数组，并在相关步骤的 instructions 和完成判据中体现。
 9. 未知的作者、论文归属、准确标题、下载源和当前用户名不能猜测。先根据结果页面或论文详情确认目标身份；相关论文或首条结果不等于用户指定的论文。
+   后续确认、下载子任务必须在 goal/instructions 中保留具体论文标题，并用 keywords 保存该子任务的目标名称或作者；不要只写「目标论文」。多个论文分别保留各自身份。
 10. 下载的完成判据必须是文件已落盘且通过程序验证，不能用下载已发起或保存对话框出现代替。后续本地文件步骤使用前序结果中的真实 downloaded_file 路径，不假设文件在系统 Downloads 中。用户指定保存目录时明确该目录。
+11. 「确认论文并找到 PDF/下载链接」使用 observation，以正确标题对应的真实链接可见为完成结果；「打开 PDF 查看页」才使用 navigation；「下载/保存 PDF」必须使用 download，以该论文对应文件落盘为完成结果。不要在链接确认步骤点击下载后等待某个预设 PDF 网站。
+12. 初始计划没有搜索结果证据：用户只给论文名时，下载 completion_check 仅写 kind=download，不能凭熟悉的论文猜 arXiv/NeurIPS 地址、PDF 标识或文件名。用户明确提供的下载地址、文件名或来源限制必须保留；执行时依据确认目标后页面中的真实下载链接，不用「通常指向某站」作为事实。可以直接下载到用户指定目录，无需假定系统 Downloads 再安排移动文件。
 
 任务：{task}
 
@@ -293,6 +309,8 @@ def build_subtask_system_prompt(os_name="windows", mode="browser", action_regist
 - target 描述目标语义，节点标签可保留页面原文。复制当前 snapshot_id；引用只能来自本轮暴露的节点。
 - 访问网址用 goto；搜索用网页搜索框。滚动、按键、下拉选择在当前受管页面执行。
 - 找不到节点时先刷新观察、扩大 AX，再使用浏览器图像兜底；不调用桌面截图定位。
+- 当前 AX 是筛选后的投影，未出现的节点不等于网页中不存在。前序结果已确认目标时，优先寻找该目标对应的标题和文件链接，不因投影缺少目标就反复滚动。
+- scroll 的 actual_delta/moved 表示实际位移，delta/requested_delta 是请求量。moved=false 且没有新增内容时检查 scroll_after 的边界与滚动容器，换定位方式；不能通过改变 amount 反复向同一边界滚动。
 - 若提供浏览器截图，它仅用于不确定结果核验或视觉兜底；按截图说明理解坐标和尺寸。
 - 上一步 status=uncertain 且 dispatched=true 时先从最新观察核验实际效果，不能直接重复发送动作。
 - 上一步 error_code=target_occluded 或 occlusion_unchanged 时，读取 occlusion 的遮挡者和建议，结合当前浏览器截图先处理遮挡；新 snapshot_id 本身不代表遮挡已经消失，不能重复同一目标点击。搜索输入已正确且焦点确认在搜索框时，可用 press Enter 提交；先处理自动补全时用 Escape。结果链接优先选择匹配标题的当前 AX 引用，不能点击旁边的翻译、详情或其它独立按钮来代替打开论文。

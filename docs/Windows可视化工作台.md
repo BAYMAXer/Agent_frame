@@ -41,7 +41,9 @@ Qwen3.6-27B 的网页 AX 默认预算为 12000 字符，作为工程起点，尚
 .\.venv\Scripts\python.exe .\osworld_agent_1010\launch.py --runner local --task "搜索 Attention Is All You Need，找到论文并下载 PDF" --execution-mode browser_first --max-steps 20 --ax-max-chars 12000 --screenshot-max-edge 1280 --step-timeout 120
 ```
 
-`--execution-mode desktop` 使用兼容的通用桌面流程。Chrome 默认路径为 `C:\Program Files\Google\Chrome\Application\chrome.exe`，可用 `--chrome` 指定；浏览器调试端口默认 9222，可用 `--browser-port` 指定。Agent 使用专用无痕浏览器；新启动实例直接复用经身份核验的空白启动页，导航和跨子任务不重复开窗。任务收尾关闭本次拥有的页面，并清理本次新启动的专用实例；复用端点中的其它页面不受影响。
+`--execution-mode desktop` 使用兼容的通用桌面流程。Chrome 默认路径为 `C:\Program Files\Google\Chrome\Application\chrome.exe`，可用 `--chrome` 指定；浏览器调试端口默认 9222，可用 `--browser-port` 指定。Agent 在新启动和复用实例中都显式创建 CDP 管理的任务无痕上下文及页面，导航、下载和跨子任务复用它。新页绑定成功后，才关闭经过再次核验的本任务空白启动页。任务收尾清理本次拥有的页面；存在后来新增的外部标签页时保留其上下文，复用端点中的其它页面也保留。浏览器进程由用户保留和关闭。
+
+任务配置中的“下载保存目录”可填写 `D:\paper` 等目录，留空使用版本目录下的 `downloads`。工作台把该目录传给执行器和规划器，下载直接落盘，后续步骤使用实际文件路径。配置错误会立即停止并保留具体原因，避免同一接口错误被反复当成定位失败重试。
 
 ## 实时查看
 

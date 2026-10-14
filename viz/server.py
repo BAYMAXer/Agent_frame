@@ -473,6 +473,11 @@ def _start_local(cfg: dict):
         max_steps = cfg.get("max_steps", 20)
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError("最大步数必须为正整数")
+        download_dir = cfg.get("download_dir")
+        if download_dir is not None:
+            if not isinstance(download_dir, str) or any(ord(char) < 32 for char in download_dir):
+                raise ValueError("下载保存目录必须是有效的目录路径")
+            download_dir = download_dir.strip() or None
         browser_context = ContextConfig(ax_max_chars=cfg.get("ax_max_chars", DEFAULT_AX_MAX_CHARS),
                                         screenshot_max_edge=cfg.get("screenshot_max_edge", 1280))
         timeouts = {name: cfg.get(name, float(os.getenv(env_name, default)))
@@ -488,6 +493,7 @@ def _start_local(cfg: dict):
     result_dir = cfg.get("result_dir") or os.path.join(
         LOCAL_RUNS_DIR, "ui_" + time.strftime("%Y%m%d_%H%M%S"))
     cfg = {**cfg, "result_dir": result_dir, "execution_mode": execution_mode,
+           "download_dir": download_dir,
            "max_steps": max_steps, **timeouts, "ax_max_chars": browser_context.ax_max_chars,
            "screenshot_max_edge": browser_context.screenshot_max_edge}
 
@@ -508,6 +514,8 @@ def _start_local(cfg: dict):
         "--max-steps", str(max_steps),
         "--result-dir", result_dir,
     ]
+    if download_dir:
+        cmd.extend(["--download-dir", download_dir])
     env = os.environ.copy()
     if cfg.get("model_api_key"):
         env["OSWORLD_LOCAL_MODEL_API_KEY"] = str(cfg["model_api_key"])

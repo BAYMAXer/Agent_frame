@@ -34,6 +34,7 @@ _FAILURE_MESSAGES = {
     "step_budget": "已达到最大执行步数，任务尚未完成",
     "repeated_action": "连续重复动作已触发停止，任务尚未完成",
     "recovery_exhausted": "恢复尝试已耗尽，任务尚未完成",
+    "download_configuration_error": "浏览器下载配置失败，任务尚未完成",
     "final_verification_failed": "最终任务核验未通过",
     "completion_rejected": "子任务完成证据反复未通过核验",
     "context_budget": "输入超出上下文预算",

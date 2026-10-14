@@ -28,6 +28,11 @@ _STOPWORDS = {"the", "and", "for", "from", "with", "into", "this", "that", "then
               "type", "button", "link", "box", "field", "pdf", "html"}
 _CHINESE_ACTIONS = ("搜索结果", "搜索框", "相关论文", "浏览器", "下载", "搜索", "查找", "论文",
                     "打开", "点击", "选择", "输入", "确认", "网页", "第一个", "第二个", "结果", "相关")
+_IDENTITY_NOISE = _STOPWORDS | {"arxiv", "org", "com", "net", "www", "https", "http", "url",
+                               "google", "scholar", "谷歌", "谷歌学术", "学术搜索",
+                               "all", "is", "you", "need", "target", "obtain", "get", "locate",
+                               "identify", "valid"}
+_IDENTITY_ROLES = {"heading", "link", "StaticText", "staticText", "text"}
 
 
 def serialize_ax(block: dict) -> str:
@@ -82,8 +87,12 @@ def _query(subtask: Any) -> str:
         return subtask
     if isinstance(subtask, dict):
         parts = [str(subtask.get(key) or "") for key in ("goal", "instructions", "completion_criteria")]
-        keywords = subtask.get("keywords", [])
-        parts.extend(str(item) for item in keywords if isinstance(item, str))
+        for key in ("keywords", "context_keywords"):
+            keywords = subtask.get(key, [])
+            if isinstance(keywords, str):
+                keywords = [keywords]
+            if isinstance(keywords, (list, tuple)):
+                parts.extend(item for item in keywords if isinstance(item, str))
         return " ".join(parts)
     return str(subtask or "")
 
@@ -94,6 +103,64 @@ def _terms(query: str) -> set[str]:
         query = query.replace(action, " ")
     return {term for term in re.findall(r"[\w\u4e00-\u9fff]+", query)
             if len(term) > 1 and term not in _STOPWORDS}
+
+
+def _identity_phrases(values: Any, *, quoted_only: bool = False) -> list[str]:
+    """Extract observed identities, without making a whole prior result a title."""
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple)):
+        return []
+    phrases = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        quoted = re.findall(r"[\"'‘“]([^\"'’”\n]{2,160})[\"'’”]", value)
+        # A short standalone plan keyword can already be the exact title or an
+        # author. Goals/results usually contain prose: only their quoted labels
+        # are identities, not every word in the preceding task's instructions.
+        if not quoted and not quoted_only and len(value) <= 160 and not re.search(
+                r"https?://|[。；;：:\n]|" + "|".join(_CHINESE_ACTIONS), value, re.I):
+            quoted = [value]
+        for phrase in quoted:
+            normalized = " ".join(re.findall(r"\w+", phrase.casefold()))
+            if normalized and _terms(phrase) - _IDENTITY_NOISE and normalized not in phrases:
+                phrases.append(normalized)
+    return phrases
+
+
+def _context_identity(subtask: Any) -> tuple[set[str], list[str]]:
+    if not isinstance(subtask, dict) or not subtask.get("context_keywords"):
+        return set(), []
+    # An explicit target in the current task overrides a predecessor's identity
+    # when a multi-paper plan moves to another paper.
+    goal = str(subtask.get("goal") or "")
+    primary = _identity_phrases(goal, quoted_only=True)
+    if not primary:
+        # Common goals contain an unquoted Latin title amid Chinese actions,
+        # or an English action followed by the title. Trim action wrappers,
+        # preserving interior title words such as "for" and "all you need".
+        wrappers = _STOPWORDS | {"target", "obtain", "get", "locate", "identify", "valid"}
+        for phrase in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*(?:\s+[A-Za-z0-9][A-Za-z0-9_-]*)*", goal):
+            words = phrase.split()
+            while words and words[0].casefold() in wrappers:
+                words.pop(0)
+            while words and words[-1].casefold() in wrappers:
+                words.pop()
+            primary.extend(_identity_phrases([" ".join(words)]))
+    phrases = (_identity_phrases(subtask.get("keywords")) or primary
+               or _identity_phrases(subtask.get("context_keywords")))
+    return set().union(*(_terms(phrase) - _IDENTITY_NOISE for phrase in phrases)) if phrases else set(), phrases
+
+
+def _context_identity_score(node: dict, terms: set[str], phrases: list[str]) -> tuple[int, int]:
+    if node.get("role") not in _IDENTITY_ROLES:
+        return 0, 0
+    name = " ".join(re.findall(r"\w+", str(node.get("name", "")).casefold()))
+    exact = max((len(phrase.split()) for phrase in phrases if name == phrase), default=0)
+    contained = max((len(phrase.split()) for phrase in phrases if
+                     re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", name)), default=0)
+    return exact * 100 + contained * 10 + _identity_score(node, terms), exact
 
 
 def _resource_kind(node: dict) -> str:
@@ -169,6 +236,7 @@ class BrowserAXSelector:
         invalid_roi = roi is not None and region is None
         query = _query(subtask)
         terms = _terms(query)
+        identity_terms, identity_phrases = _context_identity(subtask)
         completion_check = subtask.get("completion_check") if isinstance(subtask, dict) else None
         resource_intent = bool(re.search(r"\b(?:download|pdf|full[ -]?text)\b|下载|全文|原文", query, re.I)
             or (isinstance(completion_check, dict) and completion_check.get("kind") == "download"))
@@ -373,7 +441,15 @@ class BrowserAXSelector:
         for node in nodes:
             if node.get("role") in _CONTAINER_ROLES or node.get("role") in _ENTRY_ROLES:
                 continue
-            score = _identity_score(node, terms)
+            # A search box can repeat the exact query in child StaticText. It
+            # is an input control, not independent evidence of a result title.
+            in_input = any(by_ref[ref].get("role") in {"searchbox", "textbox", "combobox"}
+                           for ref in self._parent_chain(node["ref"], by_ref))
+            identity_score, identity_exact = ((0, 0) if in_input else
+                _context_identity_score(node, identity_terms, identity_phrases))
+            score = identity_score * 10 + _identity_score(node, terms)
+            source_score = (_identity_score(node, terms - identity_terms)
+                            if node["ref"] in resources else 0)
             if not score and region is None and not viewport_only:
                 continue
             key, members = result_group(node["ref"])
@@ -381,11 +457,24 @@ class BrowserAXSelector:
                 continue
             if key not in candidates:
                 candidates[key] = {"key": key, "refs": members | ancestors(node["ref"]), "score": score,
-                                   "matched": {node["ref"]} if score else set()}
+                                   "matched": {node["ref"]} if score else set(),
+                                   "identity_score": identity_score, "identity_exact": identity_exact,
+                                   "source_score": source_score}
             else:
                 candidates[key]["score"] = max(candidates[key]["score"], score)
+                candidates[key]["identity_score"] = max(candidates[key]["identity_score"], identity_score)
+                candidates[key]["identity_exact"] = max(candidates[key]["identity_exact"], identity_exact)
+                candidates[key]["source_score"] = max(candidates[key]["source_score"], source_score)
                 if score:
                     candidates[key]["matched"].add(node["ref"])
+
+        if identity_terms and any(item["identity_score"] for item in candidates.values()):
+            exact = max(item["identity_exact"] for item in candidates.values())
+            # A source hint such as arxiv.org cannot substitute for a requested
+            # paper. Keep its PDF through the matched result group; an exact
+            # observed title also beats derivative titles containing its words.
+            candidates = {key: item for key, item in candidates.items() if
+                          (item["identity_exact"] == exact if exact else item["identity_score"] > 0)}
 
         identity_match = any(item["score"] for item in candidates.values())
         if resource_intent:
@@ -474,7 +563,7 @@ class BrowserAXSelector:
             return set().union(*(ancestors(ref) for ref in pivots)) if pivots else set(members)
 
         ranked = sorted(candidates.values(), key=lambda item: (
-            -bool(item.get("resource_priority")), -item["score"],
+            -bool(item.get("resource_priority")), -item["score"], -item.get("source_score", 0),
             min(order[ref] for ref in item["refs"])))
         all_groups = [*mandatory.values(), *(item["refs"] for item in ranked)]
         all_refs = set().union(*all_groups) if all_groups else set()

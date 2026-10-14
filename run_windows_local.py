@@ -204,7 +204,7 @@ def _remove_profile(port: int, profile: str) -> bool:
 
 
 def ensure_chrome(port: int, chrome_path: str):
-    """返回 (是否新建, 本次专用 profile)。新建 profile 用于精确接管唯一启动页。
+    """返回 (是否新建, 本次专用 profile)。新建 profile 用于核验并清理空白启动页。
 
     复用端点始终返回 None profile，不把已有无痕页面认作当前任务拥有的页面。
     """

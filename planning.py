@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 import ntpath
 import posixpath
+import re
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -77,7 +78,9 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dic
         check = _completion_check(source.get("completion_check"))
         step_key = (" ".join(goal.split()).casefold(), " ".join(criteria.split()).casefold(),
                     tuple(sorted(check.items())), source.get("mode"),
-                    _text(source.get("instructions")), _text(source.get("target_url")))
+                    _text(source.get("instructions")), _text(source.get("target_url")),
+                    tuple(_text(item) for item in source.get("keywords", []) if isinstance(item, str))
+                    if isinstance(source.get("keywords", []), list) else ())
         if deduplicate and step_key in seen_steps:
             continue
         seen_steps.add(step_key)
@@ -93,6 +96,11 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dic
             "instructions": _text(source.get("instructions")) or goal,
         }
         target_url = _text(source.get("target_url"))
+        if isinstance(source.get("keywords"), list):
+            keywords = list(dict.fromkeys(_text(item) for item in source["keywords"]
+                                          if isinstance(item, str) and _text(item)))
+            if keywords:
+                step["keywords"] = keywords[:16]
         if target_url and _http_url(target_url):
             step["target_url"] = target_url
         if canonical and isinstance(source.get("result"), str):
@@ -130,7 +138,88 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dic
     return plan
 
 
-def validate_executable_plan(raw: Any) -> Optional[str]:
+_DOWNLOAD_LINK_NOUN = re.compile(
+    r"下载\s*(?:链接|按钮|入口|地址|源|列表|详情页|页面|页|中心|站点|历史|记录|次数|目录|设置|统计|速度)|"
+    r"\bdownload\s+(?:link|button|url|source|page|list|history|record|count|directory|folder|settings|statistics|speed)\b", re.I)
+_DOWNLOADED_ARTIFACT = re.compile(r"已(?:经)?下载|下载(?:的|后)", re.I)
+_DOWNLOAD_ACTION = re.compile(r"下载|\bdownload(?:ing)?\b", re.I)
+_NEGATED_DOWNLOAD = re.compile(
+    r"(?:无需|不用|不要|不必|禁止|不需要|不)\s*(?:进行|实际|立即)?下载|"
+    r"\b(?:without|do\s+not|don't|no\s+need\s+to|never)\s+download(?:ing)?\b", re.I)
+_LINK_DISCOVERY = re.compile(
+    r"(?:查找|找到|搜索|识别|确认|定位|获取|提取).*(?:链接|入口|地址)|"
+    r"\b(?:find|locate|identify|confirm|inspect|collect|extract|obtain)\b.*"
+    r"\b(?:link|url)\b", re.I)
+_OBSERVATION_GOAL = re.compile(
+    r"^(?:请\s*)?(?:确认|检查|核对|验证|查看|查找|找到|搜索|识别|定位|获取|提取)|"
+    r"^(?:please\s+)?(?:find|locate|identify|confirm|inspect|check|verify|search)\b", re.I)
+_FOLLOWING_TRANSFER = re.compile(
+    r"(?:并|然后|之后|后|再)\s*(?:下载|保存|另存为)|"
+    r"\b(?:and|then)\s+(?:download|save|store)\b", re.I)
+_SAVED_FILE = re.compile(
+    r"(?:PDF|文件).{0,25}(?:落盘|已保存|保存成功|保存到|存在于)|"
+    r"论文.{0,25}(?:落盘|已保存|保存成功|保存到)|"
+    r"(?:落盘|保存到)(?:本地|磁盘|目录)|"
+    r"\b(?:PDF|file|paper)\b.{0,25}\b(?:saved|stored)\b|"
+    r"\b(?:PDF|file)\b.{0,25}\bexists\b|"
+    r"\b(?:saved|stored)\b.{0,25}\b(?:locally|disk|directory|folder)\b", re.I)
+_SAVE_ACTION = re.compile(r"保存|另存为|\b(?:save|store)\b", re.I)
+_DOWNLOAD_INTERMEDIATE = re.compile(
+    r"(?:已发起|发起|启动|开始).{0,8}下载|下载.{0,8}(?:已发起|开始|启动)|"
+    r"保存对话框|PDF(?!\s*(?:下载\s*)?(?:链接|入口|地址)).{0,12}(?:查看|预览)|"
+    r"PDF(?!\s*(?:下载\s*)?(?:链接|入口|地址)).{0,12}(?:已打开|已显示)|"
+    r"\bdownload\b.{0,15}\b(?:started|initiated|requested)\b|"
+    r"\b(?:start|initiate|request)\b.{0,15}\bdownload\b|"
+    r"\b(?:PDF\s+(?:viewer|preview)|save\s+dialog)\b|"
+    r"\bPDF\b(?!\s+(?:download\s+)?(?:link|url)\b).{0,15}\b(?:open|opened|visible|loaded)\b|"
+    r"\b(?:navigate[sd]?|navigation)\b.{0,25}\bPDF\b", re.I)
+
+
+def _download_action_text(text: str) -> bool:
+    # "find a download link" describes evidence discovery, not a file transfer.
+    cleaned = _DOWNLOAD_LINK_NOUN.sub("", _DOWNLOADED_ARTIFACT.sub("", _NEGATED_DOWNLOAD.sub("", text)))
+    return bool(_DOWNLOAD_ACTION.search(cleaned)
+                and (not _OBSERVATION_GOAL.search(cleaned) or _FOLLOWING_TRANSFER.search(cleaned)))
+
+
+def _requires_download_check(step: Dict[str, Any]) -> bool:
+    goal = _text(step.get("goal"))
+    criteria = _text(step.get("completion_criteria"))
+    observing = bool(_OBSERVATION_GOAL.search(goal) and not _FOLLOWING_TRANSFER.search(goal))
+    return bool(_download_action_text(goal)
+            or (not observing and step.get("mode") == "browser" and _SAVE_ACTION.search(goal)
+                and re.search(r"PDF|文件|论文|\b(?:file|paper)\b", goal, re.I))
+            or bool(not observing and step.get("mode") == "browser" and _SAVED_FILE.search(criteria)
+                    and not _LINK_DISCOVERY.search(goal)))
+
+
+def _known_download_url(url: str, task: str) -> bool:
+    """Initial constraints may use task URLs or an explicitly named source host.
+
+    A known host alone does not prove a PDF path, identifier or query string.
+    Later observed identities belong in execution evidence, not guessed plans.
+    """
+    candidates = re.findall(r"https?://(?:(?!\]\()[^\s<>\"'`，。；）])+", task, re.I)
+    known_urls = []
+    for candidate in candidates:
+        candidate = candidate.rstrip(",;.")
+        # DOI/publisher paths can contain paired parentheses. Strip only extra
+        # closing delimiters from prose or a Markdown link around the URL.
+        while candidate.endswith(")") and candidate.count(")") > candidate.count("("):
+            candidate = candidate[:-1]
+        while candidate.endswith("]") and candidate.count("]") > candidate.count("["):
+            candidate = candidate[:-1]
+        known_urls.append(candidate)
+    if any(_url_matches(url, candidate) for candidate in known_urls):
+        return True
+    parsed = urlsplit(url)
+    if parsed.path not in {"", "/"} or parsed.query:
+        return False
+    host = parsed.hostname or ""
+    return bool(host and re.search(r"(?<![\w.-])" + re.escape(host) + r"(?![\w.-])", task, re.I))
+
+
+def validate_executable_plan(raw: Any, task: str = "") -> Optional[str]:
     """Strict browser-first plans must cover the task before any action starts."""
     if not isinstance(raw, dict) or not isinstance(raw.get("steps"), list):
         return "计划必须包含 steps 数组"
@@ -145,6 +234,33 @@ def validate_executable_plan(raw: Any) -> Optional[str]:
             return f"子任务 {index} 缺少 goal、instructions 或 completion_criteria"
         if step.get("target_url") and not _http_url(_text(step["target_url"])):
             return f"子任务 {index} 的 target_url 必须是完整 HTTP(S) 网址"
+        check = _completion_check(step.get("completion_check"))
+        goal = _text(step.get("goal"))
+        criteria = _text(step.get("completion_criteria"))
+        saving = _requires_download_check(step)
+        discovery = bool(_LINK_DISCOVERY.search(goal)
+                         and re.search(r"PDF|下载|\bdownload\b", goal, re.I) and not saving)
+        if saving and check["kind"] != "download":
+            return f"子任务 {index} 要下载或保存文件，completion_check 必须为 kind=download，以已验证的目标文件落盘为完成判据"
+        if discovery and check["kind"] != "observation":
+            return f"子任务 {index} 只确认或获取链接，应使用 kind=observation；打开 PDF 页面与下载文件必须分别定义完成结果"
+        if ((saving or check["kind"] == "download" or discovery)
+                and _DOWNLOAD_INTERMEDIATE.search(criteria) and not _SAVED_FILE.search(criteria)):
+            return f"子任务 {index} 不能以下载已发起、保存对话框或 PDF 查看页作为文件下载/链接确认的完成判据"
+        # Validation runs before any browser observations exist. Do not bind the
+        # eventual artifact to a familiar but unobserved provider or PDF ID.
+        if task and check["kind"] in {"download", "navigation"}:
+            url = check.get("url", "")
+            artifact_check = check["kind"] == "download" or bool(
+                re.search(r"PDF", goal, re.I) and not _DOWNLOAD_LINK_NOUN.search(goal))
+            if url and artifact_check and not _known_download_url(url, task):
+                return f"子任务 {index} 的 PDF/下载地址未由用户任务提供；删除猜测的 completion_check.url，保留已知论文身份及来源限制，执行时使用页面实际链接"
+            filename = check.get("filename", "")
+            if filename and filename.casefold() not in task.casefold():
+                return f"子任务 {index} 的下载文件名未由用户任务提供；删除猜测的 filename，执行后使用已验证文件的真实名称"
+    if task and _download_action_text(task) and not any(
+            _completion_check(step.get("completion_check"))["kind"] == "download" for step in raw["steps"]):
+        return "用户要求下载文件，计划必须包含 kind=download 的文件落盘子任务，不能只搜索链接或打开 PDF 页面"
     return None
 
 
@@ -297,12 +413,12 @@ def _download_matches_check(step: Dict[str, Any], info: Dict[str, Any]) -> bool:
 
 
 def _previous_download_can_complete(plan: Dict[str, Any], step: Dict[str, Any], info: Dict[str, Any]) -> bool:
-    # Visual downloads (e.g. a native Save dialog) may still use observed evidence.
-    # When the execution does contain file evidence, a model claim cannot bypass
-    # its declared identity or reuse a file already assigned to another subgoal.
-    if step.get("completion_check", {}).get("kind") != "download" or info.get("action") != "download":
+    # Browser navigation, a dispatched click and a Save dialog do not establish
+    # that this goal's artifact exists. A model claim cannot bypass file evidence.
+    if step.get("completion_check", {}).get("kind") != "download":
         return True
-    return (info.get("verified") is True and _download_matches_check(step, info)
+    return (info.get("action") == "download" and info.get("verified") is True
+            and _download_matches_check(step, info)
             and _download_not_reused(plan, step["id"], info))
 
 

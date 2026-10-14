@@ -219,7 +219,7 @@ class BrowserSession:
             cdp.detach()
 
     def bind_owned_page(self, launch_profile=None):
-        """接管本次新启动的空白页，或在复用端点中创建隔离页；不另开启动窗口。"""
+        """统一创建可管理下载的任务 context，绑定成功后才清理已证明所有权的启动页。"""
         self._check_deadline()
         p, browser = self._connect()
         try:
@@ -229,9 +229,11 @@ class BrowserSession:
                 return self.page_id
             cdp = browser.new_browser_cdp_session()
             try:
+                starter = None
+                profile = port = owners = None
                 if launch_profile:
-                    # 仅 fresh launcher 返回的专用 profile 可被接管，已有无痕端点
-                    # 不提供 profile，也不能通过焦点或任取页面取得运行所有权。
+                    # profile/PID 证明仅允许清理本次 fresh launcher 的唯一空白页。
+                    # 原生 --incognito context 不能配置下载，不能把它用作任务 context。
                     from urllib.parse import urlsplit
                     from .run_windows_local import _validated_profile, _owned_endpoint_pids
                     port = urlsplit(self.options.endpoint).port
@@ -245,39 +247,76 @@ class BrowserSession:
                     self._check_deadline()
                     if (len(pages) == 1 and pages[0].get("url") == "about:blank"
                             and pages[0].get("browserContextId") and not pages[0].get("openerId")):
-                        # Chrome --incognito 的原生 context 不支持 createTarget，但已存在的
-                        # 精确 target 可直接操作；这避免再次 createContext 打开第二个窗口。
-                        target = pages[0]
-                        current_owners = _owned_endpoint_pids(port, profile)
-                        self._check_deadline()
-                        if current_owners != owners:
-                            raise BrowserActionError("接管启动页时调试端口所有权发生变化")
-                        self.page_id, self.context_id = target["targetId"], target["browserContextId"]
-                        if self._pick_page(browser) is None:
-                            self.page_id = self.context_id = None
-                            raise BrowserActionError("本任务的浏览器启动页已关闭")
-                        self._adopted_launcher_context = True
-                        self._owned_page_ids.add(self.page_id)
-                        self.invalidate()
-                        return self.page_id
-                # 复用端点或没有唯一可接管启动页时显式创建私有 context。
-                # native --incognito context 不能用于 Target.createTarget。
-                self.context_id = cdp.send("Target.createBrowserContext", {
+                        starter = dict(pages[0])
+                context_id = cdp.send("Target.createBrowserContext", {
                     "disposeOnDetach": False,
                 })["browserContextId"]
                 try:
-                    self.page_id = cdp.send("Target.createTarget", {
-                        "url": "about:blank", "browserContextId": self.context_id,
+                    page_id = cdp.send("Target.createTarget", {
+                        "url": "about:blank", "browserContextId": context_id,
                     })["targetId"]
-                    self._owned_page_ids.add(self.page_id)
+                    target = cdp.send("Target.getTargetInfo", {"targetId": page_id})["targetInfo"]
+                    self._check_deadline()
+                    if (target.get("targetId") != page_id or target.get("type") != "page"
+                            or target.get("browserContextId") != context_id):
+                        raise BrowserActionError("新建任务页面不属于预期的专用浏览器 context")
+                    # 新 target 的 Playwright page 附加事件可能稍晚到达。通过 CDP 往返
+                    # 继续处理事件，所有验证完成前不发布任务 page/context ID。
+                    bind_deadline = time.monotonic() + self._timeout_seconds(self.options.timeout_ms / 1000)
+                    bound = False
+                    while not bound:
+                        for ctx in browser.contexts:
+                            for page in ctx.pages:
+                                self._check_deadline()
+                                try:
+                                    bound = self._page_id(page) == page_id
+                                except ModelRequestTimeout:
+                                    raise
+                                except Exception:
+                                    continue
+                                if bound:
+                                    break
+                            if bound:
+                                break
+                        if bound:
+                            break
+                        if time.monotonic() >= bind_deadline:
+                            raise BrowserActionError("无法绑定新建的任务浏览器页面")
+                        cdp.send("Target.getTargetInfo", {"targetId": page_id})
+                        time.sleep(0.01)
+                    if launch_profile:
+                        if (_validated_profile(port, launch_profile) != profile
+                                or _owned_endpoint_pids(port, profile) != owners):
+                            raise BrowserActionError("绑定任务页面时调试端口所有权发生变化")
+                    self._check_deadline()
                 except Exception:
-                    cdp.send("Target.disposeBrowserContext", {"browserContextId": self.context_id})
-                    self.context_id = None
+                    try:
+                        cdp.send("Target.disposeBrowserContext", {"browserContextId": context_id})
+                    except Exception:
+                        pass
                     raise
+                self.page_id, self.context_id = page_id, context_id
+                self._adopted_launcher_context = False
+                self._owned_page_ids.add(page_id)
+                if starter:
+                    # 不按 URL 搜索任何新页，也不取得后来出现的页面的所有权。
+                    # 原启动页已导航、出现 opener 或 PID/profile 改变时保留它。
+                    try:
+                        current = cdp.send("Target.getTargetInfo", {
+                            "targetId": starter["targetId"],
+                        })["targetInfo"]
+                        if (current.get("targetId") == starter["targetId"]
+                                and current.get("type") == "page"
+                                and current.get("browserContextId") == starter["browserContextId"]
+                                and current.get("url") == "about:blank" and not current.get("openerId")
+                                and _validated_profile(port, launch_profile) == profile
+                                and _owned_endpoint_pids(port, profile) == owners):
+                            cdp.send("Target.closeTarget", {"targetId": starter["targetId"]})
+                    except Exception:
+                        pass  # 清理启动页失败不撤销已经绑定的任务页面。
             finally:
                 cdp.detach()
             self.invalidate()
-            self._check_deadline()
             return self.page_id
         finally:
             self._disconnect(p, browser)
@@ -902,7 +941,7 @@ class BrowserSession:
         if (self.foreground_check and not self.foreground_check()):
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Browser lost focus"}
         started, dispatched = time.perf_counter(), False
-        failure_info, recovery_info = {}, {}
+        failure_info, recovery_info, scroll_info = {}, {}, {}
         try:
             p, browser = self._connect()
         except ModelRequestTimeout:
@@ -1006,9 +1045,28 @@ class BrowserSession:
                 self._check_deadline()
                 call(obj, """function(i){ this.selectedIndex=i; this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true})); }""", [matches[0]])
             elif name == "scroll":
+                delta = int(args["amount"]) * 120 * (-1 if args["direction"] == "up" else 1)
+                chain = cdp.send("Runtime.callFunctionOn", {"objectId": obj,
+                    "functionDeclaration": self._SCROLL_CHAIN, "returnByValue": False})
+                if chain.get("exceptionDetails"):
+                    raise BrowserActionError("Scroll container inspection failed")
+                chain_id = chain.get("result", {}).get("objectId")
+                if not chain_id:
+                    raise BrowserActionError("Scroll container is unavailable")
+                before = call(chain_id, self._SCROLL_CHAIN_METRICS)
                 dispatched = True
                 page.mouse.move(point["x"], point["y"])
-                page.mouse.wheel(0, int(args["amount"]) * 120 * (-1 if args["direction"] == "up" else 1))
+                page.mouse.wheel(0, delta)
+                # Wheel dispatch is asynchronous. Observe the same container chain,
+                # including its page ancestor if scrolling chains at a boundary.
+                after = before
+                for _ in range(3):
+                    page.wait_for_timeout(min(50, self._timeout_ms(50)))
+                    after = call(chain_id, self._SCROLL_CHAIN_METRICS)
+                    if any(abs(new["scrollTop"] - old["scrollTop"]) > 0.5
+                           for old, new in zip(before, after)):
+                        break
+                scroll_info = self._scroll_progress(before, after, delta)
             else:
                 dispatched = True
                 page.mouse.click(point["x"], point["y"], button="right" if name == "right_click" else "left",
@@ -1028,6 +1086,7 @@ class BrowserSession:
                     "target_ref": ref, "coord": [point["x"], point["y"]],
                     **self._follow_owned_popup(browser),
                     **recovery_info,
+                    **scroll_info,
                     "actionability": {"point_source": point.get("point_source", "center"),
                                       "candidates_checked": point.get("candidates_checked", 1)},
                     "coordinate_space": "css_viewport", "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
@@ -1540,12 +1599,69 @@ class BrowserSession:
             except Exception:
                 pass
 
+    # Metrics use CSS pixels, the same space as viewport/DOM actions. Keep the
+    # actual nodes in a temporary CDP object so the before/after samples cannot
+    # silently switch to a different ancestor after scrolling.
+    _SCROLL_CHAIN = """function(){
+        const root=document.scrollingElement || document.documentElement;
+        const chain=[];
+        for(let el=this;el;el=el.parentElement || (el.getRootNode && el.getRootNode().host)){
+            if(el===root)break;
+            if(el.nodeType!==1)continue;
+            const style=getComputedStyle(el);
+            if(/^(auto|scroll|overlay)$/.test(style.overflowY) && el.scrollHeight>el.clientHeight+0.5)
+                chain.push(el);
+        }
+        if(root)chain.push(root);
+        return chain;
+    }"""
+    _SCROLL_CHAIN_METRICS = """function(){
+        return this.map(el=>{
+            if(!el.isConnected)throw new Error('Scroll container detached');
+            const root=document.scrollingElement || document.documentElement;
+            const top=el.scrollTop,height=el.clientHeight,total=el.scrollHeight;
+            const maximum=Math.max(0,total-height);
+            return {scrollTop:top,clientHeight:height,scrollHeight:total,
+                can_scroll_up:top>0.5,can_scroll_down:top<maximum-0.5,
+                at_top:top<=0.5,at_bottom:top>=maximum-0.5,
+                container:{kind:el===root?'page':'element',tag:el.tagName.toLowerCase(),id:el.id || ''}};
+        });
+    }"""
+    _PAGE_SCROLL_METRICS = """() => {
+        const el=document.scrollingElement || document.documentElement;
+        const top=el ? el.scrollTop : scrollY;
+        const height=el ? el.clientHeight : innerHeight;
+        const total=el ? el.scrollHeight : innerHeight;
+        const maximum=Math.max(0,total-height);
+        return {scrollTop:top,clientHeight:height,scrollHeight:total,
+            can_scroll_up:top>0.5,can_scroll_down:top<maximum-0.5,
+            at_top:top<=0.5,at_bottom:top>=maximum-0.5,
+            container:{kind:'page',tag:el ? el.tagName.toLowerCase() : '',id:el ? el.id || '' : ''}};
+    }"""
+
+    @staticmethod
+    def _scroll_progress(before, after, requested_delta):
+        if not before or len(before) != len(after):
+            raise BrowserActionError("Scroll metrics are unavailable", dispatched=True)
+        # Report the nearest ancestor that actually moved; an inner scroller can
+        # hand the wheel to an outer one when its own boundary has been reached.
+        index = next((i for i, (old, new) in enumerate(zip(before, after))
+                      if abs(new["scrollTop"] - old["scrollTop"]) > 0.5), 0)
+        old, new = before[index], after[index]
+        actual_delta = new["scrollTop"] - old["scrollTop"]
+        moved = abs(actual_delta) > 0.5
+        return {"action": "scroll", "delta": requested_delta, "requested_delta": requested_delta,
+                "actual_delta": actual_delta, "moved": moved, "noop": not moved,
+                "scroll_container": new.get("container", {"kind": "page"}),
+                "scroll_before": {k: v for k, v in old.items() if k != "container"},
+                "scroll_after": {k: v for k, v in new.items() if k != "container"}}
+
     def _scroll(self, action):
-        """页面级滚动（window.scrollBy），无需 target。"""
+        """页面级滚动，报告真实位移和滚动边界，而非仅报告输入已发送。"""
         self._check_deadline()
         amount = int(action.args.get("amount", 1))
         delta = amount * 300 * (-1 if action.args.get("direction", "up") == "up" else 1)
-        started = time.perf_counter()
+        started, dispatched = time.perf_counter(), False
         try:
             p, browser = self._connect()
         except ModelRequestTimeout:
@@ -1562,16 +1678,24 @@ class BrowserSession:
             if self.options.bind_page:
                 self._validate_snapshot(page=page, cdp=page.context.new_cdp_session(page))
             self._check_deadline()
-            page.evaluate(f"window.scrollBy(0, {delta})")
+            before = page.evaluate(self._PAGE_SCROLL_METRICS)
+            self._check_deadline()
+            dispatched = True
+            # Instant behavior avoids mistaking an animation's first frame for
+            # a no-op, even when the page applies CSS scroll-behavior:smooth.
+            page.evaluate("delta => window.scrollBy({top:delta,left:0,behavior:'instant'})", delta)
+            self._check_deadline()
+            after = page.evaluate(self._PAGE_SCROLL_METRICS)
             self._check_deadline()
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
-                    "action": "scroll", "delta": delta,
+                    **self._scroll_progress([before], [after], delta),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except ModelRequestTimeout:
             raise
         except Exception as exc:
             self._check_deadline()
-            return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
+            return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
+                    "channel": "browser_dom", "action": "scroll",
                     "error": str(exc)[:200]}
         finally:
             try:
@@ -1673,14 +1797,13 @@ class BrowserSession:
                 try:
                     cdp = browser.new_browser_cdp_session()
                     try:
-                        if self._adopted_launcher_context:
-                            # native context 可能有用户后来打开的其它 tabs，不能整体 dispose。
-                            # 只关执行期间已登记的启动页/弹出页；不能在关闭时把用户
-                            # 后来打开但具有同一 opener 的页面补认作本任务所有。
-                            targets = cdp.send("Target.getTargets")["targetInfos"]
-                            children = {target["targetId"]: target for target in targets
-                                        if target.get("type") == "page"
-                                        and target.get("browserContextId") == self.context_id}
+                        targets = cdp.send("Target.getTargets")["targetInfos"]
+                        children = {target.get("targetId"): target for target in targets
+                                    if target.get("type") == "page"
+                                    and target.get("browserContextId") == self.context_id}
+                        if self._adopted_launcher_context or not set(children) <= self._owned_page_ids:
+                            # 即便显式创建的 context 也可能出现用户后来打开的 tabs。
+                            # 只关已登记的任务页，保留含外部页面的整个 context。
                             for target_id in self._owned_page_ids & children.keys():
                                 try:
                                     cdp.send("Target.closeTarget", {"targetId": target_id})

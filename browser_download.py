@@ -10,6 +10,14 @@ from urllib.parse import unquote, urlsplit
 from .model.request_deadline import ModelRequestTimeout
 
 
+class DownloadConfigurationError(RuntimeError):
+    """A download cannot start until the browser/session configuration changes."""
+
+    def __init__(self, message, code="download_configuration_failed"):
+        super().__init__(message)
+        self.code = code
+
+
 def _pdf_url(url):
     path = urlsplit(url).path.lower()
     return path.endswith((".pdf", "/pdf")) or "/pdf/" in path
@@ -43,6 +51,7 @@ def download_through_chromium(session, url, page, browser):
     page_cdp = browser_cdp = None
     staging = None
     configured = False
+    phase = "configuration"
     frame_id = None
     scope = {}
     state = {"guid": None, "progress": None, "response_url": None, "error": None,
@@ -114,15 +123,21 @@ def download_through_chromium(session, url, page, browser):
         target = page_cdp.send("Target.getTargetInfo")["targetInfo"]
         if session.options.bind_page and (target.get("targetId") != session.page_id
                 or target.get("browserContextId") != session.context_id):
-            raise BrowserActionError("下载页面不属于当前任务的绑定会话")
+            raise DownloadConfigurationError("下载页面不属于当前任务的绑定会话", "download_context_unavailable")
         if target.get("browserContextId"):
             scope = {"browserContextId": target["browserContextId"]}
         frame_id = page_cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
         check()
+        browser_cdp = browser.new_browser_cdp_session()
+        if session.options.bind_page:
+            contexts = browser_cdp.send("Target.getBrowserContexts").get("browserContextIds", [])
+            if not scope or scope["browserContextId"] not in contexts:
+                raise DownloadConfigurationError(
+                    "下载上下文未注册到 CDP，需重新初始化任务浏览器", "download_context_unavailable")
+        check()
         root = os.path.abspath(session.downloads_dir)
         os.makedirs(root, exist_ok=True)
         staging = tempfile.mkdtemp(prefix=".browser-download-", dir=root)
-        browser_cdp = browser.new_browser_cdp_session()
         browser_cdp.on("Browser.downloadWillBegin", will_begin)
         browser_cdp.on("Browser.downloadProgress", progress)
         page_cdp.on("Fetch.requestPaused", paused)
@@ -131,6 +146,7 @@ def download_through_chromium(session, url, page, browser):
         configured = True
         page_cdp.send("Fetch.enable", {"patterns": [{"resourceType": "Document", "requestStage": "Response"}]})
         check()
+        phase = "transfer"
         state["dispatched"] = True
         try:
             # Navigation timeout also bounds a server that never sends headers.
@@ -190,9 +206,14 @@ def download_through_chromium(session, url, page, browser):
         raise
     except Exception as exc:
         session._check_deadline()
+        details = {}
+        if isinstance(exc, DownloadConfigurationError) or phase == "configuration":
+            details = {"error_code": getattr(exc, "code", "download_configuration_failed"),
+                       "retryable": False, "error_phase": "download_configuration"}
         return {"status": "rejected", "dispatched": state["dispatched"], "channel": "browser_dom",
                 "action": "download", "verified": False, "download_transport": "chromium",
-                "error": str(exc)[:300], "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+                "error": str(exc)[:300], **details,
+                "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
     finally:
         if browser_cdp is not None:
             if state["guid"] and (state["progress"] or {}).get("state") != "completed":
