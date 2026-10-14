@@ -58,6 +58,10 @@ class WindowsEnvironment(Environment):
         self.downloads_dir = downloads_dir
         self._configured_downloads_dir = downloads_dir
         self.download_destination = None
+        self._observe_downloads = False
+        self._download_extensions = None
+        self._file_rename_verifier = None
+        self._file_verification_binding = None
         self._browser_launcher = browser_launcher
         self._browser_ready = False
         self._browser_launch_profile = None
@@ -79,8 +83,24 @@ class WindowsEnvironment(Environment):
         self.downloads_dir = self.download_destination["directory"] or os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "downloads")
         self.download_destination["directory"] = self.downloads_dir
+        self._observe_downloads = (self.download_destination["source"] == "task" or bool(
+            re.search(r"下载|保存|另存为|导出|\b(?:download|save|export)\b", str(task or ""), re.I)))
+        task_text = str(task or "")
+        # PPT 是常用的 PowerPoint 通称；明确写 PPTX 时按该格式核验。
+        other_format = re.search(r"(?<![a-z])(?:pdf|docx?|xlsx?|csv|zip)(?![a-z])", task_text, re.I)
+        if other_format:
+            # 混合格式任务由各子任务核验，不能用全任务的 PPT 限制其他文件。
+            self._download_extensions = None
+        elif re.search(r"(?<![a-z])pptx(?![a-z])", task_text, re.I):
+            self._download_extensions = frozenset({".pptx"})
+        elif re.search(r"(?<![a-z])ppt(?![a-z])|powerpoint", task_text, re.I):
+            self._download_extensions = frozenset({".ppt", ".pptx", ".pptm"})
+        else:
+            self._download_extensions = None
         if self._browser_session is not None:
             self._browser_session.downloads_dir = self.downloads_dir
+            self._browser_session.observe_downloads = self._observe_downloads
+            self._browser_session.download_extensions = self._download_extensions
         return dict(self.download_destination)
 
     # ---- 观察 ----
@@ -293,6 +313,22 @@ class WindowsEnvironment(Environment):
             self.width, self.height = self.work_screen.width, self.work_screen.height
         return self._build_observation()
 
+    def prepare_subtask_verification(self, subtask, plan, task):
+        """Capture the current rename source before any desktop/shell operation."""
+        binding = (str(task), subtask.get("id"))
+        if binding == self._file_verification_binding:
+            return
+        from ..file_rename_verifier import FileRenameVerifier
+        self._file_rename_verifier = FileRenameVerifier(
+            task, subtask, plan, check_deadline=lambda: self._command_timeout())
+        self._file_verification_binding = binding
+
+    def verify_subtask_files(self, step_id):
+        verifier = self._file_rename_verifier
+        if verifier is None or self._file_verification_binding[1] != step_id:
+            return {}
+        return verifier.verify()
+
     def _get_browser_session(self):
         """懒加载 BrowserSession；网页和前台窗口都必须聚焦才能进行 CDP 操作。"""
         if self._browser_session is None:
@@ -310,6 +346,8 @@ class WindowsEnvironment(Environment):
             )
         self._browser_session.request_deadline = (getattr(self, "request_deadline", None)
             if self.execution_mode == "browser_first" else None)
+        self._browser_session.observe_downloads = self._observe_downloads
+        self._browser_session.download_extensions = self._download_extensions
         return self._browser_session
 
     def _invalidate_browser_snapshot(self):
@@ -541,6 +579,8 @@ class WindowsEnvironment(Environment):
 
     # ---- Environment 接口 ----
     def reset(self, task: str) -> Observation:
+        self._file_rename_verifier = None
+        self._file_verification_binding = None
         self.configure_task_downloads(task)
         if self.execution_mode == "browser_first":
             self._browser_subtask_active = False
@@ -869,7 +909,9 @@ class WindowsEnvironment(Environment):
 
     def run_command(self, command: str) -> str:
         try:
-            r = subprocess.run(["cmd", "/c", command], capture_output=True, text=True,
+            # CMD must parse the command's own quotes. Passing it as a list
+            # argument uses backslash quote escaping, which breaks quoted paths.
+            r = subprocess.run(command, shell=True, capture_output=True, text=True,
                                timeout=self._command_timeout(), encoding="utf-8", errors="replace")
         except (subprocess.TimeoutExpired, ModelRequestTimeout) as exc:
             raise ModelRequestTimeout("本机终端命令超出当前步骤预算") from exc

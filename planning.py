@@ -142,6 +142,11 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True,
             download = _download_evidence(source.get("download_evidence"))
             if download:
                 step["download_evidence"] = download
+            file_evidence = source.get("file_evidence")
+            if (isinstance(file_evidence, dict) and source.get("status") == "done"
+                    and file_evidence.get("verification_source") == "filesystem_rename"):
+                step["file_evidence"] = {key: file_evidence[key] for key in
+                    ("source_path", "path", "bytes", "sha256", "verification_source") if key in file_evidence}
         steps.append(step)
         if len(steps) > MAX_PLAN_STEPS:
             # Reject an oversized decomposition rather than silently dropping

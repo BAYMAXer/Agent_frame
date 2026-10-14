@@ -122,6 +122,7 @@ class StepState:
     browser_selection_cache: Dict[str, Any] = field(default_factory=dict)
     rejected_completion: Dict[str, Any] = field(default_factory=dict)
     occluded_action: Dict[str, Any] = field(default_factory=dict)
+    file_verification_info: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -261,7 +262,15 @@ class Pipeline:
             self._check_step_budget("deciding")
             before = self._observation_record(state.obs, f"o_{step_no}")
             try:
-                decision = self.decide(messages)
+                if state.file_verification_info:
+                    # The file operation finished between observations. Record
+                    # its evidence without sampling or dispatching a repeat.
+                    decision = Decision(action=Action("wait", {"seconds": 0}),
+                        observed_effect=state.file_verification_info["message"], action_status="success",
+                        raw=json.dumps({"source": "filesystem_rename", "next_action":
+                            {"type": "wait", "seconds": 0}}, ensure_ascii=False))
+                else:
+                    decision = self.decide(messages)
             except ModelRequestTimeout as exc:
                 call = copy.deepcopy(getattr(self.model, "last_call", {}))
                 call.update(messages=copy.deepcopy(messages), actor_role="decision", error_type=type(exc).__name__)
@@ -322,6 +331,7 @@ class Pipeline:
                 except Exception:  # noqa: BLE001
                     pass
             execution = self.execute(action, state)
+            self._attach_file_rename_evidence(state, execution)
             if state.auxiliary_calls:
                 decision.calls.extend(state.auxiliary_calls)
                 state.auxiliary_calls = []
@@ -502,6 +512,11 @@ class Pipeline:
                 state.obs.info["plan_step_id"] = subtask.get("id") if subtask else None
         if state.obs is None:
             state.obs = self.env.reset(state.task)
+        subtask = self._current_subtask(state)
+        prepare = getattr(self.env, "prepare_subtask_verification", None)
+        if subtask and callable(prepare):
+            prepare(subtask, state.memory.plan, state.task)
+        state.file_verification_info = self._file_rename_evidence(state)
         state.screenshot_history.append(state.obs.screenshot)
         if len(state.screenshot_history) > 3:
             state.screenshot_history = state.screenshot_history[-3:]
@@ -869,6 +884,10 @@ class Pipeline:
         return resolved
 
     def execute(self, action: Action, state: StepState) -> Execution:
+        file_info = self._file_rename_evidence(state)
+        if file_info:
+            return Execution(kind="file_rename", executed="文件系统核验（操作已完成）",
+                             outcome=file_info["message"], obs=state.obs, info=file_info)
         name = action.action
         if name == "complete_subtask":
             confirmed, reason = self._verify_subtask(state, action)
@@ -1003,6 +1022,7 @@ class Pipeline:
     def postprocess(self, step_no: int, decision: Decision, execution: Execution,
                     state: StepState, result: AgentResult) -> Tuple[StepState, bool]:
         """⑥ 后处理：记录 expected/observed + 控制状态 + 卡死检测 + Finish 验证。"""
+        self._attach_file_rename_evidence(state, execution)
         # 1) 记录模型对上一步的判断（observed / action_status）
         state.memory.observed_effect = decision.observed_effect
         state.memory.action_status = decision.action_status
@@ -1185,7 +1205,9 @@ class Pipeline:
                 result.success = True
                 state.memory.add_event(f"✅ 程序核实：{verifier} 验证通过，任务结束")
                 should_break = True
-        if self.browser_first and not should_break and not self._unfinished_plan_steps(state):
+        verified_rename = ((execution.info or {}).get("verification_source") == "filesystem_rename"
+                           and execution.info.get("verified") is True)
+        if (self.browser_first or verified_rename) and not should_break and not self._unfinished_plan_steps(state):
             answer = self._aggregate_results(state)
             confirmed, reason = self._verify_finish(state, answer)
             result.success = confirmed
@@ -1435,6 +1457,21 @@ class Pipeline:
     def _update_plan_progress(self, state: StepState, execution: Execution,
                               action: Optional[Action] = None) -> bool:
         """本次执行只用导航/下载确定性证据；上一动作的视觉证据已经单独处理。"""
+        info = execution.info or {}
+        if (info.get("action") == "file_rename" and info.get("verified") is True
+                and info.get("verification_source") == "filesystem_rename"
+                and info.get("step_id") == state.action_plan_step_id):
+            changed = record_subtask_completion(state.memory.plan, info["step_id"],
+                info["message"], info["path"], state.step_id)
+            if changed:
+                step = next(s for s in state.memory.plan["steps"] if s["id"] == info["step_id"])
+                step["update_source"] = "file_rename"
+                step["file_evidence"] = {key: info[key] for key in
+                    ("source_path", "path", "bytes", "sha256", "verification_source")}
+                state.memory.known_facts["downloaded_file"] = info["path"]
+                state.memory.known_facts["renamed_file"] = info["path"]
+                state.memory.add_event(info["message"] + "；重命名已完成，无需再次执行。")
+            return changed
         if self.browser_first and execution.kind == "subtask_complete":
             info = execution.info
             return (info.get("verified") is True and record_subtask_completion(
@@ -1450,6 +1487,32 @@ class Pipeline:
                 info = execution.info
                 step["result"] = str(info.get("path") or info.get("url") or step.get("evidence", ""))
         return changed
+
+    def _file_rename_evidence(self, state):
+        """Read only the active desktop subtask's bound filesystem verifier."""
+        subtask = self._current_subtask(state)
+        verify = getattr(self.env, "verify_subtask_files", None)
+        if (not subtask or subtask.get("mode") != "desktop" or not callable(verify)
+                or subtask.get("completion_check", {}).get("kind") != "observation"):
+            return {}
+        info = verify(subtask["id"])
+        if (not isinstance(info, dict) or info.get("action") != "file_rename"
+                or info.get("verified") is not True or info.get("status") != "executed"
+                or info.get("verification_source") != "filesystem_rename"
+                or info.get("step_id") != subtask["id"]):
+            return {}
+        return copy.deepcopy(info)
+
+    def _attach_file_rename_evidence(self, state, execution):
+        if (execution.info or {}).get("verification_source") == "filesystem_rename":
+            return
+        info = self._file_rename_evidence(state)
+        if info:
+            original_action = (execution.info or {}).get("action")
+            execution.info = {**(execution.info or {}), **info}
+            if original_action:
+                execution.info["original_action"] = original_action
+            execution.outcome = (execution.outcome + "；" if execution.outcome else "") + info["message"]
 
     def _publish_plan(self, state, result, *, changed=False):
         state.memory.sync_plan_state()
@@ -1546,6 +1609,14 @@ class Pipeline:
 
     def _compute_control_state(self, state: StepState, decision: Decision,
                                execution: Execution, before_screenshot) -> str:
+        if ((execution.info or {}).get("verification_source") == "filesystem_rename"
+                and execution.info.get("verified") is True):
+            state.no_change_count = 0
+            state.action_keys.clear()
+            state.shell_outputs.clear()
+            state.memory.stall_count = 0
+            state.memory.control_state = "ADVANCE"
+            return "ADVANCE"
         stall_reason = self._detect_stall(state, decision, execution, before_screenshot)
         if stall_reason:
             state.memory.control_state = "STALL"

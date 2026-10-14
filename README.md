@@ -2,9 +2,27 @@
 
 Windows 本机浏览器与桌面 Agent 框架。默认采用浏览器优先流程，保留通用 Windows 桌面兼容模式。
 
-当前版本：**0.4.0**（[v0.4.0 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.4.0)）。
+当前版本：**0.4.1**（[v0.4.1 Release](https://github.com/BAYMAXer/Agent_frame/releases/tag/v0.4.1)）。
 
 源码直接位于仓库根目录，不同版本通过 Git 标签保存。本版本的发布源码不包含测试文件。
+
+## v0.4.1 本次提交解决的问题
+
+相对于 [v0.4.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.4.0)，本次提交修正以下问题：
+
+| 问题 | 本次处理 |
+| --- | --- |
+| 点击普通下载按钮、导出按钮或网页脚本生成的附件后，缺少与当前动作对应的文件落盘证据。 | 下载任务在浏览器输入前启动 Chromium 下载监听，覆盖 DOM、定位器、视觉坐标和键盘动作；关联当前任务页面、子框架与下载标识，将核实完成的文件保存到任务指定目录，并推动下载子任务完成。 |
+| 服务器延迟返回附件或生成 Blob 时，监听过早结束；下载完成事件缺失、文件截断时难以确认真实结果。 | 等待当前页面触发的 Document／XHR／Fetch 请求及后续下载回调，沿用单步预算；核对下载字节数、临时文件状态与文件稳定性，拒绝不完整文件。未收到完成事件时，只有对应的新文件稳定且字节一致才作为落盘证据。 |
+| 明确要求 PPT／PPTX 的任务可能误把 PDF 链接当作目标下载，或将扩展名正确但内容无效的文件当作成功。 | 按原始任务限定 PowerPoint 格式，PPTX 任务只接受 PPTX；检查 PPT 文件头及 PPTX／PPTM 的演示文稿结构、压缩内容完整性，同时保留 PDF 文件头校验；混合格式任务不使用全任务的 PPT 格式限制。 |
+| Windows 终端命令中的引号被额外转义，带空格或中文路径的重命名命令执行失败。 | 由 Windows 命令解释器直接解析命令自身的引号，保留单步超时控制；通过真实 Windows 静默重命名验证带空格、中文目录与 PDF／PPTX 文件名。 |
+| 文件已重命名成功，但命令无输出、桌面截图未变化，导致重复重命名、错误停滞或结果仍指向旧文件名。 | 在当前桌面重命名子任务开始前，为此前已核实的下载文件记录内容基线；目标名取自原始任务，省略扩展名时继承原格式。核对目标的准确文件名、大小、SHA-256 和原文件名消失后立即推进计划，阻止再次执行并清理停滞状态；已符合目标名的文件无需重复改名，计划与轨迹保留核验证据和最终路径。 |
+
+重命名核验只适用于来源明确、目标唯一的下载后重命名子任务；已有同名文件、错误内容、来源歧义或包含额外完成要求时，不会仅凭文件存在判定任务完成。
+
+发布前以固定依赖版本完成 **1640 项本地回归**，覆盖普通／无痕 Chrome 的按钮、表单与 Blob 下载、延迟响应和不完整附件、文件格式拒绝、真实 Windows 静默重命名、文件系统核验、计划与轨迹归档，以及既有规划、停滞恢复和工作台检查。测试使用本地网页、模拟模型与本地诊断回放；测试代码与诊断样本继续排除在发布源码之外。
+
+[查看完整提交差异](https://github.com/BAYMAXer/Agent_frame/compare/v0.4.0...v0.4.1)
 
 ## v0.4.0 本次提交解决的问题
 
@@ -56,4 +74,5 @@ python -m venv .venv
 | [v0.3.3](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.3) | osworld_agent_1010 的 0.3.3 版本，不含测试文件 |
 | [v0.3.4](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.4) | osworld_agent_1010 的 0.3.4 版本，不含测试文件 |
 | [v0.3.5](https://github.com/BAYMAXer/Agent_frame/tree/v0.3.5) | osworld_agent_1010 的 0.3.5 版本，不含测试文件 |
-| [v0.4.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.4.0) | osworld_agent_1010 当前版本，不含测试文件 |
+| [v0.4.0](https://github.com/BAYMAXer/Agent_frame/tree/v0.4.0) | osworld_agent_1010 的 0.4.0 版本，不含测试文件 |
+| [v0.4.1](https://github.com/BAYMAXer/Agent_frame/tree/v0.4.1) | osworld_agent_1010 当前版本，不含测试文件 |

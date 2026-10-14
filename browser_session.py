@@ -66,6 +66,31 @@ class BrowserSession:
         self.request_deadline = None
         self._downloaded = {}  # url -> path，本次会话已下载的文件（幂等去重）
         self._downloaded_sizes = {}  # 保存原始大小，拒绝非空但已被截断的缓存
+        self.observe_downloads = False  # 下载任务同时监听普通按钮/脚本触发的浏览器下载。
+        self.download_extensions = None  # 原任务明确要求的文件格式；None 表示未限定。
+
+    def _start_download_observer(self, page, browser, action_name, target=""):
+        if not self.observe_downloads or action_name not in {
+                "click", "double_click", "right_click", "type", "select", "press", "hotkey"}:
+            return None
+        from .browser_download_observer import BrowserDownloadObserver
+        observer = BrowserDownloadObserver(self, page, browser)
+        if re.search(r"下载|导出|保存|\b(?:download|export|save)\b", str(target or ""), re.I):
+            observer.start_timeout = 10.0
+        try:
+            observer.start()
+        except BaseException:
+            observer.close()
+            raise
+        return observer
+
+    @staticmethod
+    def _download_error_details(error):
+        code = getattr(error, "code", None)
+        if code not in {"download_configuration_failed", "download_context_unavailable"}:
+            return {}
+        return {"action": "download", "verified": False, "error_code": code,
+                "retryable": False, "error_phase": "download_configuration"}
 
     # ---- 临时连接的 attach 帮助 ----
     def _check_deadline(self):
@@ -1037,6 +1062,7 @@ class BrowserSession:
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom", "error": "Browser lost focus"}
         started, dispatched = time.perf_counter(), False
         failure_info, recovery_info, scroll_info = {}, {}, {}
+        download_observer = None
         try:
             p, browser = self._connect()
         except ModelRequestTimeout:
@@ -1123,7 +1149,8 @@ class BrowserSession:
                     full = node["href"]
                 _u = full.lower()
                 # PDF 链接判定：.pdf 后缀 / 查询/锚点参数 / 路径含 /pdf/（arXiv 的 /pdf/1706.03762 这类）
-                if (_u.endswith(".pdf") or ".pdf?" in _u or ".pdf#" in _u
+                if (not self.download_extensions or ".pdf" in self.download_extensions) and (
+                        _u.endswith(".pdf") or ".pdf?" in _u or ".pdf#" in _u
                         or "/pdf/" in _u or _u.endswith("/pdf")):
                     return {**self.download(full, page=page, browser=browser), **recovery_info, "target_ref": ref,
                             "actionability": {"point_source": point.get("point_source", "center"),
@@ -1132,6 +1159,8 @@ class BrowserSession:
                 raise BrowserActionError("Target is not editable")
             if name == "select" and point["tag"] != "select":
                 raise BrowserActionError("Custom dropdown: use click and then click its option")
+            download_observer = self._start_download_observer(
+                page, browser, name, f"{node.get('name', '')} {args.get('target', '')}")
             if name == "select":
                 matches = call(obj, "function(label){return Array.from(this.options).filter(o=>o.label===label && !o.disabled).map(o=>o.index)}", [str(args["option"])])
                 if len(matches) != 1:
@@ -1177,6 +1206,7 @@ class BrowserSession:
                     self._check_deadline()
                     page.keyboard.insert_text(str(args["text"]))
             self._check_deadline()
+            download_info = download_observer.finish() if download_observer is not None else {}
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "target_ref": ref, "coord": [point["x"], point["y"]],
                     **self._follow_owned_popup(browser),
@@ -1184,7 +1214,8 @@ class BrowserSession:
                     **scroll_info,
                     "actionability": {"point_source": point.get("point_source", "center"),
                                       "candidates_checked": point.get("candidates_checked", 1)},
-                    "coordinate_space": "css_viewport", "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+                    "coordinate_space": "css_viewport", **download_info,
+                    "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except ModelRequestTimeout:
             raise
         except Exception as exc:
@@ -1192,8 +1223,11 @@ class BrowserSession:
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "error": str(exc)[:500],
                     "target_ref": ref, **failure_info, **recovery_info,
+                    **self._download_error_details(exc),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         finally:
+            if download_observer is not None:
+                download_observer.close()
             try:
                 browser.close()
             except Exception:
@@ -1393,6 +1427,7 @@ class BrowserSession:
         """
         self._check_deadline()
         started, dispatched = time.perf_counter(), False
+        download_observer = None
         try:
             p, browser = self._connect()
         except ModelRequestTimeout:
@@ -1417,6 +1452,7 @@ class BrowserSession:
                     raise BrowserActionError("视觉坐标超出网页视口")
             name = action.action
             self._check_deadline()
+            download_observer = self._start_download_observer(page, browser, name, action.args.get("target"))
             if name in ("click", "double_click", "right_click"):
                 dispatched = True
                 page.mouse.click(vx, vy, button="right" if name == "right_click" else "left",
@@ -1435,18 +1471,22 @@ class BrowserSession:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "visual", "error": f"不支持的视觉动作 {name}"}
             self._check_deadline()
+            download_info = download_observer.finish() if download_observer is not None else {}
             return {"status": "executed" if dispatched else "rejected", "dispatched": dispatched,
                     "channel": "browser_dom", "resolved": "visual",
                     **self._follow_owned_popup(browser),
-                    "coord": [vx, vy], "coordinate_space": "css_viewport",
+                    "coord": [vx, vy], "coordinate_space": "css_viewport", **download_info,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except ModelRequestTimeout:
             raise
         except Exception as exc:
             self._check_deadline()
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
-                    "channel": "browser_dom", "resolved": "visual", "error": str(exc)[:300]}
+                    "channel": "browser_dom", "resolved": "visual", "error": str(exc)[:300],
+                    **self._download_error_details(exc)}
         finally:
+            if download_observer is not None:
+                download_observer.close()
             try:
                 browser.close()
             except Exception:
@@ -1620,6 +1660,7 @@ class BrowserSession:
         """CDP locator 执行浏览器动作（虚拟输入）。"""
         self._check_deadline()
         started, dispatched = time.perf_counter(), False
+        download_observer = None
         try:
             p, browser = self._connect()
         except ModelRequestTimeout:
@@ -1639,6 +1680,7 @@ class BrowserSession:
             if name in ("press", "hotkey"):
                 # 键盘动作不需要 locator
                 self._check_deadline()
+                download_observer = self._start_download_observer(page, browser, name, target)
                 dispatched = True
                 if name == "press":
                     page.keyboard.press(self._norm_key(str(action.args.get("key", ""))))
@@ -1647,8 +1689,10 @@ class BrowserSession:
                     if keys:
                         page.keyboard.press("+".join(keys))
                 self._check_deadline()
+                download_info = download_observer.finish() if download_observer is not None else {}
                 return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                         "resolved": "locator", "action": name,
+                        **download_info,
                         "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
             loc = self._locator_for(page, target)
             self._check_deadline()
@@ -1658,6 +1702,7 @@ class BrowserSession:
                         "error": "Target not found in DOM（换一种 target 描述，或该目标在 canvas/iframe）"}
             if loc.count() != 1:
                 raise BrowserActionError("目标名称存在歧义，请指定唯一节点")
+            download_observer = self._start_download_observer(page, browser, name, target)
             if name in ("click", "double_click", "right_click"):
                 dispatched = True
                 loc.first.click(button="right" if name == "right_click" else "left",
@@ -1680,16 +1725,21 @@ class BrowserSession:
                 return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                         "resolved": "locator", "error": f"unsupported action {name}"}
             self._check_deadline()
+            download_info = download_observer.finish() if download_observer is not None else {}
             return {"status": "executed", "dispatched": True, "channel": "browser_dom",
                     "resolved": "locator", "action": name,
+                    **download_info,
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
         except ModelRequestTimeout:
             raise
         except Exception as exc:
             self._check_deadline()
             return {"status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
-                    "channel": "browser_dom", "resolved": "locator", "error": str(exc)[:300]}
+                    "channel": "browser_dom", "resolved": "locator", "error": str(exc)[:300],
+                    **self._download_error_details(exc)}
         finally:
+            if download_observer is not None:
+                download_observer.close()
             try:
                 browser.close()
             except Exception:
