@@ -52,6 +52,8 @@ class WindowsEnvironment(Environment):
         self.os_name = "windows"
         self.browser_only = False  # 同时支持桌面任务；browser use 仅限已核验的无痕实例
         self.downloads_dir = downloads_dir
+        self._configured_downloads_dir = downloads_dir
+        self.download_destination = None
         self._browser_launcher = browser_launcher
         self._browser_ready = False
         self._browser_launch_profile = None
@@ -63,6 +65,19 @@ class WindowsEnvironment(Environment):
         self.work_screen = work_screen
         self._fallback_size = (width, height)
         self.dpi_awareness = None
+
+    def configure_task_downloads(self, task):
+        """Bind a task's explicit delivery directory before the planner runs."""
+        from ..download_destination import resolve_download_destination
+        import os
+
+        self.download_destination = resolve_download_destination(task, self._configured_downloads_dir)
+        self.downloads_dir = self.download_destination["directory"] or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "downloads")
+        self.download_destination["directory"] = self.downloads_dir
+        if self._browser_session is not None:
+            self._browser_session.downloads_dir = self.downloads_dir
+        return dict(self.download_destination)
 
     # ---- 观察 ----
     def _take_screenshot(self):
@@ -520,6 +535,7 @@ class WindowsEnvironment(Environment):
 
     # ---- Environment 接口 ----
     def reset(self, task: str) -> Observation:
+        self.configure_task_downloads(task)
         if self.execution_mode == "browser_first":
             self._browser_subtask_active = False
             self._desktop_subtask_active = False

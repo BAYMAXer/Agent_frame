@@ -221,8 +221,12 @@ class Pipeline:
         self._running_decision = None
         self._start_step_budget()
         # 阶段0：任务规划；browser_first 格式纠错失败必须明确终止。
-        self._emit_progress("planning", state, result)
         try:
+            configure_downloads = getattr(self.env, "configure_task_downloads", None)
+            destination = None
+            if callable(configure_downloads):
+                destination = configure_downloads(task)
+            self._emit_progress("planning", state, result, download_destination=destination)
             self._plan(task, state)
         except ValueError as exc:
             if not self.browser_first:
@@ -1269,11 +1273,12 @@ class Pipeline:
                 try:
                     raw = self.model.chat(messages, json_mode=True)
                     obj = parse_decision(raw)
-                    error = validate_executable_plan(obj, task)
+                    error = validate_executable_plan(obj, task, download_dir=getattr(self.env, "downloads_dir", None))
                     if error is None:
                         proposal = dict(obj)
                         proposal.pop("schema_version", None)
-                        state.memory.plan = normalize_plan(proposal, task, deduplicate=False)
+                        state.memory.plan = normalize_plan(proposal, task, deduplicate=False,
+                                                           download_dir=getattr(self.env, "downloads_dir", None))
                         state.memory.task_state["goal"] = task
                         state.memory.sync_plan_state()
                         state.memory.add_event(f"已制定 {len(state.memory.plan['steps'])} 个串行子任务")
@@ -1294,7 +1299,7 @@ class Pipeline:
             # 新规划只允许提出目标，不能通过自报 schema/status 冒充已经完成。
             proposal = dict(obj)
             proposal.pop("schema_version", None)
-            state.memory.plan = normalize_plan(proposal, task)
+            state.memory.plan = normalize_plan(proposal, task, download_dir=getattr(self.env, "downloads_dir", None))
             state.memory.task_state["goal"] = task
             state.memory.sync_plan_state()
             state.memory.add_event(f"📋 已制定任务计划：{len(state.memory.plan['steps'])} 个子目标")

@@ -1418,6 +1418,9 @@ class BrowserSession:
             path = self._downloaded[url]
             try:
                 size = os.path.getsize(path) if os.path.isfile(path) else 0
+                if (os.path.normcase(os.path.dirname(os.path.abspath(path)))
+                        != os.path.normcase(os.path.abspath(self.downloads_dir))):
+                    size = 0  # The same URL cached in another destination cannot satisfy this task.
                 expected = self._downloaded_sizes.get(url)
                 if expected is not None and size != expected:
                     size = 0

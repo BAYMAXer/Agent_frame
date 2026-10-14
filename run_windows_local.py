@@ -320,7 +320,7 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
     parser.add_argument("--chrome", default=CHROME_DEFAULT)
-    parser.add_argument("--download-dir", default=None, help="下载目录（缺省为 osworld_agent/downloads）")
+    parser.add_argument("--download-dir", default=None, help="下载目录（任务明确目录优先；否则缺省为版本 downloads）")
     parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省自动保存到 local_runs）")
     args = parser.parse_args()
     if any(value <= 0 or not math.isfinite(value)
@@ -390,6 +390,7 @@ def main() -> int:
         log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps,
                     "work_screen": work_screen.to_dict(), "dpi_awareness": dpi_awareness,
                     "execution_mode": args.execution_mode,
+                    "configured_download_dir": args.download_dir,
                     "ax_max_chars": args.ax_max_chars, "screenshot_max_edge": args.screenshot_max_edge})
         print(f"\n===== 任务开始 =====\n{args.task}\n")
         result = agent.run(args.task)

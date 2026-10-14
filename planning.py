@@ -11,6 +11,7 @@ from copy import deepcopy
 import ntpath
 import posixpath
 import re
+import unicodedata
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -26,6 +27,22 @@ _DISPATCH_ONLY = {
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _directory_error(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return "下载目录必须是非空字符串"
+    if len(value) > 4096:
+        return "下载目录不能超过 4096 个字符"
+    if any(unicodedata.category(char) == "Cc" for char in value):
+        return "下载目录不能包含控制字符"
+    directory = value.strip().replace("/", "\\")
+    drive, _ = ntpath.splitdrive(directory)
+    if not drive or not ntpath.isabs(directory):
+        return "下载目录必须是完整的 Windows 绝对路径"
+    if drive.startswith("\\\\") and len([part for part in drive[2:].split("\\") if part]) < 2:
+        return "下载目录必须包含 UNC 主机与共享名称"
+    return None
 
 
 def _completion_check(value: Any) -> Dict[str, str]:
@@ -44,10 +61,13 @@ def _completion_check(value: Any) -> Dict[str, str]:
         filename = _text(value.get("filename"))
         if filename and "/" not in filename and "\\" not in filename:
             check["filename"] = filename
+        if "directory" in value and _directory_error(value["directory"]) is None:
+            check["directory"] = _path_identity(value["directory"].strip())
     return check
 
 
-def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dict[str, Any]:
+def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True,
+                   download_dir: Optional[str] = None) -> Dict[str, Any]:
     """Create consecutive, stable IDs and a safe, bounded initial plan.
 
     Planner indices are ignored; goals retain their list order and get fresh
@@ -56,6 +76,11 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dic
     A plan produced here can be normalized again without losing its progress.
     When no valid subgoal survives, retain the task itself as one observable goal.
     """
+    if download_dir is not None:
+        directory_error = _directory_error(download_dir)
+        if directory_error:
+            raise ValueError(directory_error)
+    destination = _path_identity(download_dir.strip()) if download_dir is not None else ""
     obj = raw if isinstance(raw, dict) else {}
     source_steps = obj.get("steps") if isinstance(obj.get("steps"), list) else []
     canonical = obj.get("schema_version") == 1 and all(
@@ -76,6 +101,8 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True) -> Dic
             continue
         criteria = _text(source.get("completion_criteria")) or goal
         check = _completion_check(source.get("completion_check"))
+        if check["kind"] == "download" and destination:
+            check["directory"] = destination
         step_key = (" ".join(goal.split()).casefold(), " ".join(criteria.split()).casefold(),
                     tuple(sorted(check.items())), source.get("mode"),
                     _text(source.get("instructions")), _text(source.get("target_url")),
@@ -219,8 +246,22 @@ def _known_download_url(url: str, task: str) -> bool:
     return bool(host and re.search(r"(?<![\w.-])" + re.escape(host) + r"(?![\w.-])", task, re.I))
 
 
-def validate_executable_plan(raw: Any, task: str = "") -> Optional[str]:
+def _task_declares_directory(task: str, directory: str) -> bool:
+    # This is a literal declaration check, not an interpretation of plan prose.
+    # The caller supplies parsed/configured destinations through download_dir.
+    wanted = _path_identity(directory)
+    normalized_task = task.replace("/", "\\").casefold()
+    suffix = r"\\?" if not wanted.endswith("\\") else ""
+    return bool(re.search(re.escape(wanted) + suffix + r"(?![A-Za-z0-9_.\\-])", normalized_task))
+
+
+def validate_executable_plan(raw: Any, task: str = "", download_dir: Optional[str] = None) -> Optional[str]:
     """Strict browser-first plans must cover the task before any action starts."""
+    if download_dir is not None:
+        directory_error = _directory_error(download_dir)
+        if directory_error:
+            return directory_error
+    destination = _path_identity(download_dir.strip()) if download_dir is not None else ""
     if not isinstance(raw, dict) or not isinstance(raw.get("steps"), list):
         return "计划必须包含 steps 数组"
     if not 1 <= len(raw["steps"]) <= 8:
@@ -234,7 +275,19 @@ def validate_executable_plan(raw: Any, task: str = "") -> Optional[str]:
             return f"子任务 {index} 缺少 goal、instructions 或 completion_criteria"
         if step.get("target_url") and not _http_url(_text(step["target_url"])):
             return f"子任务 {index} 的 target_url 必须是完整 HTTP(S) 网址"
-        check = _completion_check(step.get("completion_check"))
+        raw_check = step.get("completion_check")
+        if isinstance(raw_check, dict) and "directory" in raw_check:
+            directory_error = _directory_error(raw_check["directory"])
+            if directory_error:
+                return f"子任务 {index}：{directory_error}"
+            if _text(raw_check.get("kind")).lower() != "download":
+                return f"子任务 {index} 的 directory 仅用于 kind=download 的文件落盘检查"
+            directory = _path_identity(raw_check["directory"].strip())
+            if destination and directory != destination:
+                return f"子任务 {index} 的下载目录与可信目标目录不一致；使用已配置的真实下载目录，不能自行指定其他位置"
+            if not destination and not _task_declares_directory(task, directory):
+                return f"子任务 {index} 的下载目录未由用户任务或配置提供；不能猜测 completion_check.directory"
+        check = _completion_check(raw_check)
         goal = _text(step.get("goal"))
         criteria = _text(step.get("completion_criteria"))
         saving = _requires_download_check(step)
@@ -369,7 +422,11 @@ def _path_identity(path: str) -> str:
     if not path:
         return ""
     if "\\" in path or ntpath.splitdrive(path)[0]:
-        return ntpath.normcase(ntpath.normpath(path))
+        normalized = ntpath.normcase(ntpath.normpath(path))
+        drive, tail = ntpath.splitdrive(normalized)
+        if drive.startswith("\\\\") and tail in {"", "\\"}:
+            return drive  # A UNC share root is the same directory with or without its last slash.
+        return normalized
     return posixpath.normpath(path)
 
 
@@ -409,7 +466,9 @@ def _download_matches_check(step: Dict[str, Any], info: Dict[str, Any]) -> bool:
     path = _text(info.get("path"))
     filename = path.replace("\\", "/").rsplit("/", 1)[-1]
     return (bool(path) and (not check.get("filename") or check["filename"] == filename)
-            and (not check.get("url") or _url_matches(check["url"], _text(info.get("url")))))
+            and (not check.get("url") or _url_matches(check["url"], _text(info.get("url"))))
+            and (not check.get("directory")
+                 or _path_identity(ntpath.dirname(path)) == _path_identity(check["directory"])))
 
 
 def _previous_download_can_complete(plan: Dict[str, Any], step: Dict[str, Any], info: Dict[str, Any]) -> bool:
