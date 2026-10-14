@@ -60,6 +60,7 @@ class BrowserSession:
         self.last_capture_info = {}
         self.request_deadline = None
         self._downloaded = {}  # url -> path，本次会话已下载的文件（幂等去重）
+        self._downloaded_sizes = {}  # 保存原始大小，拒绝非空但已被截断的缓存
 
     # ---- 临时连接的 attach 帮助 ----
     def _check_deadline(self):
@@ -979,7 +980,7 @@ class BrowserSession:
             self._validate_snapshot(route, page, cdp)
             name, args = action.action, action.args
             self._check_deadline()
-            # 点击的是 PDF 链接 → 直接 HTTP 下载保存（而非浏览器打开 PDF 查看器）
+            # 点击 PDF 链接 → 用当前 Chrome 网络通道下载并核实落盘
             if name in ("click", "right_click", "double_click") and node.get("href"):
                 try:
                     from urllib.parse import urljoin
@@ -990,7 +991,7 @@ class BrowserSession:
                 # PDF 链接判定：.pdf 后缀 / 查询/锚点参数 / 路径含 /pdf/（arXiv 的 /pdf/1706.03762 这类）
                 if (_u.endswith(".pdf") or ".pdf?" in _u or ".pdf#" in _u
                         or "/pdf/" in _u or _u.endswith("/pdf")):
-                    return {**self.download(full), **recovery_info, "target_ref": ref,
+                    return {**self.download(full, page=page, browser=browser), **recovery_info, "target_ref": ref,
                             "actionability": {"point_source": point.get("point_source", "center"),
                                               "candidates_checked": point.get("candidates_checked", 1)}}
             if name == "type" and (not point["editable"] or point["readOnly"]):
@@ -1346,16 +1347,9 @@ class BrowserSession:
         finally:
             self._disconnect(p, browser)
 
-    def download(self, url):
-        """用 HTTP 下载文件（论文 PDF 等）到 downloads 目录，返回结果 dict。
-
-        带浏览器 User-Agent、跟随重定向；从 Content-Disposition 或 URL 提取文件名。
-        """
+    def download(self, url, *, page=None, browser=None):
+        """通过受管 Chrome 下载，复用浏览器代理、证书和会话。"""
         self._check_deadline()
-        import requests
-        import urllib3
-        from urllib.parse import urlparse, unquote
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         url = (url or "").strip()
         if not url.startswith(("http://", "https://")):
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
@@ -1365,6 +1359,14 @@ class BrowserSession:
             path = self._downloaded[url]
             try:
                 size = os.path.getsize(path) if os.path.isfile(path) else 0
+                expected = self._downloaded_sizes.get(url)
+                if expected is not None and size != expected:
+                    size = 0
+                from .browser_download import _pdf_url
+                if size > 0 and (_pdf_url(url) or path.lower().endswith(".pdf")):
+                    with open(path, "rb") as handle:
+                        if not handle.read(1024).lstrip().startswith(b"%PDF-"):
+                            size = 0
             except OSError:
                 size = 0
             if size > 0:
@@ -1374,85 +1376,26 @@ class BrowserSession:
                         "message": f"已重新核实本地文件：{path}（{size} 字节），无需重复下载"}
             # 文件被删除、变成目录或空文件时，缓存不能阻止重新下载。
             self._downloaded.pop(url, None)
-        headers = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")}
-        started = time.perf_counter()
-        r = None
-        partial_path = None
+            self._downloaded_sizes.pop(url, None)
+        from .browser_download import download_through_chromium
+        if page is not None and browser is not None:
+            return download_through_chromium(self, url, page, browser)
+        p = attached = None
         try:
-            # verify=False：公司网络走 MITM 代理，Python CA 库缺公司根证书（仅影响下载，模型走 HTTP 内网）
-            r = requests.get(url, headers=headers, timeout=self._timeout_seconds(90), stream=True,
-                             allow_redirects=True, verify=False)
-            self._check_deadline()
-            if r.status_code != 200:
-                return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                        "action": "download", "error": f"HTTP {r.status_code}"}
-            # 文件名：优先 Content-Disposition，其次 URL 路径
-            filename = None
-            cd = r.headers.get("Content-Disposition", "")
-            m = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", cd, re.IGNORECASE)
-            if m:
-                filename = unquote(m.group(1).strip())
-            if not filename:
-                filename = unquote(os.path.basename(urlparse(url).path)) or "download"
-            # 无扩展名时按 content-type 补
-            if "." not in filename:
-                ct = r.headers.get("Content-Type", "")
-                if "pdf" in ct:
-                    filename += ".pdf"
-                elif "html" in ct:
-                    filename += ".html"
-            os.makedirs(self.downloads_dir, exist_ok=True)
-            path = os.path.join(self.downloads_dir, filename)
-            # 文件已存在 → 加后缀改名（xxx_1.pdf、xxx_2.pdf…），不覆盖旧下载
-            if os.path.exists(path):
-                base, ext = os.path.splitext(filename)
-                i = 1
-                while os.path.exists(os.path.join(self.downloads_dir, f"{base}_{i}{ext}")):
-                    i += 1
-                filename = f"{base}_{i}{ext}"
-                path = os.path.join(self.downloads_dir, filename)
-            size = 0
-            partial_path = path + "." + uuid.uuid4().hex + ".part"
-            with open(partial_path, "xb") as f:
-                for chunk in r.iter_content(65536):
-                    self._check_deadline()
-                    f.write(chunk)
-                    size += len(chunk)
-            self._check_deadline()
-            os.replace(partial_path, path)
-            partial_path = None
-            self._downloaded[url] = path
-            self._check_deadline()
-            # 落盘校验：写完后读回，确认真实存在 + 大小匹配（不靠模型自评）
-            verified = False
-            try:
-                verified = os.path.exists(path) and os.path.getsize(path) == size and size > 0
-            except Exception:  # noqa: BLE001
-                verified = False
-            return {"status": "executed", "dispatched": True, "channel": "browser_dom",
-                    "action": "download", "path": path, "bytes": size,
-                    "verified": verified, "url": url,
-                    "message": (f"✅ 已成功下载到 {path}（{size} 字节），已核实此文件落盘" if verified
-                                else f"⚠️ 下载写入异常：{path} 落盘校验失败"),
-                    "latency_ms": round((time.perf_counter() - started) * 1000, 2)}
+            p, attached = self._connect()
+            page = self._pick_page(attached)
+            if page is None:
+                raise BrowserActionError("No focused or bound page for download")
+            return download_through_chromium(self, url, page, attached)
         except ModelRequestTimeout:
             raise
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._check_deadline()
             return {"status": "rejected", "dispatched": False, "channel": "browser_dom",
-                    "action": "download", "error": str(exc)[:300]}
+                    "action": "download", "verified": False, "error": str(exc)[:300]}
         finally:
-            if r is not None and hasattr(r, "close"):
-                try:
-                    r.close()
-                except Exception:
-                    pass
-            if partial_path is not None:
-                try:
-                    os.remove(partial_path)
-                except OSError:
-                    pass
+            if p is not None and attached is not None:
+                self._disconnect(p, attached)
 
     def execute_target(self, action, target, allowed=None, route=None):
         """纯 target 描述执行：先 resolve ref → DOM 点击；否则 Playwright locator 匹配。

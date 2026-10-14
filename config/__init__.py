@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 CONFIG_DIR = Path(__file__).parent
 ACTION_YAML = CONFIG_DIR / "action.yaml"
 SKILLS_YAML = CONFIG_DIR / "skills.yaml"
+DEFAULT_AX_MAX_CHARS = 12000
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -94,7 +95,7 @@ class ContextConfig:
     memory_tokens: int = 2200
     auxiliary_tokens: int = 1200
     structure_tokens: int = 5000
-    ax_max_chars: int = 5000  # 浏览器精简 AX 的字符上限，与 structure_tokens 的 token 预算独立
+    ax_max_chars: int = DEFAULT_AX_MAX_CHARS  # 浏览器精简 AX 的字符上限，与 structure_tokens 的 token 预算独立
     screenshot_max_edge: int = 1280  # 浏览器模型输入截图最长边；保留原始坐标用于操作
     tokenizer_path: str = ""  # 本地 tokenizer；不填则按 UTF-8 字节保守预算
 

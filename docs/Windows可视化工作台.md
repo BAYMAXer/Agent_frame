@@ -28,15 +28,17 @@ python .\osworld_agent_1010\launch.py
 
 1. 填写任务目标，选择“浏览器优先”（默认）或“通用桌面 · 兼容模式”。默认最大执行步数为 20，单步预算 120 秒。
 2. 选择或输入决策与定位模型，检查各自的 API 地址。模型预设读取自 `config/model_presets.yaml`；自定义模型可直接输入名称与地址。
-3. 在定位模型的“协议与认证”中选择 UI-Venus-2 或 UI-TARS。定位模型保留为视觉兜底；网页节点操作优先走 AX 引用。高级设置提供决策、定位与单步超时，以及 AX 字符预算（默认 5000）和浏览器截图最长边（默认 1280 像素）。字符预算与模型 token 预算独立；截图保持宽高比例，操作定位仍使用原始网页坐标。
+3. 在定位模型的“协议与认证”中选择 UI-Venus-2 或 UI-TARS。定位模型保留为视觉兜底；网页节点操作优先走 AX 引用。高级设置提供决策、定位与单步超时，以及 AX 字符预算（默认 12000）和浏览器截图最长边（默认 1280 像素）。字符预算与模型 token 预算独立；截图保持宽高比例，操作定位仍使用原始网页坐标。
 4. 任务描述旁提供“开始运行”和“测试模型连接”，无需滚动到运行概览。可先测试决策模型的视觉连接，再开始任务。界面自动打开实时工作区；“停止运行”会终止当前任务并保留已有记录。桌面示例会自动选择通用桌面模式。
 
 任务、模型地址、执行模式和预算会自动保存为浏览器草稿；配置页的 API Key 不进入草稿。系统提示词随模式切换，仅供预览，实际完整输入可在实时调用中查看。
 
+Qwen3.6-27B 的网页 AX 默认预算为 12000 字符，作为工程起点，尚未验证为该模型的最优值。[官方模型卡](https://huggingface.co/Qwen/Qwen3.6-27B) 标注原生上下文为 262144 tokens；实际模型服务的容量需按部署确认，所以框架仍保留总输入 30000 tokens 和上下文窗口 65536 tokens。字符预算不等于 token 预算。已有草稿中的自定义值继续保留；更新后可在高级设置将 AX 字符预算改为 12000。
+
 命令行也使用浏览器优先模式：
 
 ```powershell
-.\.venv\Scripts\python.exe .\osworld_agent_1010\launch.py --runner local --task "搜索 Attention Is All You Need，找到论文并下载 PDF" --execution-mode browser_first --max-steps 20 --ax-max-chars 5000 --screenshot-max-edge 1280 --step-timeout 120
+.\.venv\Scripts\python.exe .\osworld_agent_1010\launch.py --runner local --task "搜索 Attention Is All You Need，找到论文并下载 PDF" --execution-mode browser_first --max-steps 20 --ax-max-chars 12000 --screenshot-max-edge 1280 --step-timeout 120
 ```
 
 `--execution-mode desktop` 使用兼容的通用桌面流程。Chrome 默认路径为 `C:\Program Files\Google\Chrome\Application\chrome.exe`，可用 `--chrome` 指定；浏览器调试端口默认 9222，可用 `--browser-port` 指定。Agent 使用专用无痕浏览器；新启动实例直接复用经身份核验的空白启动页，导航和跨子任务不重复开窗。任务收尾关闭本次拥有的页面，并清理本次新启动的专用实例；复用端点中的其它页面不受影响。

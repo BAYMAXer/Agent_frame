@@ -468,12 +468,12 @@ def _start_local(cfg: dict):
     execution_mode = cfg.get("execution_mode", os.getenv("OSWORLD_LOCAL_EXECUTION_MODE", "browser_first"))
     if not isinstance(execution_mode, str) or execution_mode not in {"browser_first", "desktop"}:
         return {"ok": False, "error": "执行模式必须是 browser_first 或 desktop"}
-    from osworld_agent.config import ContextConfig
+    from osworld_agent.config import ContextConfig, DEFAULT_AX_MAX_CHARS
     try:
         max_steps = cfg.get("max_steps", 20)
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError("最大步数必须为正整数")
-        browser_context = ContextConfig(ax_max_chars=cfg.get("ax_max_chars", 5000),
+        browser_context = ContextConfig(ax_max_chars=cfg.get("ax_max_chars", DEFAULT_AX_MAX_CHARS),
                                         screenshot_max_edge=cfg.get("screenshot_max_edge", 1280))
         timeouts = {name: cfg.get(name, float(os.getenv(env_name, default)))
                     for name, env_name, default in

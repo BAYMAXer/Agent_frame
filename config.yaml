@@ -35,7 +35,7 @@ env:
   screen_height: 1080
 
 context:
-  ax_max_chars: 5000        # 精简网页 AX 的字符上限
+  ax_max_chars: 12000       # 精简网页 AX 的字符上限；可按实际模型服务容量调整
   screenshot_max_edge: 1280 # 浏览器模型输入截图最长边，保持宽高比例
   max_input_tokens: 30000
   output_reserve: 2048

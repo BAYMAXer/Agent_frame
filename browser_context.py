@@ -11,6 +11,9 @@ import re
 import time
 from collections import defaultdict
 from typing import Any
+from urllib.parse import unquote, urlsplit
+
+from .config import DEFAULT_AX_MAX_CHARS
 
 
 _HEADER_KEYS = ("kind", "snapshot_id", "url", "title", "viewport", "ax_quality", "warnings", "nodes")
@@ -93,6 +96,33 @@ def _terms(query: str) -> set[str]:
             if len(term) > 1 and term not in _STOPWORDS}
 
 
+def _resource_kind(node: dict) -> str:
+    """Recognize file/access controls separately from paper identity words."""
+    if node.get("role") not in {"link", "button", "menuitem"}:
+        return ""
+    name = str(node.get("name", "")).casefold()
+    try:
+        path = unquote(urlsplit(str(node.get("href", ""))).path).casefold()
+    except ValueError:
+        path = ""
+    if (path.endswith((".pdf", "/pdf")) or "/pdf/" in path
+            or re.search(r"\bpdf\b", name)):
+        return "pdf"
+    if (re.search(r"\bdownload\b|\bfull[ -]?text\b|下载|全文|原文", name)
+            or re.search(r"/(?:download|fulltext)(?:/|$)", path)):
+        return "download"
+    return ""
+
+
+def _identity_score(node: dict, terms: set[str]) -> int:
+    text = (str(node.get("name", "")) + " " + str(node.get("value", ""))).casefold()
+    # 'at' must not match Metadata, or 'view' Reviews. Chinese identity phrases
+    # may remain substrings because AX does not supply word segmentation.
+    return sum(bool(term in text) if re.search(r"[\u4e00-\u9fff]", term) else
+               bool(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text))
+               for term in terms)
+
+
 def _compact_node(node: dict) -> dict:
     compact = {key: node[key] for key in ("ref", "parent", "role") if node.get(key) is not None}
     for key, limit in (("name", 240), ("value", 160)):
@@ -117,7 +147,7 @@ def _compact_node(node: dict) -> dict:
 class BrowserAXSelector:
     """Select atomic result entries, their ancestors, and essential controls."""
 
-    def __init__(self, max_chars: int = 5000):
+    def __init__(self, max_chars: int = DEFAULT_AX_MAX_CHARS):
         if type(max_chars) is not int or max_chars < 128:
             raise ValueError("AX character budget must be an integer of at least 128")
         self.max_chars = max_chars
@@ -139,6 +169,10 @@ class BrowserAXSelector:
         invalid_roi = roi is not None and region is None
         query = _query(subtask)
         terms = _terms(query)
+        completion_check = subtask.get("completion_check") if isinstance(subtask, dict) else None
+        resource_intent = bool(re.search(r"\b(?:download|pdf|full[ -]?text)\b|下载|全文|原文", query, re.I)
+            or (isinstance(completion_check, dict) and completion_check.get("kind") == "download"))
+        resources = {node["ref"]: _resource_kind(node) for node in nodes if _resource_kind(node)}
         viewport = block.get("viewport") or {}
 
         def ancestors(ref):
@@ -156,7 +190,7 @@ class BrowserAXSelector:
                 if current in result or current not in by_ref:
                     continue
                 result.add(current)
-                todo.extend(children[current])
+                todo.extend(children.get(current, ()))
             return result
 
         def compact_refs(refs):
@@ -171,10 +205,10 @@ class BrowserAXSelector:
                     result.discard(ref)
             return result
 
-        def visible(node):
+        def visible(node, *, within_region=True):
             bounds = node.get("bounds")
             if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
-                return bool(node.get("in_viewport")) and region is None
+                return bool(node.get("in_viewport")) and (region is None or not within_region)
             try:
                 x, y, width, height = map(float, bounds)
                 vw, vh = float(viewport["width"]), float(viewport["height"])
@@ -184,11 +218,88 @@ class BrowserAXSelector:
                 return False
             if not all(math.isfinite(value) for value in (x, y, width, height, vw, vh)) or vw <= 0 or vh <= 0:
                 return False
-            rx, ry, rw, rh = region["bbox"] if region else [0, 0, 1, 1]
+            rx, ry, rw, rh = region["bbox"] if region and within_region else [0, 0, 1, 1]
             return (width > 0 and height > 0 and x < (rx + rw) * vw and x + width > rx * vw
                     and y < (ry + rh) * vh and y + height > ry * vh)
 
         group_cache = {}
+
+        def bounds(ref):
+            raw = by_ref[ref].get("bounds")
+            if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+                return None
+            if any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   or not math.isfinite(value) for value in raw):
+                return None
+            x, y, width, height = map(float, raw)
+            return (x, y, width, height) if width > 0 and height > 0 else None
+
+        # Chromium AX order can list all result headings before their author,
+        # snippet and PDF siblings. Source-order neighbours then attach every
+        # PDF to the last heading. Use geometry only within the same AX parent;
+        # semantic result boundaries below still take precedence.
+        geometry_owners = {}
+        geometry_members = {}
+        wrapped_resource_owners = {}
+        for parent, siblings in children.items():
+            headings = [ref for ref in siblings if by_ref[ref].get("role") == "heading"
+                        and bounds(ref) is not None]
+            if len(headings) < 2:
+                continue
+            heading_bounds = {ref: bounds(ref) for ref in headings}
+            next_tops = {}
+            for heading, (hx, hy, hw, _) in heading_bounds.items():
+                next_tops[heading] = min((other_y for other, (other_x, other_y, other_w, _)
+                                         in heading_bounds.items() if other != heading and other_y > hy
+                                         and min(hx + hw, other_x + other_w) > max(hx, other_x)),
+                                        default=float("inf"))
+            groups = {ref: descendants(ref) for ref in headings}
+            owners = {ref: ref for ref in headings}
+            probes = [ref for ref in siblings if ref not in owners
+                      and by_ref[ref].get("role") not in _CONTAINER_ROLES | _ENTRY_ROLES]
+            # Inspect resource leaves inside sibling wrappers. The wrapper may
+            # span several results, so never add its complete subtree as a group.
+            wrapped = set()
+            for ref in siblings:
+                if by_ref[ref].get("role") in {"generic", "group", "section"}:
+                    wrapped.update(item for item in descendants(ref) if item in resources and not any(
+                        by_ref[ancestor].get("role") in _ENTRY_ROLES for ancestor in
+                        self._parent_chain(item, by_ref) if ancestor != parent))
+            probes.extend(sorted(wrapped, key=order.get))
+            for ref in probes:
+                rect = bounds(ref)
+                if rect is None:
+                    continue
+                x, y, width, height = rect
+                aligned, below = [], []
+                for heading, (hx, hy, hw, hh) in heading_bounds.items():
+                    vertical_overlap = min(y + height, hy + hh) - max(y, hy)
+                    horizontal_overlap = min(x + width, hx + hw) - max(x, hx)
+                    if vertical_overlap > 0:
+                        # A resource link beside the title belongs to its row.
+                        # Equal-distance rows/columns remain unassociated.
+                        gap = max(hx - (x + width), x - (hx + hw), 0)
+                        aligned.append((gap, heading))
+                    elif horizontal_overlap > 0 and y >= hy + hh:
+                        if y + height <= next_tops[heading]:
+                            below.append(heading)
+                owner = None
+                if aligned:
+                    nearest = min(gap for gap, _ in aligned)
+                    matches = [heading for gap, heading in aligned if gap == nearest]
+                    if len(matches) == 1:
+                        owner = matches[0]
+                elif len(below) == 1:
+                    owner = below[0]
+                if owner is not None:
+                    if ref in wrapped:
+                        wrapped_resource_owners[ref] = owner
+                        groups[owner].update(descendants(ref) | (ancestors(ref) - ancestors(parent)))
+                    else:
+                        owners[ref] = owner
+                        groups[owner].update(descendants(ref))
+            geometry_owners[parent] = owners
+            geometry_members.update(groups)
 
         def result_group(ref):
             path = ancestors(ref)
@@ -199,16 +310,30 @@ class BrowserAXSelector:
                 if entry not in group_cache:
                     group_cache[entry] = descendants(entry)
                 return ("entry", entry), group_cache[entry]
+            wrapped_heading = next((wrapped_resource_owners[item] for item in
+                                    self._parent_chain(ref, by_ref) if item in wrapped_resource_owners), None)
+            if wrapped_heading is not None:
+                return ("heading", wrapped_heading), geometry_members[wrapped_heading]
             heading = next((item for item in self._parent_chain(ref, by_ref)
                             if by_ref[item].get("role") == "heading"), None)
+            geometry_parent = None
             if heading is None:
-                parent = by_ref[ref].get("parent")
-                siblings = children[parent]
-                index = siblings.index(ref) if ref in siblings else -1
-                # A PDF link/snippet may be a sibling of a title heading.
-                prior = [item for item in siblings[:index + 1] if by_ref[item].get("role") == "heading"]
-                heading = prior[-1] if prior else None
+                for item in self._parent_chain(ref, by_ref):
+                    parent = by_ref[item].get("parent")
+                    if parent in geometry_owners:
+                        geometry_parent = parent
+                        heading = geometry_owners[parent].get(item)
+                        break
+                if geometry_parent is None:
+                    parent = by_ref[ref].get("parent")
+                    siblings = children[parent]
+                    index = siblings.index(ref) if ref in siblings else -1
+                    # Legacy trees without geometry retain local source order.
+                    prior = [item for item in siblings[:index + 1] if by_ref[item].get("role") == "heading"]
+                    heading = prior[-1] if prior else None
             if heading is not None:
+                if heading in geometry_members:
+                    return ("heading", heading), geometry_members[heading]
                 if heading not in group_cache:
                     sibling_refs = children[by_ref[heading].get("parent")]
                     index = sibling_refs.index(heading)
@@ -248,22 +373,63 @@ class BrowserAXSelector:
         for node in nodes:
             if node.get("role") in _CONTAINER_ROLES or node.get("role") in _ENTRY_ROLES:
                 continue
-            text = (str(node.get("name", "")) + " " + str(node.get("value", ""))).casefold()
-            score = sum(1 for term in terms if term in text)
+            score = _identity_score(node, terms)
             if not score and region is None and not viewport_only:
                 continue
             key, members = result_group(node["ref"])
             if (region is not None or viewport_only) and not any(visible(by_ref[item]) for item in members):
                 continue
             if key not in candidates:
-                candidates[key] = {"refs": members | ancestors(node["ref"]), "score": score}
+                candidates[key] = {"key": key, "refs": members | ancestors(node["ref"]), "score": score,
+                                   "matched": {node["ref"]} if score else set()}
             else:
                 candidates[key]["score"] = max(candidates[key]["score"], score)
+                if score:
+                    candidates[key]["matched"].add(node["ref"])
+
+        identity_match = any(item["score"] for item in candidates.values())
+        if resource_intent:
+            # Do not treat an unassociated PDF next to multiple result headings
+            # as a detail-page control. Its identity still needs observation.
+            result_scope = sum(any(by_ref[item].get("role") == "link" and item not in resources
+                                  for item in geometry_members[heading])
+                               for heading in geometry_members) > 1 or sum(
+                node.get("role") in _ENTRY_ROLES and any(
+                    by_ref[item].get("role") == "heading" for item in descendants(node["ref"]))
+                for node in nodes) > 1
+            scoped_resources = any(item["score"] and item["refs"] & resources.keys()
+                                   for item in candidates.values())
+            detail_companions = set()
+            for ref in resources:
+                key, members = result_group(ref)
+                # In a results list, keep the matched paper's resources through
+                # its group. On detail pages, a root/menu Paper/PDF control can
+                # be separate from the banner title and still must be exposed.
+                standalone = (key[0] == "node" or not any(
+                    by_ref[item].get("role") == "heading" or
+                    (by_ref[item].get("role") == "link" and item not in resources and by_ref[item].get("name"))
+                    for item in members))
+                companion = identity_match and not scoped_resources and standalone and not result_scope
+                if (region is not None or viewport_only) and not any(
+                        visible(by_ref[item], within_region=not companion) for item in members):
+                    continue
+                if companion and key not in candidates:
+                    detail_companions.update(members | ancestors(ref))
+                    continue
+                if key not in candidates and (not terms or (not scoped_resources and standalone and not result_scope)):
+                    candidates[key] = {"key": key, "refs": members | ancestors(ref), "score": 0,
+                                       "matched": set(), "resource_priority": True}
+            if detail_companions:
+                # Keep the observed document identity and its separate access
+                # controls together, while preserving every node's real parent.
+                target = max((item for item in candidates.values() if item["score"]),
+                             key=lambda item: (item["score"], item["key"][0] == "heading"))
+                target["refs"].update(detail_companions)
 
         # A new query is not present in the input yet. A unique search input is
         # enough to dispatch typing without an unnecessary region-model call.
         search_intent = bool(re.search(r"search|搜索|检索|输入|type", query, re.I))
-        has_match = any(item["score"] for item in candidates.values())
+        has_match = identity_match or (resource_intent and not terms and bool(candidates))
         if search_intent and len(search_inputs) == 1 and not has_match:
             has_match = True
         best = max((item["score"] for item in candidates.values()), default=0)
@@ -294,17 +460,44 @@ class BrowserAXSelector:
             payload["nodes"] = [_compact_node(by_ref[ref]) for ref in sorted(compact_refs(refs), key=order.get)]
             return payload
 
-        ranked = sorted(candidates.values(), key=lambda item: (-item["score"], min(order[ref] for ref in item["refs"])))
+        def core(item):
+            members = item["refs"]
+            pivots = {ref for ref in members if ref in resources or by_ref[ref].get("role") == "heading"}
+            for ref in list(pivots):
+                if by_ref[ref].get("role") == "heading":
+                    pivots.update(child for child in descendants(ref) if by_ref[child].get("role") == "link")
+            matches = item.get("matched", set())
+            if matches and not any(ref in matches for ref in pivots):
+                # Text evidence may match only in a snippet. Retain one useful
+                # witness, rather than turning every repeated snippet into core.
+                pivots.add(max(matches, key=lambda ref: (_identity_score(by_ref[ref], terms), -order[ref])))
+            return set().union(*(ancestors(ref) for ref in pivots)) if pivots else set(members)
+
+        ranked = sorted(candidates.values(), key=lambda item: (
+            -bool(item.get("resource_priority")), -item["score"],
+            min(order[ref] for ref in item["refs"])))
         all_groups = [*mandatory.values(), *(item["refs"] for item in ranked)]
         all_refs = set().union(*all_groups) if all_groups else set()
         candidate_chars = len(serialize_ax(render(all_refs)))
-        chosen, omitted_groups = set(), 0
-        for group in all_groups:
+        chosen, omitted_groups, trimmed_groups = set(), 0, 0
+        essential = [set(group) for group in mandatory.values()] + [core(item) for item in ranked]
+        for group, minimum in zip(all_groups, essential):
             proposal = chosen | group
             if len(serialize_ax(render(proposal))) <= self.max_chars:
                 chosen = proposal
             elif not group <= chosen:
-                omitted_groups += 1
+                proposal = chosen | minimum
+                if len(serialize_ax(render(proposal))) > self.max_chars:
+                    omitted_groups += 1
+                    continue
+                chosen = proposal
+                trimmed_groups += 1
+                # Title and file controls are atomic; summaries/authors are
+                # optional and can use the remaining budget without losing them.
+                for ref in sorted(group - minimum, key=order.get):
+                    proposal = chosen | ancestors(ref)
+                    if len(serialize_ax(render(proposal))) <= self.max_chars:
+                        chosen = proposal
         selected = render(chosen)
         # A blank managed page should go straight to goto, without vision.
         has_content = any(node.get("direct") or (node.get("role") not in _CONTAINER_ROLES
@@ -313,7 +506,7 @@ class BrowserAXSelector:
         reasons = []
         if invalid_roi:
             reasons.append("invalid_roi")
-        if header_overflow or candidate_chars > self.max_chars:
+        if header_overflow or omitted_groups:
             reasons.append("over_budget")
         if not has_match and region is None and not viewport_only and not blank_page:
             reasons.append("no_match")
@@ -322,6 +515,8 @@ class BrowserAXSelector:
         metadata = {"snapshot_id": snapshot_id, "original_count": len(nodes), "selected_count": len(selected["nodes"]),
                     "original": len(nodes), "selected": len(selected["nodes"]), "total": len(nodes),
                     "omitted": len(nodes) - len(selected["nodes"]), "omitted_groups": omitted_groups,
+                    "trimmed_groups": trimmed_groups, "resource_intent": resource_intent,
+                    "resource_refs": [node["ref"] for node in selected["nodes"] if node["ref"] in resources],
                     "original_serialized_chars": len(json.dumps(block, ensure_ascii=False, separators=(",", ":"))),
                     "candidate_serialized_chars": candidate_chars, "serialized_chars": len(serialize_ax(selected)),
                     "needs_region": bool(reasons), "reason": ",".join(reasons) or ("blank_page" if blank_page else "selected"),

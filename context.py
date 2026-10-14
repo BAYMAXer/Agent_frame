@@ -2,12 +2,12 @@
 
 解决「上下文受得了吗」：不是把整棵 AX-Tree 塞进 prompt，而是：
 - 用 tokenizer（或 UTF-8 字节保守估算）精确计数；
-- 浏览器 AX 按当前子任务选择完整条目、保留祖先，并执行独立字符上限；
+- 浏览器 AX 按当前子任务保留标题/资源核心与祖先，再填充附加内容，并执行独立字符上限；
 - 分层预算：memory / auxiliary（工具结果）/ structure（页面结构）各占一份，超预算抛异常。
 """
 from __future__ import annotations
 
-from .config import ContextConfig
+from .config import ContextConfig, DEFAULT_AX_MAX_CHARS
 from .browser_context import BrowserAXSelector, serialize_ax
 
 
@@ -56,7 +56,7 @@ class PromptCompiler:
         sections, exposed, metadata = [], [], []
         remaining = budget
         ax_chars = 0
-        ax_limit = getattr(self.config, "ax_max_chars", 5000)
+        ax_limit = getattr(self.config, "ax_max_chars", DEFAULT_AX_MAX_CHARS)
         for block in blocks:
             if block.get("kind") != "browser_ax":
                 rendered = self.clip(str(block.get("text", "")), min(remaining, self.config.structure_tokens))
@@ -118,5 +118,5 @@ class PromptCompiler:
             "input_estimate": estimated, "limit": limit, "image_count": len(images),
             "image_tokens_each_estimate": cfg.image_tokens, "selection": selection,
             "ax_serialized_chars": sum(item.get("serialized_chars", 0) for item in selection),
-            "ax_max_chars": getattr(cfg, "ax_max_chars", 5000),
+            "ax_max_chars": getattr(cfg, "ax_max_chars", DEFAULT_AX_MAX_CHARS),
             "exposed_refs": sorted(refs)}

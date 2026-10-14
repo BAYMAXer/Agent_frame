@@ -7,7 +7,7 @@
 
 说明：
 - 默认 browser_first：按计划子任务进入独立浏览器；--execution-mode desktop 保留桌面兼容流程；
-- 浏览器输入截图最长边默认 1280 像素，精简 AX 默认最多 5000 字符；
+- 浏览器输入截图最长边默认 1280 像素，精简 AX 默认最多 12000 字符；
 - 进入网页子任务时，启动或核验带 remote-debugging 的无痕 Chrome；
 - browser_first 绑定本次运行的私有网页，不依赖桌面焦点；
 - 目标应用在任务期间置顶，切换应用或任务结束时恢复原置顶状态；
@@ -40,7 +40,7 @@ else:
     from launch import bootstrap_package
 bootstrap_package()
 
-from osworld_agent.config import ContextConfig, ModelConfig  # noqa: E402
+from osworld_agent.config import ContextConfig, DEFAULT_AX_MAX_CHARS, ModelConfig  # noqa: E402
 from osworld_agent.model import ChatModel             # noqa: E402
 from osworld_agent.adapters.uivenus2_grounding import UIVenus2Grounding  # noqa: E402
 from osworld_agent.adapters.uitars_grounding import RealUItarsGrounding  # noqa: E402
@@ -313,7 +313,7 @@ def main() -> int:
     parser.add_argument("--execution-mode", choices=("browser_first", "desktop"),
                         default=os.getenv("OSWORLD_LOCAL_EXECUTION_MODE", "browser_first"),
                         help="browser_first 优先按计划进入独立浏览器；desktop 保留通用桌面流程")
-    parser.add_argument("--ax-max-chars", type=int, default=5000, help="浏览器精简 AX 的字符上限")
+    parser.add_argument("--ax-max-chars", type=int, default=DEFAULT_AX_MAX_CHARS, help="浏览器精简 AX 的字符上限")
     parser.add_argument("--screenshot-max-edge", type=int, default=1280,
                         help="浏览器模型输入截图最长边像素数")
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
