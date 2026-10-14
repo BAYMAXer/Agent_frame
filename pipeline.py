@@ -38,7 +38,8 @@ from .prompts import (build_user_prompt, build_format_feedback, build_planner_pr
                       build_subtask_system_prompt, build_region_prompt)
 from .context import PromptCompiler, ContextBudgetError
 from .planning import (normalize_plan, get_current_step_id, update_plan_progress,
-                       validate_executable_plan, record_subtask_completion, prepare_executable_plan)
+                       validate_executable_plan, record_subtask_completion, prepare_executable_plan,
+                       build_plan_repair_feedback)
 
 # 实时状态推送（可选）：execute 阶段进度推给 viz 前端，失败不影响主流程
 try:
@@ -160,7 +161,7 @@ class Pipeline:
                  system_prompt: str, code_agent=None, max_steps: int = 20,
                  max_retries: int = 3, enable_reflection: bool = True,
                  early_stop_repeat: int = 3, step_callback=None, progress_callback=None,
-                 step_timeout: float = 120.0, context_config=None):
+                 step_timeout: float = 120.0, context_config=None, planner_attempts: int = 5):
         self.model = model
         self.grounding = grounding
         self.env = env
@@ -168,6 +169,9 @@ class Pipeline:
         self.system_prompt = system_prompt
         self.max_steps = max_steps
         self.max_retries = max_retries
+        if isinstance(planner_attempts, bool) or not isinstance(planner_attempts, int) or not 1 <= planner_attempts <= 10:
+            raise ValueError("规划尝试次数必须为 1～10 的整数")
+        self.planner_attempts = planner_attempts
         self.enable_reflection = enable_reflection
         self.early_stop_repeat = early_stop_repeat
         self.step_callback = step_callback  # 每步结束后回调(step_no, decision, execution, state)
@@ -238,7 +242,9 @@ class Pipeline:
                                       "model_calls": copy.deepcopy(result.planning_calls)})
             self._emit_progress("planning_failed", state, result, error=result.final_answer)
             return result
+        self._check_step_budget("planning")
         self._publish_plan(state, result, changed=bool(state.memory.plan))
+        self._check_step_budget("planning")
 
         for step_no in range(1, self.max_steps + 1):
             self._start_step_budget()
@@ -1264,8 +1270,8 @@ class Pipeline:
     def _plan(self, task: str, state: StepState) -> None:
         """阶段0：把模糊任务拆成结构化 plan，存进记忆。
 
-        非法输出和普通网络异常降级为无 plan；墙钟超时按运行策略上抛，
-        由 runner 保存失败阶段和当前轨迹。
+        浏览器优先在共享时间预算内重试请求与格式纠错；通用桌面保留无计划兼容流程。
+        每轮原始输出与失败原因同步记录，重试不会重置阶段截止时间。
         """
         prompt = build_planner_prompt(task, os_name="windows",
                                       browser_first=self.browser_first,
@@ -1273,61 +1279,116 @@ class Pipeline:
         if self.browser_first:
             messages = [{"role": "user", "content": prompt}]
             error = "未取得可实施的任务计划"
-            for attempt in range(2):
+            for attempt in range(self.planner_attempts):
                 self._check_step_budget("planning")
                 sent_messages = copy.deepcopy(messages)
                 raw = None
                 corrections = []
+                obj = None
                 try:
                     raw = self.model.chat(messages, json_mode=True)
+                    self._check_step_budget("planning")
                     obj, corrections = prepare_executable_plan(parse_decision(raw), task)
                     error = validate_executable_plan(obj, task, download_dir=getattr(self.env, "downloads_dir", None))
+                    self._check_step_budget("planning")
                     if error is None:
                         proposal = dict(obj)
                         proposal.pop("schema_version", None)
-                        state.memory.plan = normalize_plan(proposal, task, deduplicate=False,
-                                                           download_dir=getattr(self.env, "downloads_dir", None))
+                        normalized = normalize_plan(proposal, task, deduplicate=False,
+                                                    download_dir=getattr(self.env, "downloads_dir", None))
+                        self._check_step_budget("planning")
+                        state.memory.plan = normalized
                         state.memory.task_state["goal"] = task
                         state.memory.sync_plan_state()
                         state.memory.add_event(f"已制定 {len(state.memory.plan['steps'])} 个串行子任务")
                         self._record_planning_call(state, attempt + 1, sent_messages, raw,
                                                    corrections=corrections)
                         return
+                    feedback = build_plan_repair_feedback(obj, error, task, download_dir=getattr(self.env, "downloads_dir", None))
                     self._record_planning_call(state, attempt + 1, sent_messages, raw,
-                                               error=error, corrections=corrections)
-                    messages += [{"role": "assistant", "content": raw},
-                                 {"role": "user", "content": f"计划不完整：{error}。请重新输出完整计划 JSON，不要执行操作。"}]
+                                               error=error, corrections=corrections, repair_feedback=feedback)
+                    # Keep only the most recent failed proposal in model input;
+                    # the complete history remains in planning_calls.
+                    messages = [{"role": "user", "content": prompt},
+                                {"role": "assistant", "content": raw},
+                                {"role": "user", "content": feedback}]
                 except ModelRequestTimeout as exc:
                     self._record_planning_call(state, attempt + 1, sent_messages, raw,
                                                error=str(exc), corrections=corrections,
                                                error_type=type(exc).__name__)
-                    raise
+                    if attempt + 1 >= self.planner_attempts:
+                        raise
+                    self._pause_planning_retry(attempt + 1)
                 except Exception as exc:
                     error = f"规划请求失败：{type(exc).__name__}：{str(exc)[:300]}"
+                    feedback = build_plan_repair_feedback(obj, error, task, download_dir=getattr(self.env, "downloads_dir", None)) if isinstance(raw, str) else None
                     self._record_planning_call(state, attempt + 1, sent_messages, raw,
                                                error=error, corrections=corrections,
-                                               error_type=type(exc).__name__)
+                                               error_type=type(exc).__name__, repair_feedback=feedback)
+                    if self._permanent_planning_error(exc):
+                        raise ValueError(error) from exc
+                    if feedback is not None:
+                        messages = [{"role": "user", "content": prompt},
+                                    {"role": "assistant", "content": raw},
+                                    {"role": "user", "content": feedback}]
+                    elif attempt + 1 < self.planner_attempts:
+                        self._pause_planning_retry(attempt + 1)
             raise ValueError(error)
-        try:
-            raw = self.model.chat([{"role": "user", "content": prompt}], retries=1, json_mode=True)
-            obj = parse_decision(raw)
-            steps = obj.get("steps") if isinstance(obj, dict) else None
-            if not isinstance(steps, list) or not steps:
+        for attempt in range(self.planner_attempts):
+            self._check_step_budget("planning")
+            raw = None
+            try:
+                raw = self.model.chat([{"role": "user", "content": prompt}], json_mode=True)
+                self._check_step_budget("planning")
+                obj = parse_decision(raw)
+                steps = obj.get("steps") if isinstance(obj, dict) else None
+                if not isinstance(steps, list) or not steps:
+                    # Desktop compatibility permits direct execution without a
+                    # decomposition. Do not consume its next decision as a plan.
+                    self._record_planning_call(state, attempt + 1, [{"role": "user", "content": prompt}], raw,
+                                               error="未生成子任务，沿用通用桌面流程")
+                    return
+                proposal = dict(obj)
+                proposal.pop("schema_version", None)
+                normalized = normalize_plan(proposal, task, download_dir=getattr(self.env, "downloads_dir", None))
+                self._check_step_budget("planning")
+                state.memory.plan = normalized
+                state.memory.task_state["goal"] = task
+                state.memory.sync_plan_state()
+                state.memory.add_event(f"📋 已制定任务计划：{len(state.memory.plan['steps'])} 个子目标")
+                self._record_planning_call(state, attempt + 1, [{"role": "user", "content": prompt}], raw)
                 return
-            # 新规划只允许提出目标，不能通过自报 schema/status 冒充已经完成。
-            proposal = dict(obj)
-            proposal.pop("schema_version", None)
-            state.memory.plan = normalize_plan(proposal, task, download_dir=getattr(self.env, "downloads_dir", None))
-            state.memory.task_state["goal"] = task
-            state.memory.sync_plan_state()
-            state.memory.add_event(f"📋 已制定任务计划：{len(state.memory.plan['steps'])} 个子目标")
-        except ModelRequestTimeout:
-            raise
-        except Exception:  # noqa: BLE001  planner 失败不影响主流程
-            return
+            except ModelRequestTimeout as exc:
+                self._record_planning_call(state, attempt + 1, [{"role": "user", "content": prompt}], raw,
+                                           error=str(exc), error_type=type(exc).__name__)
+                if attempt + 1 >= self.planner_attempts:
+                    raise
+                self._pause_planning_retry(attempt + 1)
+            except Exception as exc:
+                self._record_planning_call(state, attempt + 1, [{"role": "user", "content": prompt}], raw,
+                                           error=f"规划请求失败：{type(exc).__name__}：{str(exc)[:300]}", error_type=type(exc).__name__)
+                if self._permanent_planning_error(exc):
+                    raise ValueError(str(exc)) from exc
+                if raw is None and attempt + 1 < self.planner_attempts:
+                    self._pause_planning_retry(attempt + 1)
+
+    @staticmethod
+    def _permanent_planning_error(exc):
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        return isinstance(status, int) and status in {400, 401, 403, 404, 422}
+
+    def _pause_planning_retry(self, attempt):
+        self._check_step_budget("planning retry")
+        delay = min(1.0, 0.2 * attempt)
+        if self._deadline is not None and self._deadline - time.monotonic() <= delay:
+            raise ModelRequestTimeout("规划剩余时间预算不足以重试")
+        time.sleep(delay)
+        self._check_step_budget("planning retry")
 
     def _record_planning_call(self, state, attempt, messages, raw, *, error=None,
-                              corrections=None, error_type=None):
+                              corrections=None, error_type=None, repair_feedback=None):
         """Persist rejected planner responses even when no action step exists."""
         result = getattr(self, "_running_result", None)
         if result is None:
@@ -1337,13 +1398,17 @@ class Pipeline:
         if raw is None and call.get("messages") != messages:
             call = {}  # Do not label a previous response as the failed new request.
         call.update(actor_role="planning", provenance="sampled", attempt=attempt,
+                    attempt_limit=self.planner_attempts,
                     messages=copy.deepcopy(messages), response=raw or "",
                     plan_accepted=error is None, validation_error=error or "",
                     corrections=copy.deepcopy(corrections or []))
         if error_type:
             call["error_type"] = error_type
+        if repair_feedback is not None:
+            call["repair_feedback"] = repair_feedback
         result.planning_calls.append(call)
         self._emit_progress("planning", state, result, planning_attempt=attempt,
+                            planning_attempt_limit=self.planner_attempts,
                             model_calls=[call], validation_error=error or "",
                             planning_corrections=copy.deepcopy(corrections or []))
 
@@ -1489,6 +1554,8 @@ class Pipeline:
             state.memory.add_forbidden_repeat(sig)
             state.memory.add_event(f"⚠️ STALL：{stall_reason}。反复同一操作且屏幕无变化，任务可能【已经完成】——先看界面/文档是否已达标，达标就 request_finish；否则换一种完全不同的方法。")
             return "STALL"
+        # 硬停止阈值统计连续 STALL，恢复操作不能累计此前的停滞次数。
+        state.memory.stall_count = 0
         if ((execution.info or {}).get("scroll_progress") is False
                 or (state.browser_scroll_no_progress_count
                     and not (execution.info or {}).get("observation_changed")
@@ -1559,6 +1626,17 @@ class Pipeline:
                       execution: Execution, before_screenshot) -> Optional[str]:
         """确定性卡死检测：屏幕无变化 + shell 输出无变化 + 动作循环 + 禁止重复命中。返回原因或 None。"""
         repeat_threshold = max(1, self.early_stop_repeat) if self.browser_first else _REPEAT_ACTION_THRESHOLD
+        info = execution.info or {}
+        if (self.browser_first and (execution.kind == "browser_dom"
+                or (execution.kind == "env" and info.get("channel") == "browser_dom"))
+                and info.get("status") == "executed" and info.get("dispatched") is True
+                and info.get("followed_popup") is True and info.get("page_id")):
+            # 执行器已确认新页的 opener/context 并绑定新 target。即使点击语义与
+            # 此前失败策略相同，也必须先观察新页，不能在页面打开后立即误停。
+            state.no_change_count = 0
+            state.action_keys.clear()
+            state.memory.forbidden_repeats.clear()
+            return None
         if (decision.action and decision.action.action == "scroll"
                 and execution.kind == "browser_dom"
                 and (execution.info or {}).get("scroll_progress") is True):

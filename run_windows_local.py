@@ -8,7 +8,7 @@
 说明：
 - 默认 browser_first：按计划子任务进入独立浏览器；--execution-mode desktop 保留桌面兼容流程；
 - 浏览器输入截图最长边默认 1280 像素，精简 AX 默认最多 12000 字符；
-- 进入网页子任务时，启动或核验带 remote-debugging 的无痕 Chrome；
+- 进入网页子任务时，启动或核验带 remote-debugging 的所选模式 Chrome；
 - browser_first 绑定本次运行的私有网页，不依赖桌面焦点；
 - 目标应用在任务期间置顶，切换应用或任务结束时恢复原置顶状态；
 - 任务结束后释放本次运行的私有会话，浏览器进程由用户关闭；
@@ -203,25 +203,28 @@ def _remove_profile(port: int, profile: str) -> bool:
         return False
 
 
-def ensure_chrome(port: int, chrome_path: str):
+def ensure_chrome(port: int, chrome_path: str, browser_mode: str = "incognito"):
     """返回 (是否新建, 本次专用 profile)。新建 profile 用于核验并清理空白启动页。
 
     复用端点始终返回 None profile，不把已有无痕页面认作当前任务拥有的页面。
     """
-    from osworld_agent.utils import cdp_pages_are_incognito, list_cdp_pages
+    from osworld_agent.utils import cdp_pages_match_mode, list_cdp_pages
+    if not isinstance(browser_mode, str) or browser_mode not in {"incognito", "normal"}:
+        raise ValueError("browser_mode 必须是 incognito 或 normal")
+    mode_name = "无痕" if browser_mode == "incognito" else "普通"
     port = int(port)
     if not 1 <= port <= 65535:
         raise ValueError("浏览器调试端口必须在 1 到 65535 之间")
     if list_cdp_pages("localhost", port):
-        if not cdp_pages_are_incognito("localhost", port):
+        if not cdp_pages_match_mode("localhost", port, browser_mode):
             raise RuntimeError(
-                f"调试端口 {port} 已被普通或无法确认无痕模式的浏览器占用。"
+                f"调试端口 {port} 已被其他或无法确认{mode_name}模式的浏览器占用。"
                 "请关闭该调试浏览器，或使用 --browser-port 指定空闲端口。")
-        print(f"[chrome] 检测到 {port} 端口已有无痕 Chrome，直接复用")
+        print(f"[chrome] 检测到 {port} 端口已有{mode_name} Chrome，直接复用")
         return False, None
     if not os.path.isfile(chrome_path):
         raise FileNotFoundError(f"找不到 Chrome：{chrome_path}（可用 --chrome 指定路径）")
-    print(f"[chrome] 启动带 remote-debugging 的无痕 Chrome（端口 {port}）...")
+    print(f"[chrome] 启动带 remote-debugging 的{mode_name} Chrome（端口 {port}）...")
     user_data_dir = tempfile.mkdtemp(prefix=f"{_PROFILE_PREFIX}{port}_",
                                     dir=os.path.realpath(tempfile.gettempdir()))
     proc = None
@@ -230,18 +233,18 @@ def ensure_chrome(port: int, chrome_path: str):
             chrome_path,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={user_data_dir}",
-            "--incognito", "--new-window",
+            *(["--incognito"] if browser_mode == "incognito" else []), "--new-window",
             "--no-first-run", "--no-default-browser-check",
             "--disable-session-crashed-bubble", "--disable-infobars",
             "about:blank",
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(30):
             time.sleep(0.5)
-            if (list_cdp_pages("localhost", port) and cdp_pages_are_incognito("localhost", port)
+            if (list_cdp_pages("localhost", port) and cdp_pages_match_mode("localhost", port, browser_mode)
                     and _owned_endpoint_pids(port, user_data_dir)):
-                print("[chrome] 无痕 Chrome 已就绪")
+                print(f"[chrome] {mode_name} Chrome 已就绪")
                 return True, user_data_dir
-        raise RuntimeError(f"端口 {port} 的 Chrome 未就绪或无法确认无痕模式，已停止本次启动。")
+        raise RuntimeError(f"端口 {port} 的 Chrome 未就绪或无法确认{mode_name}模式，已停止本次启动。")
     except BaseException:
         if proc is not None and proc.poll() is None:
             try:
@@ -309,6 +312,8 @@ def main() -> int:
     parser.add_argument("--model-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_MODEL_TIMEOUT", "60")))
     parser.add_argument("--ground-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_GROUND_TIMEOUT", "60")))
     parser.add_argument("--step-timeout", type=float, default=float(os.getenv("OSWORLD_LOCAL_STEP_TIMEOUT", "120")))
+    parser.add_argument("--planner-attempts", type=int, default=5,
+                        help="规划总尝试次数（含第一次，1 到 10，默认 5），共享单步超时预算")
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--execution-mode", choices=("browser_first", "desktop"),
                         default=os.getenv("OSWORLD_LOCAL_EXECUTION_MODE", "browser_first"),
@@ -319,10 +324,17 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=None, help="屏幕宽（缺省自动检测）")
     parser.add_argument("--height", type=int, default=None, help="屏幕高（缺省自动检测）")
     parser.add_argument("--browser-port", type=int, default=9222)
+    parser.add_argument("--browser-mode", choices=("incognito", "normal"),
+                        default=os.getenv("OSWORLD_LOCAL_BROWSER_MODE", "incognito"),
+                        help="选择无痕或普通浏览器；所有网页子任务沿用此模式及会话")
     parser.add_argument("--chrome", default=CHROME_DEFAULT)
     parser.add_argument("--download-dir", default=None, help="下载目录（任务明确目录优先；否则缺省为版本 downloads）")
     parser.add_argument("--result-dir", default=None, help="轨迹/截图保存目录（缺省自动保存到 local_runs）")
     args = parser.parse_args()
+    if args.browser_mode not in {"incognito", "normal"}:
+        parser.error("浏览器模式必须是 incognito 或 normal")
+    if not 1 <= args.planner_attempts <= 10:
+        parser.error("规划尝试次数必须是 1 到 10 的整数")
     if any(value <= 0 or not math.isfinite(value)
            for value in (args.model_timeout, args.ground_timeout, args.step_timeout)):
         parser.error("模型、定位及每步超时必须为有限正数")
@@ -350,13 +362,18 @@ def main() -> int:
         args.result_dir = os.path.join(base, "local_" + time.strftime("%Y%m%d_%H%M%S")
                                       + "_" + str(time.time_ns() % 1_000_000_000))
     recorder = LocalRunRecorder(args.result_dir, args.task)
+    recorder.on_progress({"event": "task_start", "phase": "starting", "step": 0,
+                          "execution_mode": args.execution_mode,
+                          "planner_attempts": args.planner_attempts,
+                          "browser_mode": args.browser_mode}, None, None)
     print(f"[source] {os.path.abspath(__file__)}", flush=True)
     print(f"[model] {args.model} url={args.model_url} timeout={args.model_timeout:g}s attempts=1", flush=True)
     print(f"[grounding] {args.ground_model} type={args.ground_type} url={args.ground_url} "
           f"timeout={args.ground_timeout:g}s attempts=1; step_budget={args.step_timeout:g}s", flush=True)
     print(f"[trajectory] 执行前记录和每步轨迹实时保存到: {args.result_dir}", flush=True)
+    print(f"[planning] attempts<={args.planner_attempts}; total_budget={args.step_timeout:g}s", flush=True)
     print(f"[browser] mode={args.execution_mode} AX<={args.ax_max_chars} chars "
-          f"screenshot_edge<={args.screenshot_max_edge}px", flush=True)
+          f"screenshot_edge<={args.screenshot_max_edge}px browser_mode={args.browser_mode}", flush=True)
     env = None
     result = None
     try:
@@ -375,7 +392,8 @@ def main() -> int:
         # 3) 环境
         env = WindowsEnvironment(browser_port=args.browser_port, width=width, height=height,
                                  downloads_dir=args.download_dir,
-                                 browser_launcher=lambda: ensure_chrome(args.browser_port, args.chrome),
+                                 browser_launcher=lambda: ensure_chrome(args.browser_port, args.chrome, args.browser_mode),
+                                 browser_mode=args.browser_mode,
                                  execution_mode=args.execution_mode,
                                  screenshot_max_edge=args.screenshot_max_edge,
                                  work_screen=work_screen,
@@ -385,11 +403,14 @@ def main() -> int:
         agent = Agent(decision_model=model, grounding=grounding, env=env,
                       max_steps=args.max_steps, enable_reflection=False,
                       step_callback=_live_step, progress_callback=recorder.on_progress,
-                      step_timeout=args.step_timeout, context_config=context_config)
+                      step_timeout=args.step_timeout, context_config=context_config,
+                      planner_attempts=args.planner_attempts)
         reset_collected()
         log_status({"event": "task_start", "instruction": args.task, "max_steps": args.max_steps,
+                    "planner_attempts": args.planner_attempts,
                     "work_screen": work_screen.to_dict(), "dpi_awareness": dpi_awareness,
                     "execution_mode": args.execution_mode,
+                    "browser_mode": args.browser_mode,
                     "configured_download_dir": args.download_dir,
                     "ax_max_chars": args.ax_max_chars, "screenshot_max_edge": args.screenshot_max_edge})
         print(f"\n===== 任务开始 =====\n{args.task}\n")

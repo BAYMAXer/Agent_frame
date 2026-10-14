@@ -27,6 +27,7 @@ agent:
 
 env:
   execution_mode: "browser_first"
+  browser_mode: "incognito" # incognito（无痕）或 normal（普通），主任务与子任务共用
   browser_port: 9222
   chrome_path: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
   downloads_dir: null

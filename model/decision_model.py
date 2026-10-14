@@ -69,6 +69,7 @@ class ChatModel:
         self.cfg = cfg
         self.vision = bool(getattr(cfg, "vision", True))
         self.disable_thinking = bool(getattr(cfg, "disable_thinking", True))
+        self._supports_json_mode = True
         self.last_call: Dict[str, Any] = {}   # 最近一次调用的完整元数据（供轨迹记录 decision_calls）
         self.request_deadline: Optional[float] = None
 
@@ -86,6 +87,7 @@ class ChatModel:
 
         deadline = make_request_deadline(self.cfg.timeout, self.request_deadline)
         retries = min(max(0, int(retries)), max(0, int(getattr(self.cfg, "request_retries", 0))))
+        json_mode = bool(json_mode and self._supports_json_mode)
         # trust_env=False：直连内网 endpoint，不走系统代理（同 grounding，避免 HIS 代理拦掉 7.x）
         client = OpenAI(
             base_url=self.cfg.url, api_key=self.cfg.api_key,
@@ -96,7 +98,9 @@ class ChatModel:
         self.last_call = {"messages": copy.deepcopy(normalized),
                           "model": resolve_model_name(self.cfg.name), "attempts": []}
         last_err: Optional[Exception] = None
-        for attempt in range(retries + 1):
+        attempt = 0
+        compatibility_retried = False
+        while attempt <= retries:
             started = time.perf_counter()
             try:
                 create_kwargs: Dict[str, Any] = dict(
@@ -145,15 +149,39 @@ class ChatModel:
                     if isinstance(exc, ModelRequestTimeout):
                         raise
                     raise ModelRequestTimeout(f"模型请求超时({self.cfg.name}): {exc}") from exc
-                # 若因 extra_body 不被支持而报错，去掉 extra_body 重试一次
-                if self.disable_thinking and "extra_body" in str(exc).lower():
-                    self.disable_thinking = False
-                # 若 json_mode 不被支持，降级为无约束重试
-                if json_mode and ("response_format" in str(exc).lower() or "json" in str(exc).lower()):
-                    json_mode = False
+                status = getattr(exc, "status_code", None)
+                if status is None:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
+                detail = str(exc).lower()
+                unsupported = status in {None, 400, 422} and any(marker in detail for marker in (
+                    "unsupported", "not supported", "does not support", "unrecognized",
+                    "unknown parameter", "unknown argument", "unknown field",
+                    "unexpected keyword", "unexpected argument", "extra inputs are not permitted"))
+                drop_extra = unsupported and "extra_body" in create_kwargs and "extra_body" in detail
+                drop_json = unsupported and "response_format" in create_kwargs and (
+                    "response_format" in detail or any(marker in detail for marker in (
+                        "json mode", "json_object", "json output", "json response", "json format")))
+                # One explicit compatibility downgrade shares this call's original deadline.
+                if not compatibility_retried and (drop_extra or drop_json):
+                    if drop_extra:
+                        self.disable_thinking = False
+                    if drop_json:
+                        self._supports_json_mode = False
+                        json_mode = False
+                    compatibility_retried = True
+                    continue
+                if status in {400, 401, 403, 404, 422}:
+                    break
                 if attempt < retries:
                     sleep_before_retry(1.5 * (attempt + 1), deadline)
-        raise RuntimeError(f"模型调用失败({self.cfg.name}): {last_err}")
+                attempt += 1
+        error = RuntimeError(f"模型调用失败({self.cfg.name}): {last_err}")
+        status = getattr(last_err, "status_code", None)
+        if status is None:
+            status = getattr(getattr(last_err, "response", None), "status_code", None)
+        if status is not None:
+            error.status_code = status
+        raise error from last_err
 
     def build_vision_message(self, text: str, images=None) -> Dict[str, Any]:
         """构造一条用户消息；vision 开启时按顺序附上多张图（OpenAI vision 格式）。

@@ -294,6 +294,52 @@ def cdp_pages_are_incognito(host: str, port: int = 9222) -> bool:
             pass
 
 
+def _browser_pages_match_mode(browser, browser_mode: str) -> bool:
+    """核验所有网页属于所选模式；普通模式只能使用默认上下文。"""
+    if browser_mode == "incognito":
+        return _browser_pages_are_incognito(browser)
+    if browser_mode != "normal":
+        raise ValueError("browser_mode 必须是 incognito 或 normal")
+    cdp = None
+    try:
+        cdp = browser.new_browser_cdp_session()
+        default_id = cdp.send("Target.getBrowserContexts").get("defaultBrowserContextId")
+        pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
+                 if target.get("type") == "page"]
+        return bool(default_id and pages) and all(
+            target.get("browserContextId") == default_id for target in pages)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        if cdp is not None:
+            try:
+                cdp.detach()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def cdp_pages_match_mode(host: str, port: int = 9222, browser_mode: str = "incognito") -> bool:
+    if browser_mode == "incognito":
+        return cdp_pages_are_incognito(host, port)
+    if browser_mode != "normal":
+        raise ValueError("browser_mode 必须是 incognito 或 normal")
+    try:
+        p, browser = _connect_browser(host, port)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return _browser_pages_match_mode(browser, browser_mode)
+    finally:
+        try:
+            browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            p.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def fetch_page_source(host: str, port: int = 9222, max_chars: int = 20000) -> str:
     """CDP 抓当前页面 HTML 源码。失败返回空串。"""
     try:

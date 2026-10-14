@@ -24,7 +24,7 @@ let forceFollowScroll = false;
 let lastEventScrollTop = 0;
 let expectedEventScrollTop = null;
 const draftKey = 'agent-studio.windows.config.v1';
-const draftFields = ['local-task','download-dir','local-maxsteps','execution-mode','ax-max-chars','screenshot-max-edge','run-model','run-model-url','run-ground','run-ground-url','run-ground-type','model-timeout','ground-timeout','step-timeout'];
+const draftFields = ['local-task','download-dir','local-maxsteps','execution-mode','browser-mode','ax-max-chars','screenshot-max-edge','run-model','run-model-url','run-ground','run-ground-url','run-ground-type','model-timeout','ground-timeout','step-timeout','planner-attempts'];
 const typeLabels = {decision:'决策模型',grounding:'定位模型',format_retry:'格式重试',verify:'完成核对',reflect:'执行反思',code_agent:'子 Agent',planning:'任务规划',region_selection:'网页选区',subtask_verification:'子任务核验',uncertain_verification:'操作效果核验'};
 const eventLabels = {task_start:'任务开始',step:'开始执行步骤',plan_update:'任务计划更新',browser_observation:'浏览器观察',browser_selection:'浏览器区域选择',executing:'正在执行动作',executed:'动作执行结果',task_end:'任务结束',error:'执行异常',interrupted:'已停止运行'};
 
@@ -74,6 +74,7 @@ function updateSummary() {
   setText('summary-ground',byId('run-ground').value || '待配置');
   setText('summary-budget','最多 '+byId('local-maxsteps').value+' 步 · 单步 '+byId('step-timeout').value+' 秒');
   setText('summary-mode',byId('execution-mode').value==='browser_first'?'浏览器优先':'通用桌面');
+  setText('summary-browser-mode',byId('browser-mode').value==='normal'?'普通浏览器':'无痕浏览器');
   setText('execution-mode-help',byId('execution-mode').value==='browser_first'?'使用独立浏览器，按网页结构定位和执行':'操作本机应用，使用真实鼠标与键盘');
 }
 function applyPreset(type) {
@@ -88,6 +89,7 @@ function applyPreset(type) {
 async function initConfiguration() {
   const draft=readDraft();
   draftFields.forEach(id => { if (typeof draft[id]==='string') byId(id).value=draft[id]; });
+  if (!['incognito','normal'].includes(byId('browser-mode').value)) byId('browser-mode').value='incognito';
   updateSummary();
   try {
     const data=await api('/model-presets');
@@ -151,6 +153,8 @@ function configuration() {
   return {mode:'local',task,...modelConfiguration(),max_steps:integerField('local-maxsteps','最大步数',100),
     download_dir:byId('download-dir').value.trim(),
     execution_mode:byId('execution-mode').value,
+    browser_mode:byId('browser-mode').value,
+    planner_attempts:integerField('planner-attempts','规划尝试次数',10),
     ax_max_chars:integerField('ax-max-chars','AX 字符预算',1000000),
     screenshot_max_edge:integerField('screenshot-max-edge','截图最长边',16384),
     model_timeout:integerField('model-timeout','决策超时',3600),ground_timeout:integerField('ground-timeout','定位超时',3600),step_timeout:integerField('step-timeout','单步超时',3600)};

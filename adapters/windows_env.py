@@ -38,10 +38,14 @@ class WindowsEnvironment(Environment):
                  action_settle_seconds: float = 0.3,
                  work_screen: Optional[WorkScreen] = None,
                  presentation_state_path: Optional[str] = None,
-                 execution_mode: str = "desktop", screenshot_max_edge: int = 1280):
+                 execution_mode: str = "desktop", screenshot_max_edge: int = 1280,
+                 browser_mode: str = "incognito"):
         if execution_mode not in ("desktop", "browser_first"):
             raise ValueError("execution_mode 必须是 desktop 或 browser_first")
         self.execution_mode = execution_mode
+        if browser_mode not in ("incognito", "normal"):
+            raise ValueError("browser_mode 必须是 incognito 或 normal")
+        self.browser_mode = browser_mode
         self.screenshot_max_edge = max(0, int(screenshot_max_edge))
         self._browser_subtask_active = False
         self._desktop_subtask_active = False
@@ -50,7 +54,7 @@ class WindowsEnvironment(Environment):
         self.width = width
         self.height = height
         self.os_name = "windows"
-        self.browser_only = False  # 同时支持桌面任务；browser use 仅限已核验的无痕实例
+        self.browser_only = False  # 同时支持桌面任务；browser use 仅限已核验的所选模式实例
         self.downloads_dir = downloads_dir
         self._configured_downloads_dir = downloads_dir
         self.download_destination = None
@@ -202,7 +206,7 @@ class WindowsEnvironment(Environment):
         return Action(action.action, args)
 
     def _focus_is_browser(self) -> bool:
-        """仅已核验的无痕端口所属窗口在前台时进入 browser use。"""
+        """仅已核验端口所属窗口在前台时进入 browser use。"""
         if self.execution_mode == "browser_first" and self._browser_subtask_active:
             return bool(self._browser_ready and self._browser_session is not None
                         and self._browser_session.page_id)
@@ -219,7 +223,7 @@ class WindowsEnvironment(Environment):
 
     def _ensure_browser_ready(self):
         """明确导航时始终启动/复用并核验目标，不依赖任意浏览器焦点。"""
-        from ..utils import cdp_pages_are_incognito
+        from ..utils import cdp_pages_match_mode
         try:
             session = self._get_browser_session() if self.execution_mode == "browser_first" else None
             if session is not None:
@@ -231,19 +235,20 @@ class WindowsEnvironment(Environment):
                     launched = self._browser_launcher()
                 else:
                     from ..run_windows_local import CHROME_DEFAULT, ensure_chrome
-                    launched = ensure_chrome(self.browser_port, CHROME_DEFAULT)
+                    launched = ensure_chrome(self.browser_port, CHROME_DEFAULT, self.browser_mode)
                 if (session is not None and isinstance(launched, tuple) and len(launched) == 2
                         and launched[0] is True and isinstance(launched[1], str)):
                     self._browser_launch_profile = launched[1]
             if session is not None:
                 session._check_deadline()
-                playwright, browser = session._connect()  # 同一连接核验无痕，遵守共享 deadline。
+                playwright, browser = session._connect()  # 同一连接核验所选模式，遵守共享 deadline。
                 session._disconnect(playwright, browser)
-                private = True
+                valid_mode = True
             else:
-                private = cdp_pages_are_incognito("localhost", self.browser_port)
-            if not private:
-                raise RuntimeError(f"调试端口 {self.browser_port} 无法确认是无痕浏览器；"
+                valid_mode = cdp_pages_match_mode("localhost", self.browser_port, self.browser_mode)
+            if not valid_mode:
+                mode_name = "无痕" if self.browser_mode == "incognito" else "普通"
+                raise RuntimeError(f"调试端口 {self.browser_port} 无法确认是{mode_name}浏览器；"
                                    "请关闭该调试浏览器或更换 --browser-port")
             self._browser_ready = True
         except BaseException:
@@ -295,7 +300,8 @@ class WindowsEnvironment(Environment):
             self._browser_session = BrowserSession(
                 options=BrowserOptions(endpoint=f"http://localhost:{self.browser_port}",
                                        require_focus=self.execution_mode != "browser_first",
-                                       require_incognito=True,
+                                       require_incognito=self.browser_mode == "incognito",
+                                       browser_mode=self.browser_mode,
                                        bind_page=self.execution_mode == "browser_first",
                                        screenshot_max_edge=self.screenshot_max_edge),
                 foreground_check=self._focus_is_browser if self.execution_mode != "browser_first" else None,

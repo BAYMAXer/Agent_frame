@@ -257,6 +257,8 @@ async def capabilities():
         "run_modes": ["local"],
         "local": {"task_text": True, "timeouts": ["model_timeout", "ground_timeout", "step_timeout"],
                   "execution_modes": ["browser_first", "desktop"],
+                  "browser_modes": ["incognito", "normal"],
+                  "planning": {"planner_attempts": {"default": 5, "min": 1, "max": 10}},
                   "browser_context": ["ax_max_chars", "screenshot_max_edge"]},
         "model_io": {"messages": True, "image_metadata": True, "usage": True,
                      "grounding_raw_response": True},
@@ -468,11 +470,17 @@ def _start_local(cfg: dict):
     execution_mode = cfg.get("execution_mode", os.getenv("OSWORLD_LOCAL_EXECUTION_MODE", "browser_first"))
     if not isinstance(execution_mode, str) or execution_mode not in {"browser_first", "desktop"}:
         return {"ok": False, "error": "执行模式必须是 browser_first 或 desktop"}
+    browser_mode = cfg.get("browser_mode", os.getenv("OSWORLD_LOCAL_BROWSER_MODE", "incognito"))
+    if not isinstance(browser_mode, str) or browser_mode not in {"incognito", "normal"}:
+        return {"ok": False, "error": "浏览器模式必须是 incognito（无痕）或 normal（普通）"}
     from osworld_agent.config import ContextConfig, DEFAULT_AX_MAX_CHARS
     try:
         max_steps = cfg.get("max_steps", 20)
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError("最大步数必须为正整数")
+        planner_attempts = cfg.get("planner_attempts", 5)
+        if isinstance(planner_attempts, bool) or not isinstance(planner_attempts, int) or not 1 <= planner_attempts <= 10:
+            raise ValueError("规划尝试次数必须是 1 到 10 的整数")
         download_dir = cfg.get("download_dir")
         if download_dir is not None:
             if not isinstance(download_dir, str) or any(ord(char) < 32 for char in download_dir):
@@ -493,7 +501,9 @@ def _start_local(cfg: dict):
     result_dir = cfg.get("result_dir") or os.path.join(
         LOCAL_RUNS_DIR, "ui_" + time.strftime("%Y%m%d_%H%M%S"))
     cfg = {**cfg, "result_dir": result_dir, "execution_mode": execution_mode,
+           "browser_mode": browser_mode,
            "download_dir": download_dir,
+           "planner_attempts": planner_attempts,
            "max_steps": max_steps, **timeouts, "ax_max_chars": browser_context.ax_max_chars,
            "screenshot_max_edge": browser_context.screenshot_max_edge}
 
@@ -508,7 +518,9 @@ def _start_local(cfg: dict):
         "--model-timeout", str(timeouts["model_timeout"]),
         "--ground-timeout", str(timeouts["ground_timeout"]),
         "--step-timeout", str(timeouts["step_timeout"]),
+        "--planner-attempts", str(planner_attempts),
         "--execution-mode", execution_mode,
+        "--browser-mode", browser_mode,
         "--ax-max-chars", str(browser_context.ax_max_chars),
         "--screenshot-max-edge", str(browser_context.screenshot_max_edge),
         "--max-steps", str(max_steps),
@@ -575,6 +587,7 @@ async def run_status():
         "task": _agent_state["task_name"],
         "current_step": _agent_state["current_step"],
         "max_steps": _agent_state["max_steps"],
+        "browser_mode": (_agent_state.get("config") or {}).get("browser_mode"),
         "elapsed": round(elapsed, 1),
         "pid": _agent_state["proc"].pid if _agent_state["proc"] else None,
         "plan": _agent_state.get("plan"),

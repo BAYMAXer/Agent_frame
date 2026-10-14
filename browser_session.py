@@ -39,6 +39,11 @@ class BrowserOptions:
     require_incognito: bool = False  # Windows 本地受管会话每次连接都核验无痕上下文
     bind_page: bool = False          # 专用浏览器任务按 target ID 操作，不依赖桌面焦点
     screenshot_max_edge: int = 1280
+    browser_mode: str | None = None  # 显式选择后复用原生窗口；None 保持通用 CDP 会话兼容
+
+    def __post_init__(self):
+        if self.browser_mode is not None and self.browser_mode not in {"incognito", "normal"}:
+            raise ValueError("browser_mode 必须是 incognito 或 normal")
 
 
 class BrowserSession:
@@ -90,11 +95,17 @@ class BrowserSession:
                 for context in browser.contexts:
                     context.set_default_timeout(self._timeout_ms())
                     context.set_default_navigation_timeout(self._timeout_ms())
-            if self.options.require_incognito:
-                from .utils import _browser_pages_are_incognito
+            if self.options.require_incognito or self.options.browser_mode is not None:
+                from .utils import _browser_pages_are_incognito, _browser_pages_match_mode
                 try:
-                    if not _browser_pages_are_incognito(browser):
-                        raise BrowserActionError("无法确认调试浏览器仅包含无痕页面，拒绝接入")
+                    if self.options.browser_mode == "normal":
+                        valid_mode = _browser_pages_match_mode(browser, "normal")
+                        mode_name = "普通"
+                    else:
+                        valid_mode = _browser_pages_are_incognito(browser)
+                        mode_name = "无痕"
+                    if not valid_mode:
+                        raise BrowserActionError(f"无法确认调试浏览器仅包含{mode_name}页面，拒绝接入")
                     self._check_deadline()
                 except Exception:
                     self.invalidate()
@@ -218,8 +229,92 @@ class BrowserSession:
         finally:
             cdp.detach()
 
+    def _bind_selected_mode_page(self, launch_profile=None):
+        """绑定所选模式的原生页面；首次启动与后续子任务不再创建第二个窗口。"""
+        self._check_deadline()
+        p, browser = self._connect()
+        try:
+            if self.page_id:
+                if self._pick_page(browser) is None:
+                    raise BrowserActionError("本任务的浏览器页面已关闭，不能切换到其他页面")
+                return self.page_id
+            cdp = browser.new_browser_cdp_session()
+            try:
+                profile = port = owners = None
+                if launch_profile:
+                    from urllib.parse import urlsplit
+                    from .run_windows_local import _validated_profile, _owned_endpoint_pids
+                    port = urlsplit(self.options.endpoint).port
+                    profile = _validated_profile(port, launch_profile)
+                    owners = _owned_endpoint_pids(port, profile) if profile else set()
+                    self._check_deadline()
+                    if not owners:
+                        raise BrowserActionError("不能确认启动页属于本任务的专用浏览器 profile")
+                pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
+                         if target.get("type") == "page"]
+                self._check_deadline()
+                if launch_profile:
+                    if (len(pages) != 1 or pages[0].get("url") != "about:blank"
+                            or pages[0].get("openerId")):
+                        raise BrowserActionError("启动页面已变化或存在多个页面，不能自动选择任务页面")
+                    target = dict(pages[0])
+                elif len(pages) == 1:
+                    target = dict(pages[0])
+                else:
+                    focused = self._focused_page(browser)
+                    focused_id = self._page_id(focused) if focused else None
+                    target = next((dict(item) for item in pages if item.get("targetId") == focused_id), None)
+                    if target is None:
+                        raise BrowserActionError("调试浏览器存在多个页面且焦点不唯一，请选择任务标签页后重试")
+                page_id, context_id = target.get("targetId"), target.get("browserContextId")
+                if not page_id or not context_id:
+                    raise BrowserActionError("无法确认所选页面的浏览器上下文")
+                bind_deadline = time.monotonic() + self._timeout_seconds(self.options.timeout_ms / 1000)
+                bound = False
+                while not bound:
+                    for context in browser.contexts:
+                        for page in context.pages:
+                            self._check_deadline()
+                            try:
+                                bound = self._page_id(page) == page_id
+                            except ModelRequestTimeout:
+                                raise
+                            except Exception:
+                                continue
+                            if bound:
+                                break
+                        if bound:
+                            break
+                    if bound:
+                        break
+                    if time.monotonic() >= bind_deadline:
+                        raise BrowserActionError("无法绑定启动的任务浏览器页面")
+                    cdp.send("Target.getTargetInfo", {"targetId": page_id})
+                    time.sleep(0.01)
+                current = cdp.send("Target.getTargetInfo", {"targetId": page_id})["targetInfo"]
+                if any(current.get(key) != target.get(key)
+                       for key in ("targetId", "browserContextId", "type", "url", "openerId")):
+                    raise BrowserActionError("绑定期间浏览器页面发生变化，请重试")
+                if launch_profile and (_validated_profile(port, launch_profile) != profile
+                        or _owned_endpoint_pids(port, profile) != owners):
+                    raise BrowserActionError("绑定任务页面时调试端口所有权发生变化")
+                self._check_deadline()
+                self.page_id, self.context_id = page_id, context_id
+                self._adopted_launcher_context = True
+                # 复用的端点属于用户，任务结束时仅关闭本次 fresh launcher 创建的页。
+                if launch_profile:
+                    self._owned_page_ids.add(page_id)
+            finally:
+                cdp.detach()
+            self.invalidate()
+            return self.page_id
+        finally:
+            self._disconnect(p, browser)
+
     def bind_owned_page(self, launch_profile=None):
         """统一创建可管理下载的任务 context，绑定成功后才清理已证明所有权的启动页。"""
+        if self.options.browser_mode is not None:
+            return self._bind_selected_mode_page(launch_profile)
         self._check_deadline()
         p, browser = self._connect()
         try:
@@ -1143,9 +1238,11 @@ class BrowserSession:
                     "error": str(exc)[:200]}
         try:
             page = self._pick_page(browser)
-            if (page is None and self.options.require_incognito and self.foreground_check
+            if (page is None and not self.options.bind_page
+                    and (self.options.require_incognito or self.options.browser_mode is not None)
+                    and self.foreground_check
                     and self.foreground_check()):
-                # 明确导航可在已核验无痕窗口的地址栏聚焦时，通过 CDP 操作唯一可见页。
+                # 明确导航可在已核验的任务窗口地址栏聚焦时，通过 CDP 操作唯一可见页。
                 # 点击、输入及观察仍要求 document.hasFocus，不能混用 chrome UI 坐标。
                 page = self._visible_page(browser)
                 if not self.foreground_check():

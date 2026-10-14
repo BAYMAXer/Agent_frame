@@ -68,10 +68,11 @@ class AgentConfig:
 
 @dataclass
 class EnvConfig:
-    """本地 Windows 环境；浏览器默认使用独立无痕实例。"""
+    """本地 Windows 环境；用户可选普通或无痕，默认独立无痕实例。"""
     screen_width: int = 1920
     screen_height: int = 1080
     execution_mode: str = "browser_first"
+    browser_mode: str = "incognito"
     browser_port: int = 9222
     chrome_path: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
     downloads_dir: Optional[str] = None
@@ -80,6 +81,8 @@ class EnvConfig:
     def __post_init__(self):
         if not isinstance(self.execution_mode, str) or self.execution_mode not in {"desktop", "browser_first"}:
             raise ValueError("execution_mode 必须是 desktop 或 browser_first")
+        if not isinstance(self.browser_mode, str) or self.browser_mode not in {"incognito", "normal"}:
+            raise ValueError("browser_mode 必须是 incognito 或 normal")
 
 
 @dataclass

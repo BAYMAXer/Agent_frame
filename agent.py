@@ -23,7 +23,9 @@ class Agent:
                  env: Environment, max_steps: int = 20, max_retries: int = 5,
                  enable_reflection: bool = True, early_stop_repeat: int = 3,
                  code_agent_budget: int = 20, step_callback=None, progress_callback=None,
-                 step_timeout: float = 120.0, context_config=None):
+                 step_timeout: float = 120.0, context_config=None, planner_attempts: int = 5):
+        if isinstance(planner_attempts, bool) or not isinstance(planner_attempts, int) or not 1 <= planner_attempts <= 10:
+            raise ValueError("planner_attempts 必须是 1 到 10 的整数")
         self.model = decision_model
         self.grounding = grounding
         self.env = env
@@ -35,6 +37,7 @@ class Agent:
         self.progress_callback = progress_callback
         self.step_timeout = step_timeout
         self.context_config = context_config
+        self.planner_attempts = planner_attempts
         self.os_name = "windows"
         # 显式声明浏览器专用的环境用精简提示词；Windows 本机支持桌面与浏览器切换。
         self.browser_only = bool(getattr(env, "browser_only", False))
@@ -61,5 +64,6 @@ class Agent:
             progress_callback=self.progress_callback,
             step_timeout=self.step_timeout,
             context_config=self.context_config,
+            planner_attempts=self.planner_attempts,
         )
         return pipeline.run(task)

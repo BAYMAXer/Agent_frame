@@ -40,11 +40,16 @@ def _filename(suggested, url, pdf):
 def download_through_chromium(session, url, page, browser):
     """Force a successful document response into a native Chrome download.
 
-    Fetch changes only response headers; the body stays in Chrome. Browser
+    Fetch changes only response headers; the body stays in Chrome. CDP
     events identify the exact frame and download GUID. Neither requests nor
     Playwright's APIRequestContext is used for the external transfer.
     """
     from .browser_session import BrowserActionError
+    if session.options.browser_mode == "incognito":
+        # 原生无痕下载交给 DownloadManager 后没有可用的 CDP cancel API。
+        # 接管其响应流，仍沿用该浏览器网络栈，且 IO.read 能按共享预算取消。
+        from .browser_download_stream import download_native_incognito
+        return download_native_incognito(session, url, page)
 
     started = time.perf_counter()
     deadline = time.monotonic() + session._timeout_seconds(90)
@@ -54,6 +59,9 @@ def download_through_chromium(session, url, page, browser):
     phase = "configuration"
     frame_id = None
     scope = {}
+    native_context = bool(session._adopted_launcher_context or session.options.browser_mode is not None)
+    event_cdp = None
+    event_domain = "Page" if native_context else "Browser"
     state = {"guid": None, "progress": None, "response_url": None, "error": None,
              "suggested": None, "pdf": _pdf_url(url), "dispatched": False}
     accepted_urls = set()
@@ -129,7 +137,7 @@ def download_through_chromium(session, url, page, browser):
         frame_id = page_cdp.send("Page.getFrameTree")["frameTree"]["frame"]["id"]
         check()
         browser_cdp = browser.new_browser_cdp_session()
-        if session.options.bind_page:
+        if session.options.bind_page and not native_context:
             contexts = browser_cdp.send("Target.getBrowserContexts").get("browserContextIds", [])
             if not scope or scope["browserContextId"] not in contexts:
                 raise DownloadConfigurationError(
@@ -138,11 +146,20 @@ def download_through_chromium(session, url, page, browser):
         root = os.path.abspath(session.downloads_dir)
         os.makedirs(root, exist_ok=True)
         staging = tempfile.mkdtemp(prefix=".browser-download-", dir=root)
-        browser_cdp.on("Browser.downloadWillBegin", will_begin)
-        browser_cdp.on("Browser.downloadProgress", progress)
+        event_cdp = page_cdp if native_context else browser_cdp
+        event_cdp.on(event_domain + ".downloadWillBegin", will_begin)
+        event_cdp.on(event_domain + ".downloadProgress", progress)
         page_cdp.on("Fetch.requestPaused", paused)
-        browser_cdp.send("Browser.setDownloadBehavior", {"behavior": "allowAndName",
-                         "downloadPath": staging, "eventsEnabled": True, **scope})
+        if native_context:
+            # 原生 --incognito 和默认普通上下文未注册到 Target.getBrowserContexts，
+            # Browser.setDownloadBehavior(context ID) 会拒绝。页面命令使用当前页面
+            # 的实际上下文，保留登录、代理及原窗口，同时仍按 GUID 流式落盘。
+            page_cdp.send("Page.enable")
+            page_cdp.send("Page.setDownloadBehavior", {"behavior": "allowAndName",
+                          "downloadPath": staging})
+        else:
+            browser_cdp.send("Browser.setDownloadBehavior", {"behavior": "allowAndName",
+                             "downloadPath": staging, "eventsEnabled": True, **scope})
         configured = True
         page_cdp.send("Fetch.enable", {"patterns": [{"resourceType": "Document", "requestStage": "Response"}]})
         check()
@@ -221,14 +238,19 @@ def download_through_chromium(session, url, page, browser):
                     browser_cdp.send("Browser.cancelDownload", {"guid": state["guid"], **scope})
                 except Exception:
                     pass
-            for event, handler in (("Browser.downloadWillBegin", will_begin), ("Browser.downloadProgress", progress)):
+            for event, handler in ((event_domain + ".downloadWillBegin", will_begin),
+                                   (event_domain + ".downloadProgress", progress)):
                 try:
-                    browser_cdp.remove_listener(event, handler)
+                    if event_cdp is not None:
+                        event_cdp.remove_listener(event, handler)
                 except Exception:
                     pass
             if configured:
                 try:
-                    browser_cdp.send("Browser.setDownloadBehavior", {"behavior": "default", "eventsEnabled": False, **scope})
+                    if native_context:
+                        page_cdp.send("Page.setDownloadBehavior", {"behavior": "default"})
+                    else:
+                        browser_cdp.send("Browser.setDownloadBehavior", {"behavior": "default", "eventsEnabled": False, **scope})
                 except Exception:
                     pass
             try:

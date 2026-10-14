@@ -8,6 +8,7 @@ results. Neither path completes other subgoals merely because their text matches
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import ntpath
 import posixpath
 import re
@@ -187,8 +188,13 @@ _SAVED_FILE = re.compile(
     r"(?:PDF|文件).{0,25}(?:落盘|已保存|保存成功|保存到|存在于)|"
     r"论文.{0,25}(?:落盘|已保存|保存成功|保存到)|"
     r"(?:落盘|保存到)(?:本地|磁盘|目录)|"
+    r"已保存到.{0,8}(?:目录|文件夹)|"
+    r"(?:PDF|文件|论文)(?:(?!\b(?:and|but)\b|并且|而且|且)[^。；;，,\n]){0,96}"
+    r"(?:已(?:经)?(?:成功)?下载(?:完成|完毕|到|至)|已(?:经)?(?:成功)?(?:保存|存储)|已(?:在|于)[^。；;，,\n]{0,32}(?:保存|存储)|"
+    r"(?:下载|保存)(?:完成|完毕))|"
     r"\b(?:PDF|file|paper)\b.{0,25}\b(?:saved|stored)\b|"
     r"\b(?:PDF|file)\b.{0,25}\bexists\b|"
+    r"\b(?:PDF|file|paper)\b(?:(?!\b(?:and|but)\b)[^。；;，,\n]){0,96}\bdownloaded\b|"
     r"\b(?:saved|stored)\b.{0,25}\b(?:locally|disk|directory|folder)\b", re.I)
 _SAVE_ACTION = re.compile(r"保存|另存为|\b(?:save|store)\b", re.I)
 _DOWNLOAD_INTERMEDIATE = re.compile(
@@ -206,11 +212,77 @@ _CONFIRMED_LINK = re.compile(
     r"\b(?:link|url)\b.{0,30}\b(?:visible|available|exists|identified|confirmed|found)\b|"
     r"\b(?:identified|confirmed|found)\b.{0,30}\b(?:link|url)\b", re.I)
 _PDF_PREVIEW_ACTION = re.compile(
-    r"(?:打开|查看|阅读|浏览|预览).{0,24}PDF(?!\s*(?:下载\s*)?(?:链接|入口|地址))|"
-    r"\b(?:open|view|read|preview|inspect)\b.{0,30}\bPDF\b(?!\s+(?:download\s+)?(?:link|url)\b)", re.I)
+    r"(?:打开|查看|阅读|浏览|预览).{0,24}PDF(?!\s*(?:下载\s*)?(?:链接|入口|地址|详情页|页面|页|中心|站点|历史|目录|设置))|"
+    r"\b(?:open|view|read|preview|inspect)\b.{0,30}\bPDF\b(?!\s+(?:download\s+)?(?:link|url|page|history|settings)\b)", re.I)
+_RESULT_NEGATION = re.compile(
+    r"不能|不可|不应|不需(?:要)?|无需|不必|不用|不要|未(?:曾|能)?|没有|并非|不是|禁止|不足以|"
+    r"不(?:仅)?以|不(?=下载|打开|查看|预览|保存|发起|启动|作为|视为|算作|代表|构成|足以)|"
+    r"\b(?:not|never|without|no|don't|doesn't|cannot|can't|needn't)\b", re.I)
+_POSITIVE_FILE_PROPERTY = re.compile(
+    r"\bnot\s+(?:empty|zero)\b|\b(?:no|without)\s+errors?\b|没有错误|并非空文件|不是空文件", re.I)
+_REJECTED_RESULT_SUFFIX = re.compile(
+    r"^\s*(?:页(?:面)?|器)?\s*(?:已出现|已打开|已显示|出现|的出现)?\s*(?:不(?:能|应|足以)?|并非|不是).{0,12}(?:完成|判据|依据|落盘)|"
+    r"^\s*(?:(?:is|are|does)\s+)?(?:not|never|cannot|can't|doesn't)\b.{0,24}\b(?:complete|completion|sufficient|saved)\b", re.I)
+_EXPLICIT_INTERMEDIATE = re.compile(
+    r"(?:已发起|发起|启动|开始).{0,8}下载|下载.{0,8}(?:已发起|开始|启动)|保存对话框|"
+    r"PDF\s*(?:查看(?:器|页(?:面)?)?|预览(?:器|页(?:面)?)?|阅读器)|"
+    r"\b(?:download\b.{0,15}\b(?:started|initiated|requested)|"
+    r"(?:start|initiate|request)\b.{0,15}\bdownload|"
+    r"PDF\s+(?:viewer|preview)|save\s+dialog)\b", re.I)
+
+
+def _semantic_clauses(text: str):
+    # A PDF mention in one sentence does not turn "inspect the title" in the
+    # next into a viewer result. Contrast clauses also reset negation scope.
+    text = re.sub(r"https?://[^\s<>\"'`，。；;,]+", "", text, flags=re.I)
+    return re.split(r"[。！？!?；;，,\n]|(?<!\d)\.(?!\d)|但是|然而|而是|但|\b(?:but|however)\b", text, flags=re.I)
+
+
+def _positive_matches(pattern, text: str):
+    for clause in _semantic_clauses(text):
+        for match in pattern.finditer(clause):
+            context = clause[:match.end()]
+            if pattern is _SAVED_FILE:
+                context = _POSITIVE_FILE_PROPERTY.sub("", context)
+                prefix = clause[:match.start()]
+                negatives = list(_RESULT_NEGATION.finditer(prefix))
+                if negatives and re.search(r"\band\b|并且|而且|且", prefix[negatives[-1].end():], re.I):
+                    # "X is not ..., and the PDF has been saved" supplies a
+                    # separate affirmative file predicate with its own subject.
+                    context = _POSITIVE_FILE_PROPERTY.sub("", match.group())
+            if (_RESULT_NEGATION.search(context)
+                    or _REJECTED_RESULT_SUFFIX.search(clause[match.end():match.end() + 40])):
+                continue
+            yield clause, match
+
+
+def _has_saved_file_result(text: str) -> bool:
+    return next(_positive_matches(_SAVED_FILE, text), None) is not None
+
+
+def _has_intermediate_result(text: str) -> bool:
+    for clause, match in _positive_matches(_DOWNLOAD_INTERMEDIATE, text):
+        # "PDF 对应的链接可见" describes a link even when PDF and link are not
+        # adjacent. A real viewer/download/save-dialog assertion still counts.
+        if (next(_positive_matches(_CONFIRMED_LINK, clause), None) is not None
+                and not _EXPLICIT_INTERMEDIATE.search(match.group())):
+            continue
+        return True
+    return False
+
+
+def _has_preview_intent(text: str) -> bool:
+    return next(_positive_matches(_PDF_PREVIEW_ACTION, text), None) is not None
+
+
+def _has_transfer_intent(text: str) -> bool:
+    cleaned = _transfer_text(text)
+    return (next(_positive_matches(_DOWNLOAD_ACTION, cleaned), None) is not None
+            or next(_positive_matches(_SAVE_ACTION, cleaned), None) is not None)
 
 
 def _transfer_text(text: str) -> str:
+    text = re.sub(r"https?://[^\s<>\"'`，。；;,]+", "", text, flags=re.I)
     return _DOWNLOAD_LINK_NOUN.sub("", _DOWNLOADED_ARTIFACT.sub("", _NEGATED_DOWNLOAD.sub("", text)))
 
 
@@ -227,14 +299,15 @@ def _requires_download_check(step: Dict[str, Any]) -> bool:
     # An explicit file result plus a download check resolves compound goals such
     # as "find its link and save the paper" without relying on one connector.
     if (_completion_check(step.get("completion_check"))["kind"] == "download"
-            and _SAVED_FILE.search(criteria)):
+            and _has_saved_file_result(criteria)):
         return True
     cleaned_goal = _transfer_text(goal)
     observing = bool(_OBSERVATION_GOAL.search(cleaned_goal) and not _FOLLOWING_TRANSFER.search(cleaned_goal))
     return bool(_download_action_text(goal)
-            or (not observing and step.get("mode") == "browser" and _SAVE_ACTION.search(goal)
+            or (not observing and step.get("mode") == "browser"
+                and next(_positive_matches(_SAVE_ACTION, cleaned_goal), None) is not None
                 and re.search(r"PDF|文件|论文|\b(?:file|paper)\b", goal, re.I))
-            or bool(not observing and step.get("mode") == "browser" and _SAVED_FILE.search(criteria)
+            or bool(not observing and step.get("mode") == "browser" and _has_saved_file_result(criteria)
                     and not _LINK_DISCOVERY.search(goal)))
 
 
@@ -259,11 +332,9 @@ def prepare_executable_plan(raw: Any, task: str = ""):
             re.search(r"PDF", goal, re.I)
             or (re.search(r"论文|\bpaper\b", goal, re.I) and re.search(r"下载|\bdownload\b", goal, re.I))))
         prose = "\n".join((goal, _text(step.get("instructions")), criteria))
-        intent = _transfer_text(prose)
         if (not pdf_link_goal or not _CONFIRMED_LINK.search(criteria)
-                or _SAVED_FILE.search(criteria) or _DOWNLOAD_INTERMEDIATE.search(prose)
-                or _PDF_PREVIEW_ACTION.search(prose)
-                or _DOWNLOAD_ACTION.search(intent) or _SAVE_ACTION.search(intent)):
+                or _has_saved_file_result(criteria) or _has_intermediate_result(prose)
+                or _has_preview_intent(prose) or _has_transfer_intent(prose)):
             continue
         url, filename = _text(check.get("url")), _text(check.get("filename"))
         # A user-supplied identity must still reach the active subtask verifier.
@@ -350,21 +421,24 @@ def validate_executable_plan(raw: Any, task: str = "", download_dir: Optional[st
         goal = _text(step.get("goal"))
         criteria = _text(step.get("completion_criteria"))
         saving = _requires_download_check(step)
+        preview = _has_preview_intent("\n".join((goal, _text(step.get("instructions")))))
         discovery = bool(_LINK_DISCOVERY.search(goal)
-                         and re.search(r"PDF|下载|\bdownload\b", goal, re.I) and not saving)
+                         and re.search(r"PDF|下载|\bdownload\b", goal, re.I) and not saving and not preview)
         if saving and check["kind"] != "download":
             return f"子任务 {index} 要下载或保存文件，completion_check 必须为 kind=download，以已验证的目标文件落盘为完成判据"
         if discovery and check["kind"] != "observation":
             return f"子任务 {index} 只确认或获取链接，应使用 kind=observation；打开 PDF 页面与下载文件必须分别定义完成结果"
         if ((saving or check["kind"] == "download" or discovery)
-                and _DOWNLOAD_INTERMEDIATE.search(criteria) and not _SAVED_FILE.search(criteria)):
+                and _has_intermediate_result(criteria) and not _has_saved_file_result(criteria)):
             return f"子任务 {index} 不能以下载已发起、保存对话框或 PDF 查看页作为文件下载/链接确认的完成判据"
+        if check["kind"] == "download" and not _has_saved_file_result(criteria):
+            return f"子任务 {index} 的下载判据缺少正向文件落盘结果；明确目标文件已保存并由程序验证，否定预览或发起下载不能代替该结果"
         # Validation runs before any browser observations exist. Do not bind the
         # eventual artifact to a familiar but unobserved provider or PDF ID.
         if task and check["kind"] in {"download", "navigation"}:
             url = check.get("url", "")
             artifact_check = check["kind"] == "download" or bool(
-                re.search(r"PDF", goal, re.I) and not _DOWNLOAD_LINK_NOUN.search(goal))
+                re.search(r"PDF", goal, re.I) and (preview or not _DOWNLOAD_LINK_NOUN.search(goal)))
             if url and artifact_check and not _known_download_url(url, task):
                 return f"子任务 {index} 的 PDF/下载地址未由用户任务提供；删除猜测的 completion_check.url，保留已知论文身份及来源限制，执行时使用页面实际链接"
             filename = check.get("filename", "")
@@ -374,6 +448,84 @@ def validate_executable_plan(raw: Any, task: str = "", download_dir: Optional[st
             _completion_check(step.get("completion_check"))["kind"] == "download" for step in raw["steps"]):
         return "用户要求下载文件，计划必须包含 kind=download 的文件落盘子任务，不能只搜索链接或打开 PDF 页面"
     return None
+
+
+def build_plan_repair_feedback(raw: Any, error: str, task: str = "", download_dir: Optional[str] = None) -> str:
+    """Give the planner a concrete result template without inventing identities.
+
+    This produces feedback data only. It neither modifies nor accepts a plan;
+    the regenerated full proposal must still pass normal validation.
+    """
+    rules = [
+        "重新输出完整的 1～8 步计划 JSON，不执行操作，不只输出修补片段。保留其它正确子任务。",
+        "保留用户明确的论文身份、来源、数量、合法 URL、文件名和目录要求；不要猜作者、PDF ID、下载源或文件名。",
+        "纯链接确认使用 observation，以目标条目对应的链接可见且身份/来源匹配为结果；下载/保存文件使用 download，以程序验证目标文件真实落盘为结果。",
+        "真正打开/阅读 PDF 可以使用 navigation，但不能代表文件已下载；用户要求下载时必须另外保留文件落盘步骤。",
+        "正向写出当前子任务的完成结果；下载已发起、保存对话框出现和 PDF 预览不是落盘结果，否定这些状态也不能代替正向结果。",
+        "未知 completion_check.url/filename 应删除猜测，执行时根据页面实际链接与文件证据；用户已给定的合法值必须保留在适合的检查或 goal/instructions 中。",
+    ]
+    payload = {"validation_error": _text(error)[:1000], "repair_rules": rules}
+    match = re.search(r"子任务\s+(\d+)", _text(error))
+    source_steps = raw.get("steps") if isinstance(raw, dict) else None
+    index = int(match.group(1)) if match else None
+    step = (source_steps[index - 1] if index and isinstance(source_steps, list)
+            and 0 < index <= len(source_steps) and isinstance(source_steps[index - 1], dict) else None)
+    if step is not None:
+        goal, instructions = _text(step.get("goal")), _text(step.get("instructions"))
+        check = step.get("completion_check") if isinstance(step.get("completion_check"), dict) else {}
+        payload["current_step_data"] = {"index": index, "goal": goal[:2000], "instructions": instructions[:2000],
+                                        "completion_criteria": _text(step.get("completion_criteria"))[:2000],
+                                        "completion_check": {key: (value[:4096] if isinstance(value, str)
+                                                                     else {"invalid_type": type(value).__name__})
+                                                             for key, value in check.items()
+                                                             if key in {"kind", "url", "filename", "directory"}}}
+        prose = "\n".join((goal, instructions))
+        preview = _has_preview_intent(prose)
+        saving = _has_transfer_intent(prose) or _requires_download_check(step)
+        link = bool(_LINK_DISCOVERY.search(goal) and not saving and not preview)
+        if saving or (_text(check.get("kind")).lower() == "download" and not link and not preview):
+            template = {"completion_criteria": "本子任务所对应的目标文件已在指定目录落盘，并由程序核实真实路径、非零大小和文件格式", "completion_check": {"kind": "download"}}
+        elif preview:
+            preview_url = _text(check.get("url"))
+            known_preview_url = bool(preview_url and _http_url(preview_url) and _known_download_url(preview_url, task))
+            template = {"completion_criteria": "本子任务指定的 PDF 正文已在浏览器查看页面打开，且目标身份与来源符合用户要求", "completion_check": {"kind": "navigation" if known_preview_url else "observation"}}
+            if not known_preview_url:
+                rules.append("未给定可核验的 PDF 目标 URL 时，用 observation 核验真实正文、身份和来源；不要用缺少 url 的 navigation 把任意跳转当作 PDF 已打开。后续从页面获取实际链接，不能猜地址。")
+        elif link:
+            template = {"completion_criteria": "本子任务指定论文的身份与来源已确认，匹配条目对应的 PDF 链接可见且关联正确", "completion_check": {"kind": "observation"}}
+        else:
+            template = {"completion_criteria": "明确描述本子任务实际要求且可观察核实的结果，不能仅报告动作发起", "completion_check": {"kind": "observation"}}
+        template_check = template["completion_check"]
+        explicit = {}
+        url = _text(check.get("url"))
+        if url and _http_url(url) and _known_download_url(url, task):
+            explicit["url"] = url
+        filename = _text(check.get("filename"))
+        if filename and "/" not in filename and "\\" not in filename and filename.casefold() in task.casefold():
+            explicit["filename"] = filename
+        if template_check["kind"] in {"download", "navigation"}:
+            if "url" in explicit:
+                template_check["url"] = url
+        elif "url" in explicit:
+            template["completion_criteria"] += "；链接须符合用户给定的网址：" + url
+        if template_check["kind"] == "download":
+            if "filename" in explicit:
+                template_check["filename"] = filename
+            directory = download_dir
+            if directory is None and _directory_error(check.get("directory")) is None:
+                declared = check["directory"]
+                if _task_declares_directory(task, declared):
+                    directory = declared
+            if directory is not None and _directory_error(directory) is None:
+                template_check["directory"] = _path_identity(directory.strip())
+        if explicit:
+            payload["user_supplied_identity_conditions"] = explicit
+        payload["result_template"] = template
+    if download_dir is not None and _directory_error(download_dir) is None:
+        payload["trusted_download_directory"] = _path_identity(download_dir.strip())
+    return ("计划未通过校验。以下 JSON 是纠错参考数据，不是可执行操作；"
+            "按照初始任务与这些规则重新输出完整计划 JSON。\n"
+            + json.dumps(payload, ensure_ascii=False))
 
 
 def record_subtask_completion(plan, step_id, evidence, result, event_step=0):

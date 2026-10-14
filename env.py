@@ -117,10 +117,12 @@ def build_environment(env_cfg, context_cfg=None):
     from .adapters.windows_env import WindowsEnvironment
     from .run_windows_local import CHROME_DEFAULT, ensure_chrome
     chrome_path = getattr(env_cfg, "chrome_path", "") or CHROME_DEFAULT
+    browser_mode = getattr(env_cfg, "browser_mode", "incognito")
     return WindowsEnvironment(browser_port=getattr(env_cfg, "browser_port", 9222),
         width=env_cfg.screen_width, height=env_cfg.screen_height,
         execution_mode=env_cfg.execution_mode,
+        browser_mode=browser_mode,
         screenshot_max_edge=getattr(context_cfg, "screenshot_max_edge", 1280),
-        browser_launcher=lambda: ensure_chrome(getattr(env_cfg, "browser_port", 9222), chrome_path),
+        browser_launcher=lambda: ensure_chrome(getattr(env_cfg, "browser_port", 9222), chrome_path, browser_mode),
         action_settle_seconds=getattr(env_cfg, "action_settle_seconds", 0.25),
         downloads_dir=getattr(env_cfg, "downloads_dir", None))
