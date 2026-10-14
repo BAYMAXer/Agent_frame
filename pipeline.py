@@ -38,7 +38,7 @@ from .prompts import (build_user_prompt, build_format_feedback, build_planner_pr
                       build_subtask_system_prompt, build_region_prompt)
 from .context import PromptCompiler, ContextBudgetError
 from .planning import (normalize_plan, get_current_step_id, update_plan_progress,
-                       validate_executable_plan, record_subtask_completion)
+                       validate_executable_plan, record_subtask_completion, prepare_executable_plan)
 
 # 实时状态推送（可选）：execute 阶段进度推给 viz 前端，失败不影响主流程
 try:
@@ -70,6 +70,7 @@ class AgentResult:
     plan: Optional[Dict[str, Any]] = None   # 阶段0 产出的任务计划（steps/keywords/final_check）
     termination_reason: str = ""
     error: str = ""
+    planning_calls: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -233,7 +234,8 @@ class Pipeline:
                 raise
             result.final_answer = f"规划失败：{exc}"
             result.termination_reason, result.error = "planning_error", result.final_answer
-            result.trajectory.append({"step": 0, "error": result.final_answer, "phase": "planning"})
+            result.trajectory.append({"step": 0, "error": result.final_answer, "phase": "planning",
+                                      "model_calls": copy.deepcopy(result.planning_calls)})
             self._emit_progress("planning_failed", state, result, error=result.final_answer)
             return result
         self._publish_plan(state, result, changed=bool(state.memory.plan))
@@ -421,12 +423,15 @@ class Pipeline:
         if state.memory is not None:
             result.plan = copy.deepcopy(state.memory.plan)
         now = time.monotonic()
+        phase_started = now
         if self._last_phase is not None:
             previous, step, started = self._last_phase
             if step == state.step_id:
                 details["previous_phase"] = previous
                 details["previous_phase_elapsed_ms"] = round((now - started) * 1000, 2)
-        self._last_phase = (phase, state.step_id, now)
+                if previous == phase:
+                    phase_started = started  # Same-phase diagnostics must not reset the phase duration.
+        self._last_phase = (phase, state.step_id, phase_started)
         event = {"event": phase, "phase": phase, "step": state.step_id,
                  "task": state.task, "ts": time.time(), **details}
         duration = event.get("previous_phase_elapsed_ms")
@@ -1270,9 +1275,12 @@ class Pipeline:
             error = "未取得可实施的任务计划"
             for attempt in range(2):
                 self._check_step_budget("planning")
+                sent_messages = copy.deepcopy(messages)
+                raw = None
+                corrections = []
                 try:
                     raw = self.model.chat(messages, json_mode=True)
-                    obj = parse_decision(raw)
+                    obj, corrections = prepare_executable_plan(parse_decision(raw), task)
                     error = validate_executable_plan(obj, task, download_dir=getattr(self.env, "downloads_dir", None))
                     if error is None:
                         proposal = dict(obj)
@@ -1282,13 +1290,23 @@ class Pipeline:
                         state.memory.task_state["goal"] = task
                         state.memory.sync_plan_state()
                         state.memory.add_event(f"已制定 {len(state.memory.plan['steps'])} 个串行子任务")
+                        self._record_planning_call(state, attempt + 1, sent_messages, raw,
+                                                   corrections=corrections)
                         return
+                    self._record_planning_call(state, attempt + 1, sent_messages, raw,
+                                               error=error, corrections=corrections)
                     messages += [{"role": "assistant", "content": raw},
                                  {"role": "user", "content": f"计划不完整：{error}。请重新输出完整计划 JSON，不要执行操作。"}]
-                except ModelRequestTimeout:
+                except ModelRequestTimeout as exc:
+                    self._record_planning_call(state, attempt + 1, sent_messages, raw,
+                                               error=str(exc), corrections=corrections,
+                                               error_type=type(exc).__name__)
                     raise
                 except Exception as exc:
-                    error = f"规划请求失败：{type(exc).__name__}"
+                    error = f"规划请求失败：{type(exc).__name__}：{str(exc)[:300]}"
+                    self._record_planning_call(state, attempt + 1, sent_messages, raw,
+                                               error=error, corrections=corrections,
+                                               error_type=type(exc).__name__)
             raise ValueError(error)
         try:
             raw = self.model.chat([{"role": "user", "content": prompt}], retries=1, json_mode=True)
@@ -1307,6 +1325,27 @@ class Pipeline:
             raise
         except Exception:  # noqa: BLE001  planner 失败不影响主流程
             return
+
+    def _record_planning_call(self, state, attempt, messages, raw, *, error=None,
+                              corrections=None, error_type=None):
+        """Persist rejected planner responses even when no action step exists."""
+        result = getattr(self, "_running_result", None)
+        if result is None:
+            return
+        snapshot = getattr(self.model, "last_call", {})
+        call = copy.deepcopy(snapshot) if isinstance(snapshot, dict) else {}
+        if raw is None and call.get("messages") != messages:
+            call = {}  # Do not label a previous response as the failed new request.
+        call.update(actor_role="planning", provenance="sampled", attempt=attempt,
+                    messages=copy.deepcopy(messages), response=raw or "",
+                    plan_accepted=error is None, validation_error=error or "",
+                    corrections=copy.deepcopy(corrections or []))
+        if error_type:
+            call["error_type"] = error_type
+        result.planning_calls.append(call)
+        self._emit_progress("planning", state, result, planning_attempt=attempt,
+                            model_calls=[call], validation_error=error or "",
+                            planning_corrections=copy.deepcopy(corrections or []))
 
     def _prepare_plan_action(self, state, decision, result):
         if self.browser_first:

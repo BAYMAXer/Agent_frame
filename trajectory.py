@@ -195,6 +195,7 @@ def build_trajectory(
         }, getattr(result, "plan", None)),
         "steps": steps,
         "plan": getattr(result, "plan", None),
+        "planning_calls": copy.deepcopy(getattr(result, "planning_calls", []) or []),
     }
 
 

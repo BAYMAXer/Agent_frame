@@ -166,8 +166,8 @@ def normalize_plan(raw: Any, task: str = "", *, deduplicate: bool = True,
 
 
 _DOWNLOAD_LINK_NOUN = re.compile(
-    r"下载\s*(?:链接|按钮|入口|地址|源|列表|详情页|页面|页|中心|站点|历史|记录|次数|目录|设置|统计|速度)|"
-    r"\bdownload\s+(?:link|button|url|source|page|list|history|record|count|directory|folder|settings|statistics|speed)\b", re.I)
+    r"下载\s*(?:链接|按钮|入口|地址|源|列表|详情页|页面|页|中心|站点|历史|记录|次数|目录|设置|统计|速度|状态|进度|结果)|"
+    r"\bdownload\s+(?:link|button|url|source|page|list|history|record|count|directory|folder|settings|statistics|speed|status|progress|results?)\b", re.I)
 _DOWNLOADED_ARTIFACT = re.compile(r"已(?:经)?下载|下载(?:的|后)", re.I)
 _DOWNLOAD_ACTION = re.compile(r"下载|\bdownload(?:ing)?\b", re.I)
 _NEGATED_DOWNLOAD = re.compile(
@@ -181,8 +181,8 @@ _OBSERVATION_GOAL = re.compile(
     r"^(?:请\s*)?(?:确认|检查|核对|验证|查看|查找|找到|搜索|识别|定位|获取|提取)|"
     r"^(?:please\s+)?(?:find|locate|identify|confirm|inspect|check|verify|search)\b", re.I)
 _FOLLOWING_TRANSFER = re.compile(
-    r"(?:并|然后|之后|后|再)\s*(?:下载|保存|另存为)|"
-    r"\b(?:and|then)\s+(?:download|save|store)\b", re.I)
+    r"(?:并|然后|之后|后|再)[^。；;\n]{0,24}(?:下载|保存|另存为)|"
+    r"\b(?:and|then)\b[^。；;\n]{0,24}\b(?:download|save|store)\b", re.I)
 _SAVED_FILE = re.compile(
     r"(?:PDF|文件).{0,25}(?:落盘|已保存|保存成功|保存到|存在于)|"
     r"论文.{0,25}(?:落盘|已保存|保存成功|保存到)|"
@@ -200,11 +200,23 @@ _DOWNLOAD_INTERMEDIATE = re.compile(
     r"\b(?:PDF\s+(?:viewer|preview)|save\s+dialog)\b|"
     r"\bPDF\b(?!\s+(?:download\s+)?(?:link|url)\b).{0,15}\b(?:open|opened|visible|loaded)\b|"
     r"\b(?:navigate[sd]?|navigation)\b.{0,25}\bPDF\b", re.I)
+_CONFIRMED_LINK = re.compile(
+    r"(?:链接|入口|地址).{0,30}(?:可见|存在|已找到|已确认|已定位|已显示|匹配)|"
+    r"(?:已找到|已确认|已定位|已显示).{0,30}(?:链接|入口|地址)|"
+    r"\b(?:link|url)\b.{0,30}\b(?:visible|available|exists|identified|confirmed|found)\b|"
+    r"\b(?:identified|confirmed|found)\b.{0,30}\b(?:link|url)\b", re.I)
+_PDF_PREVIEW_ACTION = re.compile(
+    r"(?:打开|查看|阅读|浏览|预览).{0,24}PDF(?!\s*(?:下载\s*)?(?:链接|入口|地址))|"
+    r"\b(?:open|view|read|preview|inspect)\b.{0,30}\bPDF\b(?!\s+(?:download\s+)?(?:link|url)\b)", re.I)
+
+
+def _transfer_text(text: str) -> str:
+    return _DOWNLOAD_LINK_NOUN.sub("", _DOWNLOADED_ARTIFACT.sub("", _NEGATED_DOWNLOAD.sub("", text)))
 
 
 def _download_action_text(text: str) -> bool:
     # "find a download link" describes evidence discovery, not a file transfer.
-    cleaned = _DOWNLOAD_LINK_NOUN.sub("", _DOWNLOADED_ARTIFACT.sub("", _NEGATED_DOWNLOAD.sub("", text)))
+    cleaned = _transfer_text(text)
     return bool(_DOWNLOAD_ACTION.search(cleaned)
                 and (not _OBSERVATION_GOAL.search(cleaned) or _FOLLOWING_TRANSFER.search(cleaned)))
 
@@ -212,12 +224,59 @@ def _download_action_text(text: str) -> bool:
 def _requires_download_check(step: Dict[str, Any]) -> bool:
     goal = _text(step.get("goal"))
     criteria = _text(step.get("completion_criteria"))
-    observing = bool(_OBSERVATION_GOAL.search(goal) and not _FOLLOWING_TRANSFER.search(goal))
+    # An explicit file result plus a download check resolves compound goals such
+    # as "find its link and save the paper" without relying on one connector.
+    if (_completion_check(step.get("completion_check"))["kind"] == "download"
+            and _SAVED_FILE.search(criteria)):
+        return True
+    cleaned_goal = _transfer_text(goal)
+    observing = bool(_OBSERVATION_GOAL.search(cleaned_goal) and not _FOLLOWING_TRANSFER.search(cleaned_goal))
     return bool(_download_action_text(goal)
             or (not observing and step.get("mode") == "browser" and _SAVE_ACTION.search(goal)
                 and re.search(r"PDF|文件|论文|\b(?:file|paper)\b", goal, re.I))
             or bool(not observing and step.get("mode") == "browser" and _SAVED_FILE.search(criteria)
                     and not _LINK_DISCOVERY.search(goal)))
+
+
+def prepare_executable_plan(raw: Any, task: str = ""):
+    """Correct only unmistakable PDF link checks in a new planner proposal.
+
+    Keep identity, source conditions and all prose verbatim. File saving and
+    ambiguous checks remain subject to strict validation and planner retries.
+    """
+    proposal = deepcopy(raw)
+    corrections = []
+    if not isinstance(proposal, dict) or not isinstance(proposal.get("steps"), list):
+        return proposal, corrections
+    for index, step in enumerate(proposal["steps"], 1):
+        if not isinstance(step, dict):
+            continue
+        check = step.get("completion_check")
+        if not isinstance(check, dict) or _text(check.get("kind")).lower() not in {"navigation", "download"}:
+            continue
+        goal, criteria = _text(step.get("goal")), _text(step.get("completion_criteria"))
+        pdf_link_goal = bool(_LINK_DISCOVERY.search(goal) and (
+            re.search(r"PDF", goal, re.I)
+            or (re.search(r"论文|\bpaper\b", goal, re.I) and re.search(r"下载|\bdownload\b", goal, re.I))))
+        prose = "\n".join((goal, _text(step.get("instructions")), criteria))
+        intent = _transfer_text(prose)
+        if (not pdf_link_goal or not _CONFIRMED_LINK.search(criteria)
+                or _SAVED_FILE.search(criteria) or _DOWNLOAD_INTERMEDIATE.search(prose)
+                or _PDF_PREVIEW_ACTION.search(prose)
+                or _DOWNLOAD_ACTION.search(intent) or _SAVE_ACTION.search(intent)):
+            continue
+        url, filename = _text(check.get("url")), _text(check.get("filename"))
+        # A user-supplied identity must still reach the active subtask verifier.
+        # If it exists only in the old check, ask the planner to preserve it in
+        # its observation goal rather than silently deleting that condition.
+        if task and ((url and _known_download_url(url, task) and url.casefold() not in prose.casefold())
+                     or (filename and filename.casefold() in task.casefold()
+                         and filename.casefold() not in prose.casefold())):
+            continue
+        previous_kind = _text(check.get("kind")).lower()
+        step["completion_check"] = {"kind": "observation"}
+        corrections.append(f"子任务 {index}：纯 PDF 链接确认的 completion_check.kind 从 {previous_kind} 改为 observation；保留目标与来源条件，移除仅用于导航/文件落盘的检查字段")
+    return proposal, corrections
 
 
 def _known_download_url(url: str, task: str) -> bool:

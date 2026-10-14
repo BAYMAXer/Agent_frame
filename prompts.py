@@ -281,6 +281,11 @@ def build_planner_prompt(task: str, os_name: str = "windows", browser_first: boo
 11. 「确认论文并找到 PDF/下载链接」使用 observation，以正确标题对应的真实链接可见为完成结果；「打开 PDF 查看页」才使用 navigation；「下载/保存 PDF」必须使用 download，以该论文对应文件落盘为完成结果。不要在链接确认步骤点击下载后等待某个预设 PDF 网站。
 12. 初始计划没有搜索结果证据：用户只给论文名时，下载 completion_check 仅写 kind=download，不能凭熟悉的论文猜 arXiv/NeurIPS 地址、PDF 标识或文件名。用户明确提供的下载地址、文件名或来源限制必须保留；执行时依据确认目标后页面中的真实下载链接，不用「通常指向某站」作为事实。可以直接下载到用户指定目录，无需假定系统 Downloads 再安排移动文件。
 
+判据示例（实际计划替换为用户要求的论文名，并保留来源条件）：
+- 只找到链接：{{"goal":"确认 Attention Is All You Need 并获取 PDF 下载链接","completion_criteria":"正确论文对应的 PDF 链接已确认且可见","completion_check":{{"kind":"observation"}}}}。
+- 获取链接并保存文件：{{"goal":"获取 Attention Is All You Need 的 PDF 链接并将论文保存到配置目录","completion_criteria":"该论文对应的 PDF 文件已在配置目录落盘，并通过程序验证","completion_check":{{"kind":"download"}}}}。
+两个结果不能混用；文件下载完成必须由程序返回真实文件路径，链接可见不代表已下载。
+
 任务：{task}
 
 只输出一个 JSON 对象，不要多余文字：
