@@ -1,0 +1,3 @@
+# Install platform requirements as well in the Python environment used by the runner.
+# Keep the SDK on the FastMCP v1 API; upgrading to v2 requires an explicit migration.
+mcp>=1.26,<2

@@ -1,58 +1,35 @@
-"""Launch this version's local UI and runners without renaming its package folder.
-
-Run ``python osworld_agent_1010/launch.py`` from the workspace, or
-``python launch.py`` from this directory. Starting the UI makes no model calls;
-desktop actions begin only after the user starts a task from the interface.
-"""
+"""Run this source snapshot without requiring its folder to be named osworld_agent."""
 from __future__ import annotations
 
-import argparse
 import importlib.util
-import os
 from pathlib import Path
 import runpy
 import sys
 
 
-def bootstrap_package():
-    """Resolve the canonical imports to this launcher's version directory."""
-    package_root = Path(__file__).resolve().parent
+def bootstrap() -> None:
+    root = Path(__file__).resolve().parent
     existing = sys.modules.get("osworld_agent")
     if existing is not None:
-        if Path(existing.__file__).resolve().parent != package_root:
-            raise RuntimeError("A different osworld_agent version is already imported")
-        return existing
-    spec = importlib.util.spec_from_file_location(
-        "osworld_agent", package_root / "__init__.py",
-        submodule_search_locations=[str(package_root)],
-    )
-    package = importlib.util.module_from_spec(spec)
-    sys.modules["osworld_agent"] = package
-    spec.loader.exec_module(package)
-    return package
-
-
-def main(argv=None):
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    bootstrap_package()
-    if arguments[:2] == ["--runner", "local"]:
-        # CLI 和工作台共用本地 Windows 参数与执行流程。
-        sys.argv = [str(Path(__file__).parent / "run_windows_local.py"), *arguments[2:]]
-        runpy.run_module("osworld_agent.main", run_name="__main__")
+        if Path(existing.__file__).resolve() != root / "__init__.py":
+            raise RuntimeError("A different osworld_agent package is already loaded")
         return
+    spec = importlib.util.spec_from_file_location(
+        "osworld_agent", root / "__init__.py", submodule_search_locations=[str(root)]
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Cannot load the osworld_agent package from this directory")
+    package = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = package
+    spec.loader.exec_module(package)
 
-    parser = argparse.ArgumentParser(description="Start the local Windows Agent visualization UI")
-    parser.add_argument("--port", type=int, default=int(os.getenv("AGENTS_VIZ_PORT", "8088")))
-    args = parser.parse_args(arguments)
-    if not 1 <= args.port <= 65535:
-        parser.error("--port must be between 1 and 65535")
-    os.environ["AGENTS_VIZ_PORT"] = str(args.port)
-    os.environ.setdefault("OSWORLD_RUNNER_PYTHON", sys.executable)
-    from osworld_agent.viz.server import app
-    import uvicorn
-    print(f"Agent Studio: http://127.0.0.1:{args.port}", flush=True)
-    # 启动界面不发送模型请求；点击开始运行后才执行任务。
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+
+def main() -> None:
+    if len(sys.argv) < 2 or not sys.argv[1].startswith("osworld_agent."):
+        raise SystemExit("Usage: python launch.py osworld_agent.<module> [arguments]")
+    module = sys.argv.pop(1)
+    bootstrap()
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
 
 
 if __name__ == "__main__":

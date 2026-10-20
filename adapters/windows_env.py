@@ -1,434 +1,282 @@
 """Windows 本机环境：pyautogui 控制桌面 + CDP 控制浏览器。
 
-用于在 Windows 本机运行 GUI agent 任务，重点支持 browser use：
-- 观察：pyautogui 截图 + browser_ax 快照（焦点在浏览器时经 BrowserSession 抓取）；
+用于在 Windows 本机（非 VM）上跑 GUI agent 任务，重点支持 browser use：
+- 观察：后台 CDP 页面截图与 AX；显式桌面观察使用 Win32/Pillow 全虚拟桌面截图；
 - 执行：桌面 GUI 动作（click/type/hotkey 等）走 pyautogui（坐标定位）；
         浏览器 DOM 动作（带 target_ref / 语义兜底命中）走 CDP（DOM 定位，跳过视觉定位）；
-- 浏览器焦点同时核对 Windows 前台窗口 PID 与本任务的 CDP 调试端口。
+- 焦点检测走 Windows GetForegroundWindow。
 
-browser_first 使用运行专属 CDP 页面；桌面兼容模式使用 Windows 截图和原生输入。
+与 VMwareEnvironment 的对齐点：browser_ax 快照进 context、target_ref 路由 + 语义兜底、
+execute_routed 走 CDP。差异点：CDP host 是 localhost，桌面使用物理像素坐标，无 AT-SPI。
 """
 from __future__ import annotations
 
 import re
 import subprocess
 import sys
-import time
-from typing import Any, Callable, Dict, Optional
+import math
+import threading
+from contextlib import contextmanager
+from typing import Any, Dict, Optional
 
 from ..env import Environment, Observation, StepResult
-from ..actions import ACTION_REGISTRY, Action, get_action_spec
-from ..browser_session import BrowserActionError
-from .windows_input import activate_application, foreground_window, write_text, _enumerate_windows, to_pyautogui
-from .windows_window import WindowPresenter
-from .windows_display import (WorkScreen, detect_primary_work_screen,
-                              initialize_dpi_awareness, move_window_to_work_screen)
-from ..model.request_deadline import ModelRequestTimeout
+from ..actions import Action, get_action_spec, BASIC_ACTIONS
+from .vmware_env import to_pyautogui
 
 
 class WindowsEnvironment(Environment):
+    cli_target = "local"
+
     """Windows 本机环境（GUI + browser use）。"""
 
-    local_environment = True
-    supported_action_names = frozenset(ACTION_REGISTRY)
+    evaluation_available = False
 
     def __init__(self, browser_port: int = 9222, width: int = 1920, height: int = 1080,
-                 downloads_dir: Optional[str] = None,
-                 browser_launcher: Optional[Callable[[], Any]] = None,
-                 action_settle_seconds: float = 0.3,
-                 work_screen: Optional[WorkScreen] = None,
-                 presentation_state_path: Optional[str] = None,
-                 execution_mode: str = "desktop", screenshot_max_edge: int = 1280,
-                 browser_mode: str = "incognito"):
-        if execution_mode not in ("desktop", "browser_first"):
-            raise ValueError("execution_mode 必须是 desktop 或 browser_first")
-        self.execution_mode = execution_mode
-        if browser_mode not in ("incognito", "normal"):
-            raise ValueError("browser_mode 必须是 incognito 或 normal")
-        self.browser_mode = browser_mode
-        self.screenshot_max_edge = max(0, int(screenshot_max_edge))
-        self._browser_subtask_active = False
-        self._desktop_subtask_active = False
-        self._browser_observation_info = {}
+                 downloads_dir: Optional[str] = None, workspace_dir: Optional[str] = None,
+                 window_timeout_s: float = 15.0, browser_start_url: Optional[str] = None,
+                 browser_session_mode: str = "isolated"):
+        if not isinstance(browser_session_mode, str) or browser_session_mode not in {"isolated", "persistent"}:
+            raise ValueError('browser_session_mode must be isolated or persistent')
+        self.browser_session_mode = browser_session_mode
+        if type(window_timeout_s) not in (int, float) or not math.isfinite(window_timeout_s) or window_timeout_s <= 0:
+            raise ValueError('window_timeout_s must be finite and positive')
+        self.window_timeout_s = window_timeout_s
+        self._window_wait_emit = None
+        self._window_wait_remaining = None
+        self._window_wait_cancel = threading.Event()
+        self._pending_window = None
+        self._window_launch_inflight = False
+        self._last_window_wait = None
         self.browser_port = browser_port
         self.width = width
         self.height = height
         self.os_name = "windows"
-        self.browser_only = False  # 同时支持桌面任务；browser use 仅限已核验的所选模式实例
+        self.browser_only = True  # 浏览器专用：用精简 system prompt + 强化 DOM 定位
         self.downloads_dir = downloads_dir
-        self._configured_downloads_dir = downloads_dir
-        self.download_destination = None
-        self._observe_downloads = False
-        self._download_extensions = None
-        self._file_rename_verifier = None
-        self._file_verification_binding = None
-        self._browser_launcher = browser_launcher
-        self._browser_ready = False
-        self._browser_launch_profile = None
+        self.workspace_dir = workspace_dir
+        self.browser_start_url = browser_start_url
+        if downloads_dir is not None and workspace_dir is not None:
+            raise ValueError('workspace_dir 与 downloads_dir 不能同时指定')
         self._browser_session = None
-        self._window_presenter = WindowPresenter(recovery_path=presentation_state_path)
-        self._foreground_before_input = None
-        self._screenshot_is_viewport = False
-        self.action_settle_seconds = max(0.0, float(action_settle_seconds))
-        self.work_screen = work_screen
-        self._fallback_size = (width, height)
-        self.dpi_awareness = None
+        self._last_observation_info = {}
+        self._observation_surface = "browser"
+        self._episode_prepared = False
+        self.initial_state = {}
+        self._desktop_capture = {}
 
-    def configure_task_downloads(self, task):
-        """Bind a task's explicit delivery directory before the planner runs."""
-        from ..download_destination import resolve_download_destination
-        import os
+    def prepare_workspace(self, task_id=None):
+        if self._episode_prepared:
+            return dict(self.initial_state)
+        self.initial_state = self._get_browser_session().prepare_workspace(task_id)
+        self.initial_state['workspace_location'] = 'target_desktop'
+        return dict(self.initial_state)
 
-        self.download_destination = resolve_download_destination(task, self._configured_downloads_dir)
-        self.downloads_dir = self.download_destination["directory"] or os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "downloads")
-        self.download_destination["directory"] = self.downloads_dir
-        self._observe_downloads = (self.download_destination["source"] == "task" or bool(
-            re.search(r"下载|保存|另存为|导出|\b(?:download|save|export)\b", str(task or ""), re.I)))
-        task_text = str(task or "")
-        # PPT 是常用的 PowerPoint 通称；明确写 PPTX 时按该格式核验。
-        other_format = re.search(r"(?<![a-z])(?:pdf|docx?|xlsx?|csv|zip)(?![a-z])", task_text, re.I)
-        if other_format:
-            # 混合格式任务由各子任务核验，不能用全任务的 PPT 限制其他文件。
-            self._download_extensions = None
-        elif re.search(r"(?<![a-z])pptx(?![a-z])", task_text, re.I):
-            self._download_extensions = frozenset({".pptx"})
-        elif re.search(r"(?<![a-z])ppt(?![a-z])|powerpoint", task_text, re.I):
-            self._download_extensions = frozenset({".ppt", ".pptx", ".pptm"})
-        else:
-            self._download_extensions = None
-        if self._browser_session is not None:
-            self._browser_session.downloads_dir = self.downloads_dir
-            self._browser_session.observe_downloads = self._observe_downloads
-            self._browser_session.download_extensions = self._download_extensions
-        return dict(self.download_destination)
+    def begin_episode(self, task_id=None, isolated=True):
+        session = self._get_browser_session()
+        self.initial_state = session.begin_episode(task_id=task_id, isolated=isolated,
+            viewport={"width": self.width, "height": self.height}, start_url=self.browser_start_url)
+        if (not self.initial_state.get("isolated") and not
+                (self.browser_session_mode == "persistent"
+                 and self.initial_state.get("isolation_scope") == "task_tabs"
+                 and self.initial_state.get("session_mode") == "persistent")):
+            raise RuntimeError("Browser episode isolation was not established")
+        self.initial_state['workspace_location'] = 'target_desktop'
+        session.initial_state = dict(self.initial_state)
+        self._episode_prepared = True
+        self._observation_surface = "browser"
+        self._desktop_capture = {}
+        self._last_observation_info = {}
+        self._pending_window = None
+        self._window_launch_inflight = False
+        self._last_window_wait = None
+        self._window_wait_cancel.clear()
+        return dict(self.initial_state)
+
+    @contextmanager
+    def framework_wait_context(self, emit, remaining):
+        old = self._window_wait_emit, self._window_wait_remaining
+        self._window_wait_emit, self._window_wait_remaining = emit, remaining
+        try:
+            yield
+        finally:
+            self._window_wait_emit, self._window_wait_remaining = old
+
+    def cancel_pending_wait(self):
+        self._window_wait_cancel.set()
+
+    def _wait_for_desktop_window(self, target, *, dispatched):
+        from ..desktop_readiness import wait_for_window
+        self._pending_window = target
+        report = wait_for_window(target, timeout_s=self.window_timeout_s,
+            emit=self._window_wait_emit, remaining=self._window_wait_remaining,
+            cancelled=self._window_wait_cancel.is_set)
+        self._last_window_wait = report
+        if report['status'] == 'completed':
+            self._pending_window = None
+            self._window_launch_inflight = False
+        return {'status': 'executed' if report['status'] == 'completed' else 'uncertain',
+                'dispatched': dispatched, 'channel': 'desktop', 'framework_wait': report,
+                'reason': report['detail'],
+                **({'window': report['window']} if report.get('window') else {}),
+                **({'error_code': 'desktop_window_' + report['status']} if report['status'] != 'completed' else {})}
 
     # ---- 观察 ----
     def _take_screenshot(self):
-        """聚焦网页用 CDP 截 viewport；桌面和浏览器 chrome UI 用全屏截图。"""
-        self._screenshot_is_viewport = False
-        if self.execution_mode == "browser_first" and self._desktop_subtask_active:
-            return self._take_desktop_screenshot()
-        if self._focus_is_browser():
-            session = self._get_browser_session()
-            if session is not None:
-                shot = session.screenshot()
-                if shot is not None and self._focus_is_browser():
-                    self._screenshot_is_viewport = True
-                    return shot
-        return self._take_desktop_screenshot()
+        """Desktop fallback; browser screenshots are collected atomically with AX."""
+        from ..desktop_capture import capture_virtual_desktop
+        self._desktop_capture = {}
+        shot, self._desktop_capture = capture_virtual_desktop()
+        return shot
 
-    def _take_desktop_screenshot(self):
-        if self.work_screen and self.work_screen.detected and self.work_screen.monitor_count > 1:
-            from PIL import ImageGrab
-            screen = self.work_screen
-            # bbox 使用虚拟桌面坐标；all_screens 支持左侧/上方副屏的负坐标布局。
-            return ImageGrab.grab(bbox=(screen.left, screen.top,
-                                        screen.left + screen.width, screen.top + screen.height),
-                                  all_screens=True)
-        import pyautogui
-        return pyautogui.screenshot()
-
-    def _screen_info(self):
-        return self.work_screen.to_dict() if self.work_screen else None
-
-    def _screenshot_origin(self):
-        if self._screenshot_is_viewport or not self.work_screen:
-            return [0, 0]
-        return [self.work_screen.left, self.work_screen.top]
-
-    def _position_browser_on_work_screen(self):
-        """明确导航时才移动已激活的浏览器窗口，观察阶段不改变用户窗口。"""
-        screen = self.work_screen
-        if not screen or not screen.detected or screen.monitor_count <= 1:
-            return True
-        if not self._focus_is_browser():
-            return False
-        try:
-            hwnd = foreground_window()
-            if not hwnd or not self._focus_is_browser() or foreground_window() != hwnd:
-                return False
-            if not move_window_to_work_screen(hwnd, screen):
-                return False
-            self._invalidate_browser_snapshot()
-            return foreground_window() == hwnd and self._focus_is_browser()
-        except OSError:
-            return False
-
-    def _present_browser_window(self):
-        """只置顶已核验端口 PID 所属的真实 Chrome HWND，不使用窗口标题猜测。"""
-        from ..utils import _tcp_listener_pids
-        try:
-            if not self._browser_ready:
-                raise RuntimeError("无痕浏览器尚未核验")
-            owners = _tcp_listener_pids(self.browser_port)
-            if not owners or len(owners) != 1:
-                raise RuntimeError("无法确认调试端口的唯一浏览器 PID")
-            pid = next(iter(owners))
-            windows = [window for window in _enumerate_windows(include_untitled=True)
-                       if window.get("pid") == pid and window.get("executable") == "chrome.exe"]
-            focused = foreground_window()
-            window = next((candidate for candidate in windows if candidate["hwnd"] == focused), None)
-            if window is None:
-                window = windows[0] if len(windows) == 1 else None
-            if window is None:
-                raise RuntimeError("无痕实例的窗口不存在或有多个候选，无法确定需要置顶的窗口")
-            return self._window_presenter.activate(
-                window["hwnd"], pid,
-                validate=lambda: self._browser_ready and _tcp_listener_pids(self.browser_port) == {pid})
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "rejected", "dispatched": False,
-                    "error": f"无痕浏览器窗口置顶失败: {exc}"}
-
-    def _present_new_foreground_window(self, previous):
-        """GUI 打开或切换到新的普通应用时置顶；观察和个人浏览器不触发此路径。"""
-        try:
-            hwnd = foreground_window()
-            if not previous or not hwnd or hwnd == previous:
-                return None
-            candidates = [window for window in _enumerate_windows(include_untitled=True)
-                          if window["hwnd"] == hwnd]
-            if len(candidates) != 1:
-                return None
-            window = candidates[0]
-            executable = (window.get("executable") or "").casefold()
-            if not window.get("pid") or not executable or executable in {
-                    "chrome.exe", "chromium.exe", "msedge.exe", "firefox.exe", "brave.exe",
-                    "opera.exe", "vivaldi.exe", "safari.exe", "iexplore.exe",
-                    "startmenuexperiencehost.exe", "shellexperiencehost.exe", "searchhost.exe",
-                    "searchapp.exe", "dwm.exe", "sihost.exe"}:
-                return None
-            # 无标题的 shell 窗口通常是任务栏/桌面，而不是已选择的文件管理器。
-            title = (window.get("title") or "").strip().casefold()
-            if ((executable == "explorer.exe" and title in {"", "program manager", "workerw"})
-                    or (executable == "applicationframehost.exe" and not title)):
-                return None
-            return self._window_presenter.activate(
-                hwnd, window["pid"], validate=lambda: foreground_window() == hwnd)
-        except Exception as exc:  # noqa: BLE001
-            return {"status": "rejected", "dispatched": False,
-                    "error": f"新应用窗口置顶失败: {exc}"}
-
-    def _desktop_action(self, action):
-        """截图内坐标转换为工作屏幕坐标；浏览器 viewport 不经过此路径。"""
-        screen = self.work_screen
-        if not screen or not screen.detected:
-            return action
-        args = dict(action.args)
-        for x_key, y_key in (("x", "y"), ("x1", "y1"), ("x2", "y2")):
-            x, y = args.get(x_key), args.get(y_key)
-            if x is None or y is None:
-                continue
-            x, y = int(x), int(y)
-            if not (0 <= x < screen.width and 0 <= y < screen.height):
-                raise ValueError("目标坐标不在当前工作屏幕内")
-            args[x_key], args[y_key] = x + screen.left, y + screen.top
-        return Action(action.action, args)
+    def _runtime_state(self):
+        from ..desktop_state import windows_runtime_state
+        return windows_runtime_state()
 
     def _focus_is_browser(self) -> bool:
-        """仅已核验端口所属窗口在前台时进入 browser use。"""
-        if self.execution_mode == "browser_first" and self._browser_subtask_active:
-            return bool(self._browser_ready and self._browser_session is not None
-                        and self._browser_session.page_id)
-        from ..utils import foreground_browser_matches_port
+        """本机浏览器模式：以「CDP 有可用页面」为准，不依赖前台焦点。
+
+        用户可同时用电脑（切到别的窗口），智能体照常通过 CDP 虚拟控制浏览器。
+        """
+        from ..utils import list_cdp_pages
         try:
-            return self._browser_ready and foreground_browser_matches_port(self.browser_port)
+            pages = list_cdp_pages("localhost", self.browser_port)
+            return any(p.get("url") and not p.get("url", "").startswith(
+                ("devtools://", "chrome-extension://")) for p in pages)
         except Exception:  # noqa: BLE001
             return False
 
-    def _unmanaged_browser_has_focus(self) -> bool:
-        """个人浏览器不作为桌面输入兜底目标。"""
-        from ..utils import detect_foreground_browser
-        return detect_foreground_browser("windows") and not self._focus_is_browser()
-
-    def _ensure_browser_ready(self):
-        """明确导航时始终启动/复用并核验目标，不依赖任意浏览器焦点。"""
-        from ..utils import cdp_pages_match_mode
-        try:
-            session = self._get_browser_session() if self.execution_mode == "browser_first" else None
-            if session is not None:
-                session._check_deadline()
-            # browser_first 的绑定页跨子任务复用；即使被关闭也不能重新启动浏览器
-            # 并偷偷切换到另一页。后续 _connect / _pick_page 仍核验当前身份。
-            if session is None or not session.page_id:
-                if self._browser_launcher is not None:
-                    launched = self._browser_launcher()
-                else:
-                    from ..run_windows_local import CHROME_DEFAULT, ensure_chrome
-                    launched = ensure_chrome(self.browser_port, CHROME_DEFAULT, self.browser_mode)
-                if (session is not None and isinstance(launched, tuple) and len(launched) == 2
-                        and launched[0] is True and isinstance(launched[1], str)):
-                    self._browser_launch_profile = launched[1]
-            if session is not None:
-                session._check_deadline()
-                playwright, browser = session._connect()  # 同一连接核验所选模式，遵守共享 deadline。
-                session._disconnect(playwright, browser)
-                valid_mode = True
-            else:
-                valid_mode = cdp_pages_match_mode("localhost", self.browser_port, self.browser_mode)
-            if not valid_mode:
-                mode_name = "无痕" if self.browser_mode == "incognito" else "普通"
-                raise RuntimeError(f"调试端口 {self.browser_port} 无法确认是{mode_name}浏览器；"
-                                   "请关闭该调试浏览器或更换 --browser-port")
-            self._browser_ready = True
-        except BaseException:
-            self._revoke_browser_ready()
-            raise
-
-    def _revoke_browser_ready(self):
-        self._browser_ready = False
-        self._invalidate_browser_snapshot()
-        self._window_presenter.restore()
-
-    def enter_browser_subtask(self, step=None):
-        """按计划进入浏览器任务；不读取桌面截图，不自动访问模型尚未选定的网址。"""
-        if self.execution_mode == "desktop":
-            return self._build_observation()
-        self._browser_subtask_active = True
-        self._desktop_subtask_active = False
-        try:
-            self._ensure_browser_ready()
-            session = self._get_browser_session()
-            if self._browser_launch_profile and not session.page_id:
-                session.bind_owned_page(launch_profile=self._browser_launch_profile)
-            else:
-                session.bind_owned_page()
-        except ModelRequestTimeout:
-            raise
-        except Exception as exc:
-            self._invalidate_browser_snapshot()
-            return Observation(info={"scene": {"browser_use": 1, "structure_available": False,
-                "mode": "browser_dom", "reason": "browser_start_failed"},
-                "capture_error": str(exc)[:300], "browser_start_failed": True})
-        return self._build_observation()
-
-    def enter_desktop_subtask(self, step=None):
-        self._browser_subtask_active = False
-        self._desktop_subtask_active = True
-        self._screenshot_is_viewport = False
-        self._invalidate_browser_snapshot()
-        if self.work_screen is None:
-            self.dpi_awareness = initialize_dpi_awareness()
-            self.work_screen = detect_primary_work_screen(*self._fallback_size)
-            self.width, self.height = self.work_screen.width, self.work_screen.height
-        return self._build_observation()
-
-    def prepare_subtask_verification(self, subtask, plan, task):
-        """Capture the current rename source before any desktop/shell operation."""
-        binding = (str(task), subtask.get("id"))
-        if binding == self._file_verification_binding:
-            return
-        from ..file_rename_verifier import FileRenameVerifier
-        self._file_rename_verifier = FileRenameVerifier(
-            task, subtask, plan, check_deadline=lambda: self._command_timeout())
-        self._file_verification_binding = binding
-
-    def verify_subtask_files(self, step_id):
-        verifier = self._file_rename_verifier
-        if verifier is None or self._file_verification_binding[1] != step_id:
-            return {}
-        return verifier.verify()
-
     def _get_browser_session(self):
-        """懒加载 BrowserSession；网页和前台窗口都必须聚焦才能进行 CDP 操作。"""
+        """懒加载 BrowserSession（保持快照，跨步复用）。连不上返回 None。
+
+        require_focus=False：本机模式用 CDP 虚拟输入，不要求浏览器前台聚焦——
+        这样智能体操作浏览器时，你可以照常用自己的鼠标键盘。
+        """
         if self._browser_session is None:
             from ..browser_session import BrowserSession, BrowserOptions
             self._browser_session = BrowserSession(
                 options=BrowserOptions(endpoint=f"http://localhost:{self.browser_port}",
-                                       require_focus=self.execution_mode != "browser_first",
-                                       require_incognito=self.browser_mode == "incognito",
-                                       browser_mode=self.browser_mode,
-                                       bind_page=self.execution_mode == "browser_first",
-                                       screenshot_max_edge=self.screenshot_max_edge),
-                foreground_check=self._focus_is_browser if self.execution_mode != "browser_first" else None,
+                                       require_focus=False, session_mode=self.browser_session_mode),
+                foreground_check=None,
                 downloads_dir=self.downloads_dir,
-                incognito_failure_callback=self._revoke_browser_ready,
+                workspace_dir=self.workspace_dir,
             )
-        self._browser_session.request_deadline = (getattr(self, "request_deadline", None)
-            if self.execution_mode == "browser_first" else None)
-        self._browser_session.observe_downloads = self._observe_downloads
-        self._browser_session.download_extensions = self._download_extensions
         return self._browser_session
-
-    def _invalidate_browser_snapshot(self):
-        if self._browser_session is not None:
-            self._browser_session.invalidate()
 
     def _collect_browser_snapshot(self):
         """抓当前浏览器页面的结构化 AX/DOM 快照（browser_ax）。非浏览器场景返回 None。"""
         if not self._focus_is_browser():
-            self._invalidate_browser_snapshot()
             return None
         try:
             session = self._get_browser_session()
             if session is None:
                 return None
-            snapshot = session.collect()
-            if snapshot is not None and self._focus_is_browser():
-                return snapshot
+            return session.collect()
         except Exception:  # noqa: BLE001
-            pass
-        self._invalidate_browser_snapshot()
-        return None
+            return None
 
     def _build_observation(self) -> Observation:
-        """截图 + browser_ax 快照进 context；显式标注场景（browser_use / structure_available）。"""
-        if self.execution_mode == "browser_first" and not self._desktop_subtask_active:
-            if not self._browser_subtask_active or not self._browser_ready:
-                return Observation(info={"scene": {"browser_use": 0, "structure_available": False,
-                    "mode": "planning", "reason": "awaiting_browser_subtask"}})
-            session = self._get_browser_session()
-            captured = session.capture_observation()
-            snapshot = captured.get("snapshot")
-            screenshot = captured.get("screenshot")
-            self._screenshot_is_viewport = screenshot is not None
-            info = {"scene": self._derive_scene(snapshot), "screenshot_origin": [0, 0],
-                    **captured.get("info", {})}
-            self._browser_observation_info = dict(info)
-            return Observation(screenshot=screenshot, context=[snapshot] if snapshot else [], info=info)
-        screenshot = self._take_screenshot()
-        # 全屏截图包含地址栏、标签栏等 chrome UI，不能复用上一步的页面结构或 viewport 坐标。
-        snapshot = self._collect_browser_snapshot() if self._screenshot_is_viewport else None
-        if snapshot is None:
-            self._invalidate_browser_snapshot()
-            if self._screenshot_is_viewport:
-                # 快照阶段可能已切到 chrome UI 或别的应用，再确认截图对应的坐标系。
-                screenshot = self._take_screenshot()
-        scene = self._derive_scene(snapshot)
-        if not scene["browser_use"]:
-            snapshot = None
-            if self._screenshot_is_viewport:
-                screenshot = self._take_desktop_screenshot()
-                self._screenshot_is_viewport = False
-        context = [snapshot] if snapshot and scene["structure_available"] else []
-        info = {"scene": scene,
-                "screenshot_coordinate_space": "css_viewport" if self._screenshot_is_viewport else "screen",
-                "screenshot_origin": self._screenshot_origin(), "work_screen": self._screen_info(),
-                "dpi_awareness": self.dpi_awareness}
+        """Collect screenshot and AX on one page, with an explicit coordinate space.
+
+        浏览器模式（后台独立浏览器）只取 CDP 截图，绝不回退到截取用户整屏；
+        虚拟桌面截图仅用于显式 observe_desktop。这样即使用户把浏览器窗口挡在后面，
+        截图仍是该浏览器页面的完整内容，不受遮挡/前台影响。
+        """
+        from ..model.grounding import screenshot_size
+        from ..scene import Scene, browser_scene
+
+        from ..desktop_readiness import foreground, window_identity
+        desktop_before = self._runtime_state() if self._observation_surface == 'desktop' else None
+        screenshot, snapshot, metadata = None, None, {}
+        error = ""
+        if self._observation_surface == "browser":
+            # 页面仍在导航/渲染时截图会瞬时失败，重试几次再放弃。
+            import time as _time
+            for _ in range(4):
+                try:
+                    session = self._get_browser_session()
+                    if session is not None:
+                        screenshot, snapshot, metadata = session.collect_observation()
+                        metadata = dict(metadata or {})
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+                if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
+                    break
+                _time.sleep(0.25)
+        else:
+            try:
+                session = self._get_browser_session()
+                if session is not None and hasattr(session, "event_metadata"):
+                    metadata = session.event_metadata()
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+
+        if screenshot is not None and metadata.get("screenshot_space") == "css_viewport":
+            info = metadata
+            info["scene"] = browser_scene(
+                snapshot, screenshot, page_id=metadata.get("page_id", ""),
+                snapshot_id=metadata.get("snapshot_id", ""),
+            ).to_dict()
+            context = [snapshot] if snapshot else []
+        elif self._observation_surface == "browser":
+            # 浏览器模式：CDP 截图失败 → 返回错误观测（无截图），不截取用户桌面。
+            info = {"screenshot_space": "css_viewport",
+                    "scene": Scene(browser_use=1, structure_available=bool(snapshot),
+                                   mode="browser_dom" if snapshot else "visual",
+                                   reason="browser_observation_failed").to_dict(),
+                    "observation_error": error or str(metadata.get("error") or "浏览器截图/快照采集失败")}
+            for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog",
+                        "initial_state", "tabs", "artifact_events"):
+                if key in metadata:
+                    info[key] = metadata[key]
+            context = [snapshot] if snapshot else []
+        else:
+            # 桌面模式：显式 observe_desktop 才截取全部显示器。
+            screenshot = self._take_screenshot()
+            size = screenshot_size(screenshot)
+            info = {"screenshot_space": "screen_pixels",
+                    "screenshot_size": list(size) if size else None,
+                    **self._desktop_capture,
+                    "scene": Scene(browser_use=0, structure_available=False,
+                                   mode="visual", reason="desktop_fallback").to_dict()}
+            for key in ("artifacts", "download_events", "pending_downloads", "dialogs", "dialog",
+                        "initial_state", "tabs", "artifact_events"):
+                if key in metadata:
+                    info[key] = metadata[key]
+            if error or metadata.get("error") or metadata.get("observation_errors"):
+                info["observation_error"] = error or metadata.get("error") or "; ".join(metadata["observation_errors"])
+            context = []
+        if self.initial_state:
+            info.setdefault('initial_state', dict(self.initial_state))
+        info["active_surface"] = "browser" if info.get("screenshot_space") == "css_viewport" else "desktop"
+        info["requested_surface"] = self._observation_surface
+        info['control_mode'] = 'background_browser' if info['active_surface'] == 'browser' else 'desktop_takeover'
+        info["runtime_state"] = self._runtime_state()
+        if desktop_before is not None:
+            before, after = foreground(desktop_before), foreground(info['runtime_state'])
+            info['desktop_focus_stable'] = bool(before and after and window_identity(before) == window_identity(after))
+            if self._last_window_wait:
+                info['desktop_window_wait'] = dict(self._last_window_wait)
+        self._last_observation_info = dict(info)
         return Observation(screenshot=screenshot, text="", context=context, info=info)
 
-    def _derive_scene(self, snapshot):
-        """算显式场景：有快照→browser_dom；浏览器但无结构→visual；非浏览器→visual/desktop。"""
-        from ..scene import Scene
-        if not self._focus_is_browser():
-            self._invalidate_browser_snapshot()
-            return Scene(browser_use=0, structure_available=False, mode="visual",
-                         reason="not_browser").to_dict()
+    def _derive_scene(self, snapshot, screenshot=None):
+        """Derive browser mode from whether page content is actionable in AX."""
+        from ..scene import Scene, browser_scene
         if snapshot:
-            return Scene(browser_use=1, structure_available=True, mode="browser_dom",
-                         reason="structured_page", url=snapshot.get("url", ""),
-                         page_id=snapshot.get("page_id", ""),
-                         snapshot_id=snapshot.get("snapshot_id", "")).to_dict()
-        return Scene(browser_use=1, structure_available=False, mode="visual",
-                     reason="no_structured_page").to_dict()
+            return browser_scene(snapshot, screenshot).to_dict()
+        if self._focus_is_browser():
+            return Scene(browser_use=1, structure_available=False, mode="visual",
+                         reason="no_structured_page").to_dict()
+        return Scene(browser_use=0, structure_available=False, mode="visual",
+                     reason="not_browser").to_dict()
 
     def _fresh_obs_after_action(self) -> Observation:
         """动作执行后重新观察：新截图 + 新 browser 快照。"""
-        return self._build_observation()
+        return self.observe()
 
     # ---- 路由 + 执行（browser_dom）----
     # 浏览器场景里全部走 CDP 的动作（虚拟鼠标键盘，不碰真实外设）
-    _BROWSER_CDP_ACTIONS = ("goto", "click", "double_click", "right_click",
+    _BROWSER_CDP_ACTIONS = ("goto", "download", "click", "double_click", "right_click",
                             "type", "select", "scroll", "press", "hotkey")
 
     def route_action(self, action, obs):
@@ -437,83 +285,64 @@ class WindowsEnvironment(Environment):
         流程：DOM（element_id / target_ref / 语义匹配）→ 命中走 CDP；都没命中返回 None，
         交给 pipeline 用 grounding 模型定坐标，再由 step() 用 CDP 虚拟坐标点击（仍不动真实鼠标）。
         """
-        if self.execution_mode == "browser_first" and self._browser_subtask_active:
-            try:
-                self._get_browser_session().validate_action_snapshot(action)
-            except ModelRequestTimeout:
-                raise
-            except Exception as exc:
-                return {"channel": "reobserve", "refresh_observation": True, "reason": str(exc)[:300]}
-        url = self._address_bar_url(action)
-        if action.action == "goto" or url:
-            return {"channel": "browser_dom", "goto_url": url or action.args.get("url"),
-                    "coordinate_space": "css_viewport"}
-        if obs is None:
+        if obs is None or action.action not in self._BROWSER_CDP_ACTIONS:
             return None
-        info = obs.info if isinstance(obs.info, dict) else {}
-        scene = info.get("scene") or {}
-        if action.action not in self._BROWSER_CDP_ACTIONS + ("drag_and_drop",):
-            return None
-        # 只有当前聚焦的浏览器网页才走 CDP；chrome UI 仍需要桌面视觉定位。
-        if not self._focus_is_browser():
-            self._invalidate_browser_snapshot()
-            if scene.get("browser_use") == 1:
-                return {"channel": "reobserve", "reason": "浏览器已失去焦点，需重新观察当前应用",
-                        "refresh_observation": True}
-            if self._unmanaged_browser_has_focus():
-                return {"channel": "reobserve", "refresh_observation": True,
-                        "reason": "当前前台浏览器不是本任务的无痕实例；请使用 goto 启动或激活目标浏览器"}
-            return None
-        if (action.action not in self._BROWSER_CDP_ACTIONS
-                or scene.get("browser_use") != 1
-                or not (scene.get("structure_available")
-                        or info.get("screenshot_coordinate_space") == "css_viewport")):
+        # Route against the actual observation, not a fresh CDP page guess.
+        from ..scene import observation_scene
+        if not observation_scene(obs).get("browser_use"):
             return None
         session = self._get_browser_session()
         if session is None:
             return None
-        if self.execution_mode == "browser_first":
-            try:
-                session.validate_observation_snapshot(obs)
-            except BrowserActionError as exc:
-                return {"channel": "reobserve", "refresh_observation": True, "reason": str(exc)}
         # 地址栏输入 URL → 转 goto（地址栏是浏览器 chrome UI，不在 DOM）
         url = self._address_bar_url(action)
         if url:
             return {"channel": "browser_dom", "goto_url": url, "coordinate_space": "css_viewport"}
+        # A scroll with an explicit node refers to that container, not the page.
+        if action.action == "scroll" and (action.args.get("target_ref") or action.args.get("element_id")):
+            return session.route(action, obs)
         # goto / scroll / press / hotkey：无 target，直接 browser_dom
-        if action.action in ("goto", "scroll", "press", "hotkey"):
-            if action.action == "scroll" and action.args.get("target_ref"):
-                route = session.route(action, obs)
-                if route is not None:
-                    return route
+        if action.action in ("goto", "download", "scroll", "press", "hotkey"):
             return {"channel": "browser_dom", "target": action.args.get("target"),
-                    **(session.snapshot_route() if self.execution_mode == "browser_first" else {}),
-                    "coordinate_space": "css_viewport"}
+                    "coordinate_space": "css_viewport", **self._route_identity(obs)}
         # click / type / select / double / right：优先 DOM 定位
         try:
             route = session.route(action, obs)  # 处理 target_ref / element_id
-        except ModelRequestTimeout:
-            raise
         except Exception:  # noqa: BLE001
             route = None
         if route is not None:
             return route  # browser_dom 或 reobserve
+        # A content-heavy AX snapshot may expose only navigation/filter controls.
+        # Do not resolve a card description against those unrelated controls;
+        # let screenshot grounding choose the card while explicit refs still work.
+        selected_mode = ((obs.info or {}).get('decision_mode') or {}).get('mode')
+        if ((selected_mode == 'gui' or (selected_mode is None and observation_scene(obs).get("mode") == "browser_gui"))
+                and action.action in {"click", "double_click", "right_click"}):
+            return None
         # 语义兜底：target 描述 → ref（仍在结构层）
         target = str(action.args.get("target") or "")
         if target:
             exposed = obs.info.get("exposed_refs") if isinstance(obs.info, dict) else None
-            allowed = set(exposed) if exposed is not None else (set() if self.execution_mode == "browser_first" else None)
+            if exposed is not None and not exposed:
+                return None
+            allowed = set(exposed) if exposed else None
             try:
                 ref = session.resolve_target(target, allowed=allowed)
             except Exception:  # noqa: BLE001
                 ref = None
+            if not ref and getattr(session, 'last_resolution_error', None) == 'ambiguous':
+                return {'channel': 'reobserve', 'error_code': 'ambiguous',
+                        'reason': '多个 AX 元素匹配此描述，请结合标题和链接选择当前 target_ref，不能通过视觉猜选。'}
             if ref:
                 action.args["target_ref"] = ref
-                return {"channel": "browser_dom", **session.snapshot_route(),
-                        "exposed_refs": list(allowed or []), "target_ref": ref, "coordinate_space": "css_viewport"}
+                return session.route(action, obs)
         # 结构解析失败：返回 None → 视觉定位（grounding 定坐标 → CDP 虚拟点击）
         return None
+
+    @staticmethod
+    def _route_identity(obs):
+        return {key: obs.info[key] for key in ("page_id", "document_id", "snapshot_id")
+                if key in obs.info}
 
     @staticmethod
     def _address_bar_url(action):
@@ -531,204 +360,91 @@ class WindowsEnvironment(Environment):
             return text
         return None
 
-    def execute_routed(self, action, route):
-        """执行已路由的 browser_dom 动作：goto / DOM(ref) / scroll/press/hotkey 全部走 CDP。"""
-        if self.execution_mode == "browser_first" and self._browser_subtask_active:
-            try:
-                self._get_browser_session().validate_action_snapshot(action)
-            except BrowserActionError as exc:
-                return StepResult(observation=self._build_observation(), info={"channel": "browser_dom",
-                    "status": "rejected", "dispatched": False, "error": str(exc)})
-        if action.action == "goto" or route.get("goto_url"):
-            return self._navigate(str(action.args.get("url") or route.get("goto_url") or ""))
-        if not self._focus_is_browser():
-            return self._browser_focus_rejected()
+    def prevent_duplicate_download(self, action, observation, route=None):
         session = self._get_browser_session()
         if session is None:
-            return StepResult(observation=self._fresh_obs_after_action(),
-                              info={"status": "rejected", "dispatched": False,
-                                    "channel": "browser_dom", "error": "Browser session unavailable"})
-        if not self._focus_is_browser():
-            return self._browser_focus_rejected()
-        if route.get("target_ref"):
+            return None
+        return session.prevent_duplicate_download(action, observation, route)
+
+    def execute_routed(self, action, route):
+        """执行已路由的 browser_dom 动作：goto / DOM(ref) / scroll/press/hotkey 全部走 CDP。"""
+        if action.action in {"download", "rename_artifact", "run_in_terminal", "call_code_agent", "set_cell_values", "save"}:
+            return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                "error_code": "non_basic_action", "action": action.action})
+        session = self._get_browser_session()
+        if session is None:
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "channel": "browser_dom",
+                "error": "browser session unavailable"})
+        if action.action == "goto" or route.get("goto_url"):
+            result = session.goto(str(action.args.get("url") or route.get("goto_url")))
+        elif route.get("target_ref"):
             result = session.execute(action, route)
         elif action.action in ("scroll", "press", "hotkey"):
-            result = (session.execute_target(action, None, route=route)
-                      if self.execution_mode == "browser_first" else session.execute_target(action, None))
+            result = session.execute_viewport_action(
+                action, metadata=action.args.get("observation_metadata") or self._last_observation_info)
         else:
             result = {"status": "rejected", "dispatched": False, "channel": "browser_dom",
                       "error": "no routable target"}
         obs = self._fresh_obs_after_action()
         info = dict(result)
+        info["artifacts"] = obs.info.get("artifacts", info.get("artifacts", []))
         return StepResult(observation=obs, info=info)
-
-    def probe_actionability(self, action, route):
-        """Read current DOM hit testing without dispatching an environment action."""
-        if not self._focus_is_browser():
-            return {"actionable": False, "dispatched": False, "error": "Browser lost focus"}
-        session = self._get_browser_session()
-        if session is None:
-            return {"actionable": False, "dispatched": False, "error": "Browser session unavailable"}
-        return session.probe_actionability(action, route)
-
-    def _browser_focus_rejected(self):
-        self._invalidate_browser_snapshot()
-        return StepResult(observation=self._fresh_obs_after_action(),
-                          info={"status": "rejected", "dispatched": False,
-                                "channel": "browser_dom", "error": "Browser lost focus"})
 
     # ---- Environment 接口 ----
     def reset(self, task: str) -> Observation:
-        self._file_rename_verifier = None
-        self._file_verification_binding = None
-        self.configure_task_downloads(task)
-        if self.execution_mode == "browser_first":
-            self._browser_subtask_active = False
-            self._desktop_subtask_active = False
-            self._screenshot_is_viewport = False
-            self._browser_observation_info = {}
-            if self._browser_session is not None:
-                self._browser_session.close()
-            return Observation(info={"scene": {"browser_use": 0, "structure_available": False,
-                "mode": "planning", "reason": "awaiting_browser_subtask"}})
-        self._window_presenter.restore()
-        self.dpi_awareness = initialize_dpi_awareness()
-        self.work_screen = detect_primary_work_screen(*self._fallback_size)
-        self.width, self.height = self.work_screen.width, self.work_screen.height
-        self._invalidate_browser_snapshot()
-        self._screenshot_is_viewport = False
-        screen = self.work_screen
-        if screen.detected:
-            print(f"[screen] 检测到 {screen.monitor_count} 块屏幕；默认工作屏幕：主屏 "
-                  f"{screen.device or '(primary)'} {screen.width}x{screen.height} "
-                  f"origin=({screen.left},{screen.top})", flush=True)
-        else:
-            print(f"[screen] 显示布局检测不可用，沿用默认主屏截图；后备尺寸 "
-                  f"{screen.width}x{screen.height}", flush=True)
-        return self._build_observation()
+        if not self._episode_prepared:
+            self.begin_episode()
+        self._episode_prepared = False
+        return self.observe()
 
-    def _navigate(self, url: str) -> StepResult:
-        """所有导航统一核验无痕实例；CDP 失败不向个人窗口发送原生输入。"""
-        url = (url or "").strip()
-        if not url:
-            return StepResult(observation=self._build_observation(),
-                              info={"status": "rejected", "dispatched": False,
-                                    "action": "goto", "error": "empty url"})
-        if self.execution_mode == "browser_first":
-            try:
-                if not self._browser_subtask_active or not self._browser_ready:
-                    self.enter_browser_subtask()
-                session = self._get_browser_session()
-                if not self._browser_ready or not session.page_id:
-                    raise RuntimeError("本任务浏览器尚未就绪")
-                result = session.goto(url)
-            except ModelRequestTimeout:
-                raise
-            except Exception as exc:
-                result = {"status": "rejected", "dispatched": False, "error": str(exc)[:300]}
-            return StepResult(observation=self._build_observation(),
-                              info={"channel": "browser_dom", "action": "goto", **result})
-        try:
-            self._ensure_browser_ready()
-            session = self._get_browser_session()
-            if session is None:
-                raise RuntimeError("Browser session unavailable")
-            presentation = self._present_browser_window()
-            if presentation.get("status") != "executed":
-                return StepResult(observation=self._build_observation(),
-                                  info={"status": "rejected", "dispatched": False,
-                                        "channel": "browser_dom", "action": "goto",
-                                        "window_result": presentation,
-                                        "error": presentation.get("error") or "无痕窗口未能置顶并获得焦点"})
-            if not session.activate():
-                return self._browser_focus_rejected()
-        except Exception as exc:  # noqa: BLE001
-            return StepResult(observation=self._build_observation(),
-                              info={"status": "rejected", "dispatched": False,
-                                    "channel": "browser_dom", "action": "goto",
-                                    "error": f"无痕浏览器准备失败: {exc}"})
-        if not self._focus_is_browser():
-            return self._browser_focus_rejected()
-        if not self._position_browser_on_work_screen():
-            return StepResult(observation=self._build_observation(),
-                              info={"status": "rejected", "dispatched": False, "action": "goto",
-                                    "error": "无法将目标浏览器窗口放到主屏工作区，需重新观察"})
-        if not self._focus_is_browser():
-            return self._browser_focus_rejected()
-        try:
-            result = session.goto(url)
-        except ModelRequestTimeout:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            # 意外异常时不确认是否已经发送导航，禁止原生输入重试。
-            result = {"status": "uncertain", "dispatched": True,
-                      "error": f"CDP 导航异常: {exc}"}
-        return StepResult(observation=self._build_observation(),
-                          info={"channel": "browser_dom", "action": "goto", **dict(result)})
+    def observe(self) -> Observation:
+        return self._build_observation()
 
     def step(self, action: Action) -> StepResult:
         name = action.action
-        if self.execution_mode == "browser_first" and self._browser_subtask_active:
-            try:
-                self._get_browser_session().validate_action_snapshot(action)
-            except BrowserActionError as exc:
-                return StepResult(observation=self._build_observation(), info={"channel": "browser_dom",
-                    "status": "rejected", "dispatched": False, "error": str(exc)})
-        if name not in self.supported_action_names:
-            return self._desktop_step_result(action, {
-                "status": "rejected", "dispatched": False,
-                "error": f"Windows 本地环境不支持动作: {name}",
-            })
-        if name == "goto":
-            return self._navigate(str(action.args.get("url") or ""))
-        url = self._address_bar_url(action)
-        if url:
-            return self._navigate(url)
+        if name not in BASIC_ACTIONS:
+            return StepResult(self.observe(), info={"status": "rejected", "dispatched": False,
+                "error_code": "non_basic_action", "action": name})
         spec = get_action_spec(name)
         kind = spec.kind if spec else "env"
+        if name in {"observe_desktop", "observe_browser"}:
+            self._observation_surface = "desktop" if name == "observe_desktop" else "browser"
+            obs = self.observe()
+            return StepResult(observation=obs, info={"status": "executed", "dispatched": False,
+                "action": name, "artifacts": obs.info.get("artifacts", [])})
+        if name in {"handle_dialog", "list_tabs", "switch_tab", "close_tab"}:
+            session = self._get_browser_session()
+            kwargs = {k: v for k, v in action.args.items() if k in {
+                "accept", "prompt_text", "dialog_id", "tab_id", "artifact_id", "filename", "url"}}
+            result = getattr(session, name)(**kwargs)
+            obs = self.observe()
+            result["artifacts"] = obs.info.get("artifacts", [])
+            return StepResult(observation=obs, info=result)
 
-        if self.execution_mode == "browser_first" and not self._desktop_subtask_active:
-            return self._browser_step(action, kind)
+        coordinate_space = action.args.get("coordinate_space")
+        coordinate_actions = ("click", "double_click", "right_click", "type", "select", "drag_and_drop")
+        if action.args.get("grounding_failed"):
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "error": "grounding failed"})
 
-        if (self._screenshot_is_viewport
-                and name in ("click", "double_click", "right_click", "type", "press",
-                             "hotkey", "scroll", "select", "drag_and_drop")):
-            if not self._focus_is_browser():
-                return self._browser_focus_rejected()
-            if name in ("select", "drag_and_drop"):
-                # 这些动作使用原生 GUI，必须先按完整桌面截图重新定位，不能把 viewport 坐标当屏幕坐标。
-                self._invalidate_browser_snapshot()
-                self._screenshot_is_viewport = False
-                screenshot = self._take_desktop_screenshot()
-                scene = self._derive_scene(None)
-                scene["reason"] = "screen_coordinates_required"
-                observation = Observation(screenshot=screenshot,
-                                          info={"scene": scene, "screenshot_coordinate_space": "screen",
-                                                "screenshot_origin": self._screenshot_origin(),
-                                                "work_screen": self._screen_info(),
-                                                "dpi_awareness": self.dpi_awareness})
-                return StepResult(observation=observation,
-                                  info={"status": "rejected", "dispatched": False, "channel": "gui",
-                                        "error": "该动作需要全屏坐标，已切换到全屏观察，请重新定位后再执行"})
-
-        # 浏览器场景 + 视觉定位坐标 → CDP 虚拟点击（不动真实鼠标）
-        if (kind == "env"
-                and name in ("click", "double_click", "right_click", "type")
-                and action.args.get("x") is not None and action.args.get("y") is not None
-                and not action.args.get("grounding_failed")
-                and self._screenshot_is_viewport):
-            if not self._focus_is_browser():
-                return self._browser_focus_rejected()
+        if coordinate_space == "css_viewport" and kind == "env" and name != "wait":
             session = self._get_browser_session()
             if session is None:
-                return StepResult(observation=self._fresh_obs_after_action(),
-                                  info={"status": "rejected", "dispatched": False,
-                                        "channel": "browser_dom", "error": "Browser session unavailable"})
-            if not self._focus_is_browser():
-                return self._browser_focus_rejected()
-            # 截图是 viewport（CDP 截的），grounding 坐标即 viewport 坐标，直接点，不再屏幕→viewport 换算
-            result = session.click_at_viewport(action, int(action.args["x"]), int(action.args["y"]))
-            return StepResult(observation=self._build_observation(), info=dict(result))
+                result = {"status": "rejected", "dispatched": False,
+                          "channel": "browser_cdp", "error": "browser session unavailable"}
+            else:
+                result = session.execute_viewport_action(
+                    action, metadata=action.args.get("observation_metadata") or self._last_observation_info)
+            obs = self.observe()
+            result = dict(result)
+            result["artifacts"] = obs.info.get("artifacts", [])
+            return StepResult(observation=obs, info=result)
+
+        if name in coordinate_actions and coordinate_space != "screen_pixels":
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False,
+                "error": "coordinate action requires css_viewport or screen_pixels"})
 
         if kind == "browser":
             result = self.browser_action(name, action.args)
@@ -738,183 +454,126 @@ class WindowsEnvironment(Environment):
             output = self.run_command(str(action.args.get("command", "")))
             return StepResult(observation=self._build_observation(), info={"terminal_result": output})
 
-        # 桌面动作必须明确反馈拒绝、已发送或可能部分执行，不能把空命令当成成功。
-        if action.args.get("grounding_failed"):
-            return self._desktop_step_result(action, {
-                "status": "rejected", "dispatched": False,
-                "error": action.args.get("grounding_error") or "视觉定位失败，动作未执行",
-            })
-        if (name in ("click", "double_click", "right_click", "type", "select", "press",
-                     "hotkey", "scroll", "drag_and_drop") and self._unmanaged_browser_has_focus()):
-            return self._desktop_step_result(action, {
-                "status": "rejected", "dispatched": False,
-                "error": "当前前台浏览器不是本任务的无痕实例，未发送输入；请先使用 goto 激活目标浏览器",
-            })
-        dispatched = False
-        try:
-            if name == "switch_applications":
-                app_code = str(action.args.get("app_code") or "")
-                if self.work_screen and self.work_screen.detected and self.work_screen.monitor_count > 1:
-                    info = activate_application(app_code, work_screen=self.work_screen,
-                                                allow_browsers=False, presenter=self._window_presenter)
-                else:
-                    info = activate_application(app_code, allow_browsers=False,
-                                                presenter=self._window_presenter)
-                return self._desktop_step_result(action, info)
-            self._foreground_before_input = foreground_window()
-            action = self._desktop_action(action)
-            if (name == "scroll" and self.work_screen and self.work_screen.detected
-                    and self.work_screen.monitor_count > 1):
-                import pyautogui
-                x, y = pyautogui.position()
-                screen = self.work_screen
-                if not (screen.left <= x < screen.left + screen.width
-                        and screen.top <= y < screen.top + screen.height):
-                    # 滚轮发送到鼠标所在窗口，不能沿用上一任务留在副屏的光标。
-                    wl, wt, wr, wb = screen.work_area
-                    dispatched = True
-                    pyautogui.moveTo((wl + wr) // 2, (wt + wb) // 2)
-            if name in ("type", "select"):
-                x, y = action.args.get("x"), action.args.get("y")
-                if x is None or y is None or int(x) < 0 or int(y) < 0:
-                    return self._desktop_step_result(action, {
-                        "status": "rejected", "dispatched": False, "error": "输入动作缺少有效目标坐标",
-                    })
-                import pyautogui
-                dispatched = True
-                pyautogui.click(int(x), int(y))
-                if self._unmanaged_browser_has_focus():
-                    return self._desktop_step_result(action, {
-                        "status": "uncertain", "dispatched": True,
-                        "error": "点击后焦点转到非本任务浏览器，未发送后续输入；请使用 goto 激活无痕实例",
-                    })
-                if name == "type":
-                    if action.args.get("overwrite"):
-                        pyautogui.hotkey("ctrl", "a")
-                        pyautogui.press("backspace")
-                    write_text(str(action.args.get("text", "")), gui=pyautogui)
-                else:
-                    time.sleep(0.5)  # 等下拉框打开后再输入选项。
-                    if self._unmanaged_browser_has_focus():
-                        return self._desktop_step_result(action, {
-                            "status": "uncertain", "dispatched": True,
-                            "error": "输入前焦点转到非本任务浏览器，未发送选项和回车",
-                        })
-                    write_text(str(action.args.get("option", "")), gui=pyautogui)
-                    pyautogui.press("enter")
-            else:
-                cmd = to_pyautogui(action)
-                if not cmd:
-                    return self._desktop_step_result(action, {
-                        "status": "rejected", "dispatched": False, "error": "动作没有可执行命令或有效坐标",
-                    })
-                dispatched = True
-                exec(cmd, {"__name__": "__main__"})  # noqa: S102
-        except Exception as exc:  # noqa: BLE001
-            return self._desktop_step_result(action, {
-                "status": "uncertain" if dispatched else "rejected", "dispatched": dispatched,
-                "error": f"执行异常: {exc}",
-            })
-        return self._desktop_step_result(action, {"status": "executed", "dispatched": True})
+        # 浏览器表面使用 CDP；显式切到桌面并重新观察后才允许桌面输入。
+        if self.browser_only and self._observation_surface != "desktop" and name != "wait":
+            return StepResult(observation=self.observe(), info={
+                "status": "rejected", "dispatched": False, "channel": "desktop",
+                "error": "请先 observe_desktop 获取桌面截图后再执行 GUI 操作；网页操作使用 DOM 或 observe_browser"})
+        if self._window_wait_cancel.is_set() or (self._window_wait_remaining and self._window_wait_remaining() <= 0):
+            return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
+                'channel': 'desktop', 'error_code': 'desktop_operation_cancelled', 'reason': '操作已取消或任务时间预算已耗尽'})
+        return self._step_desktop(action)
 
-    def _browser_step(self, action, kind):
-        """专用浏览器的结构失败仅在网页视口恢复，不向桌面发送输入。"""
-        result = {"status": "rejected", "dispatched": False, "channel": "browser_dom"}
-        name, args = action.action, action.args
-        if not self._browser_subtask_active or not self._browser_ready:
-            result["error"] = "尚未进入本任务的浏览器子任务"
-        elif args.get("grounding_failed"):
-            result["error"] = args.get("grounding_error") or "网页视觉定位失败，请重新观察"
-        else:
-            session = self._get_browser_session()
+    def _step_desktop(self, action: Action) -> StepResult:
+        name = action.action
+        if name == 'switch_applications':
+            from ..desktop_state import switch_windows_application, windows_application_process
+            process = windows_application_process(action.args.get('app_code'))
+            if sys.platform == 'win32' and process:
+                self._pending_window = {'process_name': process + '.exe'}
+                self._window_launch_inflight = False
+            result = switch_windows_application(action.args.get('app_code'))
+            if sys.platform == 'win32' and result.get('window') and result.get('status') in {'executed', 'observed', 'uncertain'}:
+                result.update(self._wait_for_desktop_window(result['window'], dispatched=result['dispatched']))
+                if result['framework_wait']['status'] == 'completed':
+                    result.pop('error_code', None)
+            return StepResult(observation=self.observe(), info=result)
+        from ..desktop_readiness import launch_target, global_shortcut, check_keyboard_focus, DesktopFocusError
+        from ..desktop_state import windows_runtime_state
+        target = launch_target(action) if sys.platform == 'win32' else None
+        if target and self._window_launch_inflight and self._pending_window and self._pending_window.get('process_name') == target['process_name']:
+            # A previous launch may still be completing. Never create more windows.
+            result = self._wait_for_desktop_window(target, dispatched=False)
+            return StepResult(observation=self.observe(), info=result)
+        keyboard_guard = (sys.platform == 'win32' and name in {'type', 'select', 'press', 'hotkey', 'goto'}
+                          and not global_shortcut(action))
+        observed = self._last_observation_info
+        def guard_input():
+            check_keyboard_focus(observed.get('runtime_state', {}), windows_runtime_state(),
+                pending_target=self._pending_window, capture_stable=observed.get('desktop_focus_stable') is True)
+        if keyboard_guard:
             try:
-                session.validate_action_snapshot(action)
-                if name in ("scroll", "press", "hotkey"):
-                    result = session.execute_target(action, args.get("target"))
-                elif name in ("click", "double_click", "right_click", "type"):
-                    if args.get("x") is None or args.get("y") is None:
-                        result["error"] = "网页动作缺少有效节点或视觉坐标"
-                    else:
-                        point = session.image_to_viewport(args["x"], args["y"])
-                        result = session.click_at_viewport(action, *point)
-                elif name == "select":
-                    result["error"] = "请选择当前 AX 节点；自定义下拉框先点击控件再点击选项"
-                elif name == "drag_and_drop":
-                    if any(args.get(key) is None for key in ("x1", "y1", "x2", "y2")):
-                        result["error"] = "网页拖拽缺少有效视觉坐标"
-                    else:
-                        result = session.drag_at_viewport(session.image_to_viewport(args["x1"], args["y1"]),
-                                                          session.image_to_viewport(args["x2"], args["y2"]))
-                elif name == "wait":
-                    seconds = min(60.0, max(0.0, float(args.get("seconds", 1))))
-                    remaining = session._timeout_seconds(60)
-                    if seconds > remaining:
-                        raise ModelRequestTimeout("等待时间超过本步剩余浏览器预算")
-                    time.sleep(seconds)
-                    session._check_deadline()
-                    result.update(status="executed", dispatched=False)
-                elif kind == "browser":
-                    result.update(status="executed", browser_result=self.browser_action(name, args))
-                else:
-                    result["error"] = f"浏览器子任务不支持桌面动作 {name}，需要明确的桌面子任务"
-            except BrowserActionError as exc:
-                result.update(status="rejected", dispatched=False, error=str(exc)[:300])
-            except ModelRequestTimeout:
-                raise
-            except Exception as exc:
-                result.update(status="uncertain", dispatched=True, error=str(exc)[:300])
-        return StepResult(observation=self._build_observation(), info=result)
-
-    def _desktop_step_result(self, action: Action, info: dict) -> StepResult:
-        result_info = {"channel": "gui", "action": action.action, **info}
-        if result_info.get("dispatched") and action.action != "wait" and self.action_settle_seconds:
-            time.sleep(self.action_settle_seconds)
-        previous = self._foreground_before_input
-        self._foreground_before_input = None
-        if result_info.get("status") == "executed" and action.action not in ("wait", "switch_applications"):
-            presentation = self._present_new_foreground_window(previous)
-            if presentation is not None:
-                result_info["window_result"] = presentation
-                if presentation.get("status") != "executed":
-                    result_info.update(status="uncertain",
-                                       error=presentation.get("error") or "新应用窗口未能置顶")
-        return StepResult(observation=self._build_observation(), info=result_info)
+                guard_input()
+            except DesktopFocusError as exc:
+                return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
+                    'channel': 'desktop', 'error_code': 'desktop_focus_unconfirmed', 'reason': str(exc)})
+        # 坐标化后执行 pyautogui 命令
+        try:
+            if sys.platform == 'win32' and not self._desktop_capture and name != 'wait':
+                raise ValueError('缺少有效虚拟桌面截图，请重新 observe_desktop')
+            if self._desktop_capture:
+                from ..desktop_capture import validate_desktop_action, virtual_geometry
+                mapped, origin = validate_desktop_action(action, self._desktop_capture, virtual_geometry())
+                cmd = to_pyautogui(mapped, desktop_origin=origin, keyboard_guard=keyboard_guard)
+            else:
+                cmd = to_pyautogui(action, keyboard_guard=keyboard_guard)
+        except (ValueError, OSError) as exc:
+            return StepResult(observation=self.observe(), info={'status': 'rejected', 'dispatched': False,
+                'channel': 'desktop', 'error_code': 'desktop_geometry_changed', 'error': str(exc)})
+        if cmd:
+            try:
+                from ..desktop_capture import physical_dpi_context
+                with physical_dpi_context():
+                    exec(cmd, {"__name__": "__main__", "desktop_input_guard": guard_input})  # noqa: S102
+            except DesktopFocusError as exc:
+                return StepResult(observation=self.observe(), info={'status': 'uncertain', 'dispatched': True,
+                    'channel': 'desktop', 'error_code': 'desktop_focus_changed_during_action', 'reason': str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                return StepResult(observation=self._build_observation(),
+                                  info={"status": "failed", "dispatched": True,
+                                        "channel": "desktop", "error": f"执行异常: {exc}"})
+            if target:
+                self._window_launch_inflight = True
+                result = self._wait_for_desktop_window(target, dispatched=True)
+                return StepResult(observation=self.observe(), info=result)
+            return StepResult(observation=self.observe(), info={
+                "status": "executed", "dispatched": True, "channel": "desktop"})
+        return StepResult(observation=self.observe(), info={
+            "status": "rejected", "dispatched": False, "channel": "desktop",
+            "error": "unsupported action or invalid coordinates"})
 
     # ---- 浏览器操作 ----
     def browser_action(self, action_name: str, args: Dict[str, Any]) -> str:
-        """执行 browser kind 动作（当前只有 get_page_source）。"""
-        if self.execution_mode == "browser_first":
-            try:
-                self._get_browser_session().validate_action_snapshot(Action(action_name, args))
-            except BrowserActionError as exc:
-                return f"浏览器动作已拒绝: {exc}"
+        """执行 browser kind 动作。"""
         if action_name == "get_page_source":
-            return self.get_page_source()
+            return self.get_page_source(target_ref=args.get("target_ref"), max_chars=args.get("max_chars", 20000))
+        if action_name == "run_browser_js":
+            return self.evaluate_js(args.get("js", ""), max_chars=args.get("max_chars", 12000))
         return f"未知浏览器动作 {action_name}"
 
-    def get_page_source(self) -> str:
-        if not self._focus_is_browser():
-            return "当前焦点不在浏览器（可能正在操作其他应用），无需抓取页面源码"
+    def get_page_source(self, target_ref=None, max_chars=20000) -> str:
+        """Read the same task page used by observations and actions."""
         session = self._get_browser_session()
-        html = session.get_page_source() if session is not None else ""
-        return html or "获取页面源码失败（Chrome 可能未开 remote debugging）"
+        if session is None:
+            return "浏览器会话不可用，请重新观察。"
+        return session.get_page_source(target_ref=target_ref, max_chars=max_chars)
 
-    # ---- 终端 / Python ----
-    def _command_timeout(self):
-        deadline = getattr(self, "request_deadline", None)
-        remaining = 120.0 if deadline is None else deadline - time.monotonic()
-        if remaining <= 0:
-            raise ModelRequestTimeout("本步预算已耗尽，未启动本机命令")
-        return min(120.0, remaining)
+    def evaluate_js(self, js: str, max_chars=12000) -> str:
+        """在任务浏览器里执行一段 JavaScript（run_browser_js 动作）。"""
+        if not js or not js.strip():
+            return "run_browser_js 需要提供 js 代码"
+        session = self._get_browser_session()
+        if session is None:
+            return "浏览器会话不可用，请重新观察。"
+        return session.evaluate_js(js, max_chars=max_chars)
 
     def run_command(self, command: str) -> str:
+        stripped = (command or "").strip()
+        # `start` 用于启动 GUI 程序/打开文件：分离进程、不捕获输出、立即返回。
+        # 否则 subprocess.run(capture_output=True) 会等被启动的 GUI 进程关闭其
+        # 继承的 stdout/stderr 管道才结束，导致 run_in_terminal 卡到 120s 超时。
+        if re.match(r'^start\b', stripped, re.IGNORECASE):
+            try:
+                subprocess.Popen(["cmd", "/c", command],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL,
+                                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                return "已启动（后台进程，不等待退出）：" + command[:120]
+            except Exception as exc:  # noqa: BLE001
+                return f"命令执行失败: {exc}"
         try:
-            # CMD must parse the command's own quotes. Passing it as a list
-            # argument uses backslash quote escaping, which breaks quoted paths.
-            r = subprocess.run(command, shell=True, capture_output=True, text=True,
-                               timeout=self._command_timeout(), encoding="utf-8", errors="replace")
-        except (subprocess.TimeoutExpired, ModelRequestTimeout) as exc:
-            raise ModelRequestTimeout("本机终端命令超出当前步骤预算") from exc
+            r = subprocess.run(["cmd", "/c", command], capture_output=True, text=True,
+                               timeout=120, encoding="utf-8", errors="replace")
         except Exception as exc:  # noqa: BLE001
             return f"命令执行失败: {exc}"
         return (r.stdout or "").strip() or (r.stderr or "").strip() or "(无输出)"
@@ -922,27 +581,19 @@ class WindowsEnvironment(Environment):
     def run_python(self, code: str) -> str:
         try:
             r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                               timeout=self._command_timeout(), encoding="utf-8", errors="replace")
-        except (subprocess.TimeoutExpired, ModelRequestTimeout) as exc:
-            raise ModelRequestTimeout("本机 Python 命令超出当前步骤预算") from exc
+                               timeout=120, encoding="utf-8", errors="replace")
         except Exception as exc:  # noqa: BLE001
             return f"python 执行失败: {exc}"
         return (r.stdout or "").strip() or (r.stderr or "").strip() or "(无输出)"
 
     def evaluate(self) -> float:
-        # 本地手动任务没有独立评测器：返回 0，由人工/模型 verify 判断是否完成
+        # 本地手动任务没有独立评测器；框架通过任务契约和执行证据验证。
         return 0.0
 
     def close(self) -> None:
-        self._browser_ready = False
-        try:
-            if self._browser_session is not None:
-                try:
-                    self._browser_session.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    self._browser_session = None
-        finally:
-            if not self._window_presenter.restore():
-                print("[window] 未能恢复本任务窗口的置顶状态，请检查该窗口")
+        if self._browser_session is not None:
+            try:
+                self._browser_session.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._browser_session = None

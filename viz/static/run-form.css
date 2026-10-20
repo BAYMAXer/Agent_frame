@@ -1,0 +1,245 @@
+/* Compact task configuration. Keep other Studio views independent. */
+#view-run {
+  --form-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+}
+#view-run #run-body { padding: 28px 32px 40px; }
+#view-run #run-form {
+  max-width: 1320px;
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+#run-form .run-panel {
+  min-height: 0;
+  padding: 22px 24px;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: none;
+  grid-column: auto;
+}
+#run-form .run-panel:hover { box-shadow: none; }
+#run-form .run-panel:focus-within { border-color: var(--border); }
+#run-form .segmented {
+  gap: 24px;
+  margin: 0 0 22px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+#run-form .segment-indicator { display: none; }
+#run-form .segmented .tab-btn {
+  flex: none;
+  padding: 0 0 12px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  font-size: 13px;
+  background: transparent;
+  box-shadow: none;
+}
+#run-form .segmented .tab-btn.active { border-bottom-color: var(--accent); }
+#run-form .run-row { gap: 6px; margin-bottom: 14px; }
+#run-form .run-row label, #run-form .field-label { font-size: 12px; color: #52615a; }
+#run-form .run-row input, #run-form .run-row select {
+  min-height: 36px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background-color: #fff;
+  font: 13px/1.4 var(--form-font);
+}
+#run-form #local-workspace-dir { font-family: var(--form-font); letter-spacing: normal; }
+#run-form .workspace-picker { gap: 8px; }
+#run-form .studio-btn { border-radius: 4px; padding: 8px 12px; font-size: 12px; box-shadow: none; }
+#run-form .workspace-picker .studio-btn { white-space: nowrap; }
+#run-form .field-tip { font-size: 11px; line-height: 1.6; color: #859087; }
+#run-form .field-tip.error { color: #a13b3b; }
+#run-form .browser-preference { margin: 2px 0 20px; }
+#run-form .checkbox-row {
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 30px;
+  font-size: 12px;
+  margin: 0;
+  gap: 9px;
+  cursor: pointer;
+}
+#run-form .checkbox-row input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  border: 1.5px solid #bccdc5;
+  border-radius: 5px;
+  background: #fff;
+  display: grid;
+  place-content: center;
+  cursor: pointer;
+  transition: background-color .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+#run-form .checkbox-row input[type="checkbox"]::before {
+  content: "";
+  width: 8px;
+  height: 5px;
+  border-left: 2px solid #fff;
+  border-bottom: 2px solid #fff;
+  transform: translateY(-1px) rotate(-45deg) scale(0);
+}
+#run-form .checkbox-row input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+#run-form .checkbox-row input[type="checkbox"]:checked::before {
+  transform: translateY(-1px) rotate(-45deg) scale(1);
+}
+#run-form .checkbox-row:hover input[type="checkbox"]:not(:disabled) {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #21816b12;
+}
+#run-form .checkbox-row input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+#run-form .checkbox-row input[type="checkbox"]:disabled { opacity: .45; cursor: not-allowed; }
+#run-form #local-batch-file {
+  min-width: 0;
+  width: 100%;
+  min-height: 48px;
+  padding: 6px;
+  border: 1px solid #dce6e0;
+  border-radius: 8px;
+  background: #f8fbf9;
+  color: #73847b;
+  font: 12px/1.5 var(--form-font);
+  cursor: pointer;
+  transition: border-color .16s ease, background-color .16s ease;
+}
+#run-form #local-batch-file::file-selector-button {
+  margin-right: 12px;
+  padding: 8px 14px;
+  border: 1px solid #d2e4da;
+  border-radius: 6px;
+  background: #eaf4ee;
+  color: #246b54;
+  font: 600 12px/1.5 var(--form-font);
+  cursor: pointer;
+  transition: background-color .16s ease, border-color .16s ease;
+}
+#run-form #local-batch-file:hover { border-color: #a8c8b8; background: #f3f9f5; }
+#run-form #local-batch-file:hover::file-selector-button { background: #deeee4; border-color: #b3d0bf; }
+#run-form #local-batch-file:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+@media (forced-colors: active) {
+  #run-form .checkbox-row input[type="checkbox"] { appearance: auto; -webkit-appearance: auto; }
+  #run-form .checkbox-row input[type="checkbox"]::before { content: none; }
+}
+#run-form #local-task {
+  min-height: 180px;
+  border-radius: 4px !important;
+  padding: 12px !important;
+  background: #fff;
+  font: 14px/1.7 var(--form-font) !important;
+}
+#run-form .task-limits { margin-top: 20px; gap: 0 16px; align-items: end; }
+#run-form .primary-launch { width: auto; min-width: 130px; min-height: 38px; border-radius: 4px; padding: 9px 18px; margin-top: 22px; font-size: 13px; box-shadow: none; }
+#run-form .model-label { font-size: 13px; margin-bottom: 16px; }
+#run-form .model-section + .model-section { padding-top: 20px; margin-top: 20px; }
+#run-form .inline-details summary { padding: 3px 0 7px; font-size: 12px; }
+#run-form .inline-details[open] > summary { margin-bottom: 8px; }
+#run-form .judge-section > .inline-details { margin-bottom: 18px; }
+#run-form .advanced-settings { background: transparent; border: 0; border-top: 1px solid var(--border); border-radius: 0; }
+#run-form .advanced-settings > summary { display: list-item; list-style: disclosure-closed inside; padding: 14px 0; font-size: 12px; }
+#run-form .advanced-settings[open] > summary { list-style-type: disclosure-open; }
+#run-form .advanced-settings > summary::after { display: none; }
+#run-form .advanced-settings > summary small { display: inline; color: var(--dim); margin-left: 8px; font-size: 11px; font-weight: 400; }
+@media (max-width: 1000px) {
+  #view-run #run-form { grid-template-columns: minmax(0, 1fr); }
+  #view-run #run-body { padding: 20px; }
+}
+@media (max-width: 520px) {
+  #view-run #run-body { padding: 14px 12px 28px; }
+  #run-form .run-panel { padding: 18px 16px; }
+  #run-form .workspace-picker { flex-wrap: wrap; }
+  #run-form .workspace-picker input { flex-basis: 100%; }
+  #run-form .segmented { gap: 20px; }
+}
+
+/* A single useful editor replaces the former experiment placeholders. */
+#run-form .prompt-settings {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+  min-width: 0;
+}
+#run-form .prompt-settings > summary {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 22px;
+  list-style: none;
+  font-size: 13px;
+  color: var(--text);
+}
+#run-form .prompt-settings > summary::-webkit-details-marker { display: none; }
+#run-form .prompt-settings-caption { color: var(--dim); font-size: 12px; font-weight: 400; }
+#run-form .prompt-settings > summary .prompt-chevron {
+  margin-left: auto;
+  width: 18px;
+  height: 18px;
+  transition: transform 260ms ease;
+}
+#run-form .prompt-settings > summary[aria-expanded="true"] .prompt-chevron { transform: rotate(180deg); }
+#run-form .prompt-settings::details-content {
+  block-size: auto;
+  opacity: 1;
+  transition: none;
+}
+#run-form .prompt-settings-body { padding: 4px 22px 18px; }
+#run-form .prompt-editor-toolbar, #run-form .prompt-mode-field, #run-form .prompt-editor-footer {
+  display: flex; align-items: center; gap: 12px;
+}
+#run-form .prompt-editor-toolbar, #run-form .prompt-editor-footer { justify-content: space-between; }
+#run-form .prompt-mode-field label { font-size: 12px; color: var(--dim); white-space: nowrap; }
+#run-form #run-prompt-mode { font-size: 13px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; background-color: #fff; }
+#run-form #run-prompt-help { font-size: 12px; line-height: 1.7; color: var(--dim); margin: 14px 0 12px; }
+#run-form #run-system-prompt {
+  display: block; width: 100%; height: 360px; min-height: 220px; resize: vertical;
+  background: #fafbf9; color: #35463f; border: 1px solid var(--border); border-radius: 4px;
+  padding: 16px; font: 13px/1.85 var(--form-font); tab-size: 2;
+}
+#run-form .prompt-editor-footer { margin-top: 12px; font-size: 11px; color: var(--dim); line-height: 1.6; flex-wrap: wrap; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+@media (max-width: 600px) {
+  #run-form .prompt-settings > summary { padding: 16px; gap: 8px; }
+  #run-form .prompt-settings-caption { font-size: 10px; }
+  #run-form .prompt-settings-body { padding: 0 16px 16px; }
+  #run-form .prompt-editor-toolbar { align-items: start; flex-direction: column; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #run-form .prompt-chevron { transition: none !important; }
+}
+
+/* Settings density: labels and values share a row; secondary options fold away. */
+#run-form .model-panel{padding:16px 20px;}
+#run-form .settings-heading{display:flex;align-items:center;justify-content:space-between;padding-bottom:14px;border-bottom:1px solid var(--border);margin-bottom:14px;font-size:13px;}
+#run-form .settings-heading span{font-size:10px;color:#97a19b;font-weight:400;}
+#run-form .model-section+.model-section{padding-top:14px;margin-top:14px;}
+#run-form .model-label{font-size:12px;margin-bottom:10px;font-weight:600;}
+#run-form .model-panel .run-row{display:grid;grid-template-columns:64px minmax(0,1fr);align-items:center;gap:8px;margin-bottom:8px;}
+#run-form .model-panel .run-row>label{font-size:11px;margin:0;white-space:nowrap;color:#859087;}
+#run-form .model-panel .run-row>input,#run-form .model-panel .run-row>select{width:100%;min-width:0;min-height:31px;height:32px;padding:5px 8px;font-size:12px;}
+#run-form .model-panel .run-row>.field-tip{grid-column:2;}
+#run-form .model-panel .inline-details{margin:5px 0 0 72px;}
+#run-form .model-panel .inline-details summary{font-size:11px;padding:3px 0;color:#8d988f;}
+#run-form .model-panel .inline-details[open]{margin-left:0;}
+#run-form .model-panel .form-two{gap:8px;}
+#run-form .model-panel .form-two .run-row{grid-template-columns:1fr;gap:4px;}
+#run-form .model-panel .field-tip{font-size:11px;margin:5px 0;}
+#run-form .model-panel .settings-link{border:0;background:transparent;color:#648879;padding:5px 0;font-size:11px;cursor:pointer;}
+#run-form .model-panel #btn-test{margin-top:14px;font-size:11px;padding:6px 9px;min-height:30px;}
+#run-form .model-panel select{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}

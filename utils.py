@@ -1,22 +1,27 @@
 """框架工具集。
 
 集中放置框架复用的工具函数。当前主要内容是「浏览器工具」（browser use 场景）：
-- 焦点检测：通过 Windows 前台窗口进程判断浏览器；
-- CDP 抓取：读取本机 Chrome/Edge 页面 AX-Tree / HTML / URL。
+- 焦点检测：判断当前活动窗口是否是浏览器（跨平台，零 token 系统调用）；
+- CDP 抓取：抓「当前页面」的 AX-Tree / HTML / URL（Chrome/Edge 走 CDP，Firefox 走 CDP 子集，
+  Safari 留 adapter 位；抓不到就降级为空，不抛异常）。
 
 以后要添加浏览器操作工具（click_element / fill / navigate / evaluate 等）也加到这个文件，
 保持「浏览器相关工具都集中在这里」。
 """
 from __future__ import annotations
 
-import ctypes
-import ntpath
 import platform
-import socket
+import subprocess
 from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
+
+# 常见浏览器进程名 / 窗口类名关键词（用于焦点检测）
+_BROWSER_KEYWORDS = (
+    "chrome", "chromium", "msedge", "edge", "firefox", "safari",
+    "brave", "opera", "vivaldi", "browser",
+)
 
 # 浏览器内部/非网页 scheme，抓页面信息时要排除
 _INTERNAL_SCHEMES = (
@@ -49,173 +54,58 @@ class BrowserState:
 
 
 # --------------------------------------------------------------------------- #
-# Windows 焦点检测
+# 焦点检测（跨平台）
 # --------------------------------------------------------------------------- #
 def detect_foreground_browser(os_name: Optional[str] = None) -> bool:
-    """检测 Windows 活动窗口；非 Windows 参数或探测失败返回 False。"""
+    """检测当前活动窗口是否是浏览器。返回 True/False（探测失败返回 False）。"""
     os_name = (os_name or platform.system()).lower()
     try:
         if os_name == "windows":
             return _foreground_windows()
+        if os_name in ("linux", "mac", "darwin"):
+            return _foreground_linux_mac()
     except Exception:  # noqa: BLE001
         return False
     return False
 
 
 def _foreground_windows() -> bool:
-    """Windows：根据前台窗口所属进程的可执行文件名确认浏览器。"""
+    """Windows：用 ctypes 读前台窗口标题/进程名。"""
     import ctypes
-    import ntpath
     from ctypes import wintypes
-    process = None
-    kernel32 = None
-    try:
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        # ctypes 默认返回 c_int；显式声明 HWND/HANDLE，避免 64 位句柄被截断。
-        user32.GetForegroundWindow.argtypes = []
-        user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.QueryFullProcessImageNameW.argtypes = [
-            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
-        ]
-        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return False
-        pid = wintypes.DWORD()
-        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
-            return False
-        process = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not process:
-            return False
-        path = ctypes.create_unicode_buffer(32768)
-        length = wintypes.DWORD(len(path))
-        if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length)):
-            return False
-        name = ntpath.basename(path.value).casefold()
-        return name in {
-            "chrome.exe", "chromium.exe", "msedge.exe", "firefox.exe", "brave.exe",
-            "opera.exe", "vivaldi.exe", "safari.exe", "iexplore.exe",
-        }
-    except Exception:  # noqa: BLE001
-        return False
-    finally:
-        if process and kernel32 is not None:
-            try:
-                kernel32.CloseHandle(process)
-            except Exception:  # noqa: BLE001
-                pass
-
-
-class _MIB_TCPROW_OWNER_PID(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_uint32) for name in (
-        "dwState", "dwLocalAddr", "dwLocalPort", "dwRemoteAddr", "dwRemotePort", "dwOwningPid")]
-
-
-class _MIB_TCP6ROW_OWNER_PID(ctypes.Structure):
-    _fields_ = [("ucLocalAddr", ctypes.c_ubyte * 16),
-                ("dwLocalScopeId", ctypes.c_uint32), ("dwLocalPort", ctypes.c_uint32),
-                ("ucRemoteAddr", ctypes.c_ubyte * 16),
-                ("dwRemoteScopeId", ctypes.c_uint32), ("dwRemotePort", ctypes.c_uint32),
-                ("dwState", ctypes.c_uint32), ("dwOwningPid", ctypes.c_uint32)]
-
-
-def _windows_foreground_identity():
-    """Return (full-width HWND, PID, executable) or None; never infer ownership by title."""
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    user32.GetForegroundWindow.argtypes = []
-    user32.GetForegroundWindow.restype = ctypes.c_void_p
-    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-    user32.GetWindowThreadProcessId.restype = ctypes.c_uint32
-    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    kernel32.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
-                                                   ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_uint32)]
-    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
-    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel32.CloseHandle.restype = ctypes.c_int
+    user32 = ctypes.windll.user32
     hwnd = user32.GetForegroundWindow()
     if not hwnd:
-        return None
-    pid = ctypes.c_uint32()
-    if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or not pid.value:
-        return None
-    process = kernel32.OpenProcess(0x1000, 0, pid.value)
-    if not process:
-        return None
+        return False
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    title = buf.value.lower()
+    return any(k in title for k in _BROWSER_KEYWORDS)
+
+
+def _foreground_linux_mac() -> bool:
+    """Linux：用 xdotool 读活动窗口名；macOS：用 AppleScript 读前台 app 名。"""
+    os_name = platform.system().lower()
     try:
-        path = ctypes.create_unicode_buffer(32768)
-        length = ctypes.c_uint32(len(path))
-        if not kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(length)):
-            return None
-        return hwnd, pid.value, ntpath.basename(path.value).casefold()
-    finally:
-        kernel32.CloseHandle(process)
-
-
-def _tcp_listener_pids(port: int):
-    """Read IPv4 and IPv6 LISTEN owners using IP Helper; None means unknown.
-
-    DWORD stays 32 bits on Win64. Ports are network-order 16-bit values stored in
-    DWORDs. TCP_TABLE_OWNER_PID_LISTENER is enum value 3 (Microsoft IP Helper).
-    """
-    iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
-    query = iphlpapi.GetExtendedTcpTable
-    query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
-                      ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    query.restype = ctypes.c_uint32
-    owners = set()
-    for family, row_type in ((2, _MIB_TCPROW_OWNER_PID), (23, _MIB_TCP6ROW_OWNER_PID)):
-        size = ctypes.c_uint32()
-        if query(None, ctypes.byref(size), False, family, 3, 0) != 122:
-            return None
-        # The table may grow between the sizing and data calls. Retry boundedly.
-        for _ in range(3):
-            if not 4 <= size.value <= 16 * 1024 * 1024:
-                return None
-            buffer = ctypes.create_string_buffer(size.value)
-            allocated = size.value
-            result = query(buffer, ctypes.byref(size), False, family, 3, 0)
-            if result == 122:
-                continue
-            if result != 0 or not 4 <= size.value <= allocated:
-                return None
-            count = ctypes.c_uint32.from_buffer(buffer).value
-            # OWNER_PID rows have DWORD alignment, so table[0] follows the DWORD count.
-            if 4 + count * ctypes.sizeof(row_type) > size.value:
-                return None
-            for index in range(count):
-                row = row_type.from_buffer(buffer, 4 + index * ctypes.sizeof(row_type))
-                if row.dwState == 2 and socket.ntohs(row.dwLocalPort & 0xFFFF) == port:
-                    if not row.dwOwningPid:
-                        return None
-                    owners.add(row.dwOwningPid)
-            break
+        if os_name == "darwin":
+            out = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to get name of first process whose frontmost is true'],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
         else:
-            return None
-    return owners
-
-
-def foreground_browser_matches_port(port: int = 9222) -> bool:
-    """Only accept a foreground Chrome whose PID uniquely owns this CDP port."""
-    try:
-        port = int(port)
-        if platform.system().lower() != "windows" or not 1 <= port <= 65535:
-            return False
-        before = _windows_foreground_identity()
-        if before is None or before[2] != "chrome.exe":
-            return False
-        owners = _tcp_listener_pids(port)
-        after = _windows_foreground_identity()
-        return before == after and owners == {before[1]}
+            # Linux：优先 xdotool，回退 wmctrl
+            out = subprocess.run(
+                ["xdotool", "getactivewindow", "getwindowname"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            if not out.strip():
+                out = subprocess.run(
+                    ["wmctrl", "-a", ":ACTIVE:"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout
+        return any(k in out.lower() for k in _BROWSER_KEYWORDS)
     except Exception:  # noqa: BLE001
         return False
 
@@ -223,12 +113,29 @@ def foreground_browser_matches_port(port: int = 9222) -> bool:
 # --------------------------------------------------------------------------- #
 # CDP 探测 + 抓取
 # --------------------------------------------------------------------------- #
+def _cdp_json(host: str, port: int, path: str, timeout: float = 4.0):
+    """CDP is a direct local/LAN control channel, independent of web proxy settings."""
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.get(f"http://{host}:{port}{path}", timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+
+def cdp_websocket_endpoint(host: str, port: int = 9222, timeout: float = 4.0) -> str:
+    """Resolve the CDP WebSocket without making the Node driver use HTTP proxies."""
+    endpoint = _cdp_json(host, port, "/json/version/", timeout).get("webSocketDebuggerUrl", "")
+    if not isinstance(endpoint, str) or not endpoint.startswith(("ws://", "wss://")):
+        raise ValueError("CDP discovery did not provide a WebSocket debugger URL")
+    return endpoint
+
+
 def list_cdp_pages(host: str, port: int = 9222, timeout: float = 4.0) -> List[dict]:
     """CDP /json 端点返回打开的页面列表。失败返回 []。"""
     try:
-        r = requests.get(f"http://{host}:{port}/json", timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
+        result = _cdp_json(host, port, "/json", timeout)
+        if isinstance(result, list):
+            return [page for page in result if isinstance(page, dict)]
     except Exception:  # noqa: BLE001
         pass
     return []
@@ -248,27 +155,17 @@ def _current_page(pages: List[dict]) -> Optional[dict]:
 def _connect_browser(host: str, port: int):
     """用 playwright connect_over_cdp 连接浏览器。返回 (playwright, browser) 或抛异常。"""
     from playwright.sync_api import sync_playwright
+    endpoint = cdp_websocket_endpoint(host, port)
     p = sync_playwright().start()
     try:
-        browser = p.chromium.connect_over_cdp(f"http://{host}:{port}")
+        browser = p.chromium.connect_over_cdp(endpoint, timeout=4000)
         return p, browser
     except Exception:
-        p.stop()
+        try:
+            p.stop()
+        except Exception:
+            pass
         raise
-
-
-def _browser_pages_are_incognito(browser) -> bool:
-    """核验当前 CDP 连接的页面上下文；普通、混合或未知模式均拒绝。"""
-    try:
-        cdp = browser.new_browser_cdp_session()
-        default_id = cdp.send("Target.getBrowserContexts").get("defaultBrowserContextId")
-        pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
-                 if target.get("type") == "page"]
-        return bool(default_id and pages) and all(
-            target.get("browserContextId") and target["browserContextId"] != default_id
-            for target in pages)
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def cdp_pages_are_incognito(host: str, port: int = 9222) -> bool:
@@ -282,53 +179,15 @@ def cdp_pages_are_incognito(host: str, port: int = 9222) -> bool:
     except Exception:  # noqa: BLE001
         return False
     try:
-        return _browser_pages_are_incognito(browser)
-    finally:
-        try:
-            browser.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            p.stop()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _browser_pages_match_mode(browser, browser_mode: str) -> bool:
-    """核验所有网页属于所选模式；普通模式只能使用默认上下文。"""
-    if browser_mode == "incognito":
-        return _browser_pages_are_incognito(browser)
-    if browser_mode != "normal":
-        raise ValueError("browser_mode 必须是 incognito 或 normal")
-    cdp = None
-    try:
         cdp = browser.new_browser_cdp_session()
         default_id = cdp.send("Target.getBrowserContexts").get("defaultBrowserContextId")
         pages = [target for target in cdp.send("Target.getTargets")["targetInfos"]
                  if target.get("type") == "page"]
         return bool(default_id and pages) and all(
-            target.get("browserContextId") == default_id for target in pages)
+            target.get("browserContextId") and target["browserContextId"] != default_id
+            for target in pages)
     except Exception:  # noqa: BLE001
         return False
-    finally:
-        if cdp is not None:
-            try:
-                cdp.detach()
-            except Exception:  # noqa: BLE001
-                pass
-
-
-def cdp_pages_match_mode(host: str, port: int = 9222, browser_mode: str = "incognito") -> bool:
-    if browser_mode == "incognito":
-        return cdp_pages_are_incognito(host, port)
-    if browser_mode != "normal":
-        raise ValueError("browser_mode 必须是 incognito 或 normal")
-    try:
-        p, browser = _connect_browser(host, port)
-    except Exception:  # noqa: BLE001
-        return False
-    try:
-        return _browser_pages_match_mode(browser, browser_mode)
     finally:
         try:
             browser.close()

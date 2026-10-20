@@ -1,42 +1,43 @@
-# 本地 Windows 配置示例。Config.load 可供集成代码读取；工作台与命令行使用各自的显式参数。
-# 决策/定位服务可以部署在本机或远程，执行环境固定为当前 Windows 主机。
+# osworld_agent 示例配置
+# 换模型 = 改下面 model / grounding_model 的名字（对应 models.py 里的注册表）即可，不动代码。
+
+# ---------------- 决策模型 ----------------
 model:
-  name: "Qwen3.5-9B"
-  url: "http://7.246.80.189:9028/v1"
+  name: "27b"                # 决策模型：Qwen3.6-27B（vLLM @ 10.44.101.62:8094）
+  url: "http://10.44.101.62:8094/v1"
   api_key: "EMPTY"
   temperature: 0.3
   max_tokens: 2048
-  timeout: 60.0
-  vision: true
+  vision: true               # 是否把截图喂给决策模型（纯文本模型设 false）
 
+# ---------------- 视觉定位模型 ----------------
 grounding_model:
-  name: "UI-Venus-2-9B"
+  name: "ui_venus2_9b"
   url: "http://7.246.80.189:8001/v1"
   api_key: "EMPTY"
-  type: "ui-venus2"
   width: 1920
   height: 1080
-  timeout: 60.0
 
+# ---------------- 智能体循环 ----------------
 agent:
-  max_steps: 20
-  max_retries: 3
-  enable_reflection: false
-  early_stop_repeat: 3
-  step_timeout: 120.0
+  max_steps: 40              # 单任务最大步数
+  max_retries: 3             # 动作解析失败最多重试几次
+  enable_reflection: true    # 是否开启反思（reflection）
+  early_stop_repeat: 3       # 相同动作无进展阈值；重复执行失败会提前进入恢复
+  max_replans: 3
+  wait_config:
+    enabled: true
+    poll_interval_s: 0.25
+    download_start_timeout_s: 2
+    operation_timeout_s: 300 # 一次传输的等待上限；自动等待不消耗决策步数
+    task_timeout_s: 1800    # 整个任务的墙钟时间预算
 
+# ---------------- 环境 ----------------
 env:
-  execution_mode: "browser_first"
-  browser_mode: "incognito" # incognito（无痕）或 normal（普通），主任务与子任务共用
-  browser_port: 9222
-  chrome_path: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
-  downloads_dir: null
-  action_settle_seconds: 0.3
+  provider: "osworld"        # 目前只支持 osworld
+  os: "linux"                # 目标机操作系统：linux / mac / windows（决定终端命令 shell）
+  vm_path: "/data/osworld-agent-s/vm/uploaded/Ubuntu.qcow2"
+  sleep_after_execution: 1.5 # 每步动作后等待秒数（截图前）
+  headless: false
   screen_width: 1920
   screen_height: 1080
-
-context:
-  ax_max_chars: 12000       # 精简网页 AX 的字符上限；可按实际模型服务容量调整
-  screenshot_max_edge: 1280 # 浏览器模型输入截图最长边，保持宽高比例
-  max_input_tokens: 30000
-  output_reserve: 2048

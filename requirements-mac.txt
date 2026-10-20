@@ -1,0 +1,6 @@
+-r requirements-viz.txt
+openai>=1
+pypdf>=5,<7
+pyautogui>=0.9.54,<1
+pyobjc-framework-Quartz>=10,<13
+pyobjc-framework-Cocoa>=10,<13

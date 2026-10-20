@@ -3,58 +3,30 @@
 对齐原 Agent-S3 的 grounding 协议：
 - prompt: "Query:{target}\\nOutput only the coordinate of one point in your response.\\n"
 - 图片在前、文本在后（OpenAI vision 多部分格式）
-- 只解析坐标对或明确标注的 point 坐标，不从解释文字中猜数字
+- 响应必须是单一坐标对，拒绝负数、额外数字和越界值
 - 从 grounding 模型的输入分辨率缩放到实际屏幕分辨率
 """
 from __future__ import annotations
 
+from ..model.grounding_usage import completion
+from ..config import resolve_secret
+
 import re
-import json
-import math
-import time
 from typing import Optional
 
-from ..model.grounding import Grounding, GroundingResult
-from ..model.request_deadline import (ModelRequestTimeout, call_with_deadline,
-                                     make_request_deadline, remaining_seconds, sleep_before_retry)
-
-
-_NUMBER = r"-?\d+(?:\.\d+)?"
-_PAIR = rf"(?:\[\s*({_NUMBER})\s*,\s*({_NUMBER})\s*\]|\(\s*({_NUMBER})\s*,\s*({_NUMBER})\s*\))"
+from ..model.grounding import Grounding, GroundingResult, screenshot_size
 
 
 def _extract_coords(text: str):
-    """Accept a coordinate pair or an explicit point, preserving negative values."""
-    text = (text or "").strip()
-    fenced = re.fullmatch(r"```(?:json|text|python)?\s*\n?([\s\S]*?)\n?```", text, re.I)
-    if fenced:
-        text = fenced.group(1).strip()
-    pair = re.fullmatch(_PAIR, text)
-    if pair:
-        values = [value for value in pair.groups() if value is not None]
-        return tuple(map(float, values))
-    bare_pair = re.fullmatch(rf"({_NUMBER})\s*,\s*({_NUMBER})", text)
-    if bare_pair:
-        return tuple(map(float, bare_pair.groups()))
-    try:
-        obj = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        obj = None
-    if isinstance(obj, dict):
-        values = obj.get("point")
-        if values is None and set(obj) == {"x", "y"}:
-            values = [obj["x"], obj["y"]]
-        if (isinstance(values, (list, tuple)) and len(values) == 2
-                and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)):
-            return tuple(map(float, values))
-    # A labelled point may accompany prose. Multiple labelled points are ambiguous.
-    labelled = list(re.finditer(rf"\b(?:point|coordinates?)\s*[:=]\s*{_PAIR}", text, re.I))
-    tags = list(re.finditer(rf"<point>\s*({_NUMBER})\s*[, ]\s*({_NUMBER})\s*</point>", text, re.I))
-    if len(labelled) + len(tags) != 1:
+    """Accept an unambiguous point, never extract digits out of prose."""
+    value = (text or "").strip()
+    if len(value) >= 2 and (value[0], value[-1]) in (("[", "]"), ("(", ")")):
+        value = value[1:-1].strip()
+    match = re.fullmatch(r"(-?\d+)\s*,\s*(-?\d+)", value)
+    if match is None:
         return None
-    match = (labelled or tags)[0]
-    values = [value for value in match.groups() if value is not None]
-    return tuple(map(float, values))
+    x, y = map(int, match.groups())
+    return (x, y) if x >= 0 and y >= 0 else None
 
 
 class RealUItarsGrounding(Grounding):
@@ -64,22 +36,21 @@ class RealUItarsGrounding(Grounding):
                  width: int = 1920, height: int = 1080,
                  grounding_width: Optional[int] = None,
                  grounding_height: Optional[int] = None,
-                 timeout: float = 60.0, retries: int = 0):
+                 timeout: float = 180.0):
         self.url = url
         self.api_key = api_key
         self.model = model
         self.width = width
         self.height = height
-        # grounding 模型的输入分辨率；默认等于屏幕分辨率（不做缩放），
+        # grounding 模型的输出坐标空间；默认等于实际截图（不做缩放），
         # 若你的 UI-TARS 端点用了别的分辨率（如 1000x1000），在这里对齐。
-        # None means the current screenshot dimensions; Pipeline updates width/height
-        # when switching between full desktop and browser viewport screenshots.
+        if (grounding_width is None) != (grounding_height is None):
+            raise ValueError("grounding_width and grounding_height must be provided together")
+        if grounding_width is not None and (grounding_width <= 0 or grounding_height <= 0):
+            raise ValueError("grounding dimensions must be positive")
         self.grounding_width = grounding_width
         self.grounding_height = grounding_height
         self.timeout = timeout
-        self.retries = max(0, int(retries))
-        self.request_deadline: Optional[float] = None
-        self.last_call = {}
         self._client = None
 
     def _get_client(self):
@@ -89,84 +60,50 @@ class RealUItarsGrounding(Grounding):
             # trust_env=False：直连内网 endpoint，不走系统代理（否则 HIS 代理会拦掉 7.x，
             # 导致 grounding 抛异常、fallback 成屏幕中心）
             self._client = OpenAI(
-                base_url=self.url, api_key=self.api_key,
-                max_retries=0,
+                base_url=self.url, api_key=resolve_secret(self.api_key),
                 http_client=httpx.Client(trust_env=False, timeout=self.timeout),
             )
         return self._client
 
     def locate(self, screenshot, target: str):
+        self.last_calls = []
         from ..model.decision_model import encode_image
-        from openai import APITimeoutError
-        import httpx
-        started = time.perf_counter()
-        self.last_call = {"model": self.model, "target": target, "messages": [], "response": "",
-                          "error": None, "attempts": [], "latency_ms": 0.0,
-                          "confidence": 0.0, "x": -1, "y": -1}
-        deadline = make_request_deadline(self.timeout, self.request_deadline)
+        import os
+        if isinstance(screenshot, os.PathLike):
+            screenshot = os.fspath(screenshot)
+        size = screenshot_size(screenshot)
         url = encode_image(screenshot)
-        if not url:
-            return self._failed_result("截图无法编码", started)
-        source_width = self.width if self.grounding_width is None else self.grounding_width
-        source_height = self.height if self.grounding_height is None else self.grounding_height
-        if not all(math.isfinite(float(value)) and value > 0
-                   for value in (self.width, self.height, source_width, source_height)):
-            return self._failed_result("截图或参考坐标尺寸无效", started)
+        if not url or size is None:
+            # 截图编码失败：显式失败，不兜底
+            return GroundingResult(x=-1, y=-1, confidence=0.0)
+        width, height = size
+        source_width = self.grounding_width or width
+        source_height = self.grounding_height or height
 
         text = f"Query:{target}\nOutput only the coordinate of one point in your response.\n"
         messages = [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": url}},
             {"type": "text", "text": text},
         ]}]
-        self.last_call["messages"] = messages
 
         last_err = None
-        for attempt in range(self.retries + 1):
-            attempt_started = time.perf_counter()
+        for attempt in range(3):
             try:
-                client = self._get_client()
-                remaining = remaining_seconds(deadline)
-                resp = call_with_deadline(lambda: client.chat.completions.create(
-                    model=self.model, messages=messages, max_tokens=128, timeout=remaining), remaining)
+                resp = completion(self,
+                    model=self.model, messages=messages, max_tokens=128)
                 out = (resp.choices[0].message.content or "").strip()
-                self.last_call["response"] = out
-                coords = _extract_coords(out)
-                valid = (coords is not None and all(math.isfinite(value) for value in coords)
-                         and 0 <= coords[0] < source_width and 0 <= coords[1] < source_height)
-                self.last_call["attempts"].append({
-                    "status": "ok" if valid else "format_error", "response": out,
-                    "latency_ms": round((time.perf_counter() - attempt_started) * 1000, 2)})
-                if valid:
-                    x = min(self.width - 1, round(coords[0] * self.width / source_width))
-                    y = min(self.height - 1, round(coords[1] * self.height / source_height))
-                    self.last_call.update({"confidence": 1.0, "x": x, "y": y, "error": None,
-                                           "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
+                point = _extract_coords(out)
+                if point is not None and point[0] < source_width and point[1] < source_height:
+                    x = min(width - 1, round(point[0] * width / source_width))
+                    y = min(height - 1, round(point[1] * height / source_height))
                     return GroundingResult(x=x, y=y, confidence=1.0)
-                # Protocol mismatches will not improve by repeating the same request.
-                return self._failed_result(f"定位协议错误：响应无有效坐标或坐标越界: {out[:100]}", started)
+                last_err = f"响应坐标无效/越界: {out[:100]}"
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
-                is_timeout = isinstance(exc, (TimeoutError, APITimeoutError, httpx.TimeoutException))
-                self.last_call["attempts"].append({
-                    "status": "timeout" if is_timeout else "error", "error_type": type(exc).__name__,
-                    "error": last_err, "latency_ms": round((time.perf_counter() - attempt_started) * 1000, 2)})
-                self.last_call.update({"error": last_err,
-                                       "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
-                if is_timeout:
-                    if isinstance(exc, ModelRequestTimeout):
-                        raise
-                    raise ModelRequestTimeout(f"定位模型请求超时({self.model}): {exc}") from exc
-            if attempt < self.retries:
-                try:
-                    sleep_before_retry(1.0 * (attempt + 1), deadline)
-                except ModelRequestTimeout as exc:
-                    self.last_call.update({"error": str(exc),
-                                           "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
-                    raise
+                if attempt < 2:
+                    import time
+                    time.sleep(1.0 * (attempt + 1))
 
-        return self._failed_result(last_err or "定位模型调用失败", started)
-
-    def _failed_result(self, error: str, started: float) -> GroundingResult:
-        self.last_call.update({"error": error, "confidence": 0.0, "x": -1, "y": -1,
-                               "latency_ms": round((time.perf_counter() - started) * 1000, 2)})
+        # 三次都失败：显式失败，confidence=0，不再兜底成屏幕中心
+        print(f"[grounding 失败] target={target!r}: {last_err}")
         return GroundingResult(x=-1, y=-1, confidence=0.0)

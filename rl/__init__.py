@@ -6,7 +6,6 @@
 - credit.py：语义轨迹树 + Bayesian smoothing 动作价值 + step-level credit（后续）
 """
 from .semantic import semantic_action, semantic_history, parse_action
-from .rollout import RolloutResult, run_rollout, run_rollouts
 from .credit import (
     build_tree, action_value, state_value, step_credits,
     normalize_credits, assign_step_level_credit,
@@ -18,3 +17,11 @@ __all__ = [
     "build_tree", "action_value", "state_value", "step_credits",
     "normalize_credits", "assign_step_level_credit",
 ]
+
+
+def __getattr__(name):
+    # Keep the collection CLI executable with python -m without eagerly importing it.
+    if name in {"RolloutResult", "run_rollout", "run_rollouts"}:
+        from . import rollout
+        return getattr(rollout, name)
+    raise AttributeError(name)

@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional
 
 MAX_RECENT_EVENTS = 3
 MAX_FAILURES = 3
-MAX_ACTION_HISTORY = 20      # 动作历史渲染给模型时保留最近 N 条（覆盖默认 max_steps=20）
+MAX_ACTION_HISTORY = 20      # 动作历史渲染给模型时保留最近 N 条
 
 
 @dataclass
@@ -29,12 +29,13 @@ class StructuredMemory:
         "completed": [],
         "pending": [],
     })
-    # 稳定 ID、完成判据及证据维护的计划；task_state 由此派生。
+    # 任务计划（planner 阶段0产出）：{"steps":[{"idx":1,"goal":"...","status":"pending"}], "keywords":[...], "final_check":"..."}
     plan: Optional[Dict[str, Any]] = None
     recent_events: List[str] = field(default_factory=list)      # 最近 3 条
     known_facts: Dict[str, Any] = field(default_factory=dict)   # 关键事实（key -> value）
     failure_memory: List[str] = field(default_factory=list)     # 最近 1~3 个重要失败
     action_history: List[str] = field(default_factory=list)     # 完整动作历史：每步做了什么 + 结果
+    decision_notes: List[str] = field(default_factory=list)     # 操作员一句话摘要；不是成功证据
 
     # ---- 控制状态（程序维护）----
     expected_effect: str = ""          # 上一步动作的预期效果
@@ -47,39 +48,15 @@ class StructuredMemory:
 
     # ---- 程序维护：应用模型输出的 state_update 补丁 ----
     def apply_state_update(self, patch: Dict[str, Any]) -> None:
-        if not isinstance(patch, dict) or not patch:
+        if not patch:
             return
-        if patch.get("goal"):
-            self.task_state["goal"] = patch["goal"]
-        if patch.get("current_subgoal") is not None:
-            self.task_state["current_subgoal"] = patch["current_subgoal"]
-        completed = patch.get("completed_add")
-        for item in completed if isinstance(completed, list) else []:
-            if item and item not in self.task_state["completed"]:
-                self.task_state["completed"].append(item)
-        pending = patch.get("pending_add")
-        for item in pending if isinstance(pending, list) else []:
-            if item and item not in self.task_state["pending"]:
-                self.task_state["pending"].append(item)
-        facts = patch.get("known_fact_add")
-        for k, v in (facts if isinstance(facts, dict) else {}).items():
+        # Queue progress, task and completion state belong exclusively to the framework.
+        if not isinstance(patch, dict):
+            return
+        if not isinstance(patch.get("known_fact_add", {}), dict):
+            return
+        for k, v in (patch.get("known_fact_add") or {}).items():
             self.known_facts[k] = v
-        self.sync_plan_state()
-
-    def sync_plan_state(self) -> None:
-        """有计划时由已确认的计划状态派生记忆，避免两份待办互相矛盾。"""
-        if not isinstance(self.plan, dict) or not isinstance(self.plan.get("steps"), list):
-            return
-        steps = [step for step in self.plan["steps"] if isinstance(step, dict) and step.get("goal")]
-        if not steps:
-            return
-        current = self.plan.get("current_step_id")
-        active = next((step for step in steps if step.get("id") == current), None)
-        self.task_state["current_subgoal"] = active.get("goal", "") if active else ""
-        self.task_state["current_plan_step_id"] = current
-        self.task_state["completed"] = [step["goal"] for step in steps if step.get("status") == "done"]
-        self.task_state["pending"] = [step["goal"] for step in steps
-                                      if step.get("status") not in ("done", "skipped")]
 
     # ---- 程序维护：事件 / 失败 ----
     def add_event(self, event: str) -> None:
@@ -112,49 +89,43 @@ class StructuredMemory:
             line += f" → {outcome}"
         self.action_history.append(line)
 
-    # ---- 渲染给模型 ----
-    def to_text(self) -> str:
-        def brief(value, limit):
-            text = " ".join(str(value or "").split())
-            return text if len(text) <= limit else text[:limit] + "…"
+    def add_decision_note(self, step: int, summary: str, action: str, status: str) -> None:
+        text = ' '.join(str(summary or '').split())[:160]
+        if not text:
+            text = '尝试执行 ' + ' '.join(action.split())[:140]
+        # Keep dispatch failures attached to the intention so later summaries
+        # cannot turn an attempted action into an accomplished fact.
+        outcome = {'executed': '已派发', 'rejected': '被拒绝，未执行', 'failed': '执行失败',
+                   'error': '执行出错', 'uncertain': '结果不确定', 'pending': '处理中',
+                   'in_progress': '处理中'}.get(status, '结果待核实')
+        self.decision_notes.append(f'{step}. {text}〔{outcome}〕')
 
+    # ---- 渲染给模型 ----
+    def to_text(self, include_plan: bool = True) -> str:
         ts = self.task_state
-        lines = []
-        # 编译器从开头截断：当前 ID、完整状态索引和当前判据优先于历史详情。
-        if self.plan:
-            steps = [s for s in self.plan.get("steps", []) if isinstance(s, dict)]
-            current = self.plan.get("current_step_id")
+        lines = [
+            "## 任务状态(task_state)",
+            f"- 目标 goal: {ts['goal'] or '（未填）'}",
+            f"- 当前子目标 current_subgoal: {ts['current_subgoal'] or '（未填）'}",
+            f"- 模型报告进展（非系统验收）completed: {ts['completed'] if ts['completed'] else '[]'}",
+            f"- 待办 pending: {ts['pending'] if ts['pending'] else '[]'}",
+            "",
+        ]
+        # 任务计划段（planner 阶段0产出）
+        if self.plan and include_plan:
             lines.append("## 任务计划(plan)")
-            lines.append(f"- current_step_id: {current or '（无）'}")
-            lines.append("- 步骤状态: " + ", ".join(
-                f"{s.get('id', s.get('idx', '?'))}={s.get('status', 'pending')}" for s in steps))
-            active = next((s for s in steps if s.get("id") == current), None)
-            if active:
-                lines.append(f"- 当前子目标: {brief(active.get('goal'), 120)}")
-                lines.append(f"- 完成判据: {brief(active.get('completion_criteria') or active.get('goal'), 180)}")
-                if active.get("blocked_reason"):
-                    lines.append(f"- 受阻原因: {brief(active['blocked_reason'], 120)}")
-            lines.append(f"- 上一步预期效果 expected_effect: {brief(self.expected_effect, 120) or '（无）'}")
-            for s in steps:
+            for s in (self.plan.get("steps") or []):
                 idx = s.get("idx", "?")
+                goal = s.get("goal", "")
                 status = s.get("status", "pending")
-                mark = {"pending": "待办", "doing": "进行中", "in_progress": "进行中",
-                        "done": "已完成", "blocked": "受阻", "skipped": "已跳过"}.get(status, status)
-                lines.append(f"- [{mark}] {s.get('id', idx)} / {idx}. {brief(s.get('goal'), 72)}")
-                if s.get("evidence"):
-                    lines.append(f"  完成证据: {brief(s['evidence'], 96)}")
+                mark = {"pending": "待办", "doing": "进行中", "done": "已完成"}.get(status, status)
+                lines.append(f"- [{mark}] {idx}. {goal}")
+                if s.get("expected_evidence"):
+                    lines.append(f"  预期证据: {s['expected_evidence']}")
             if self.plan.get("keywords"):
                 lines.append(f"- 搜索关键词 keywords: {self.plan.get('keywords')}")
             if self.plan.get("final_check"):
                 lines.append(f"- 完成判据 final_check: {self.plan.get('final_check')}")
-        lines += [
-            "",
-            "## 任务状态(task_state)",
-            f"- 目标 goal: {ts['goal'] or '（未填）'}",
-            f"- 当前子目标 current_subgoal: {ts['current_subgoal'] or '（未填）'}",
-            f"- 已完成 completed: {ts['completed'] if ts['completed'] else '[]'}",
-            f"- 待办 pending: {ts['pending'] if ts['pending'] else '[]'}",
-        ]
         lines += [
             "",
             "## 动作历史(action_history，从头到尾做了什么)",

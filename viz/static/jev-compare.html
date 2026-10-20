@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Jev · Decision Lab</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%236856e8'/%3E%3Cpath d='M25 9v15a8 8 0 0 1-16 0h5a3 3 0 0 0 6 0V9z' fill='white'/%3E%3C/svg%3E"><link rel="stylesheet" href="/static/jev-compare.css?v=zh3"></head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="#"><span class="brand-mark">j<span>·</span></span><span>Jev<span class="brand-sub">DECISION LAB</span></span></a>
+  <div class="nav-caption">WORKSPACE</div>
+  <nav><button data-view="cases" class="nav-item active"><span>◫</span>案例工作台<span class="nav-count" id="caseCount">—</span></button><button data-view="playlist" class="nav-item"><span>▤</span>汇报清单</button><button data-view="history" class="nav-item"><span>◷</span>实测记录</button></nav>
+  <div class="sidebar-note"><div class="mini-orbit">J <span>↔</span> V</div><strong>Same evidence.<br>Different decisions.</strong><p>同一输入 · 并行调用<br>保留原始结果与真实耗时</p></div>
+  <div class="sidebar-bottom"><span class="status-dot"></span>本地实验工作台<button id="settingsNav" title="连接设置" aria-label="连接设置">⚙</button></div>
+</aside>
+<div class="shell">
+  <header class="topbar"><div class="breadcrumbs"><span>Experiments</span><i>/</i><strong id="crumb">Jev × VLM</strong></div><div class="top-actions"><button class="quiet" id="presentationBtn">⛶ <span>汇报模式</span></button><button class="quiet" id="settingsBtn">连接设置 <span>↗</span></button></div></header>
+  <main id="main" aria-live="polite"></main>
+  <footer>JEV DECISION LAB <span>受控场景评测 · 不替代完整 Agent 任务成功率</span><span id="footerModel"></span></footer>
+</div>
+<div id="batchBar" class="batch-bar hidden"></div>
+<div id="toast" class="toast hidden" role="status"></div>
+<dialog id="settingsDialog"><form id="settingsForm"><div class="dialog-heading"><div><div class="eyebrow">MODEL CONNECTIONS</div><h2>连接你的模型</h2></div><button type="button" class="icon-button" data-close="settingsDialog" aria-label="关闭">×</button></div><p class="muted">设置应用于当前服务进程。跨机器使用时，在 <code>.env</code> 中保存配置；密钥不会出现在页面、结果或导出文件中。</p>
+<div class="connection-grid"><section><h3><span class="model-dot jev"></span>Jev / System One</h3><label>服务地址<input name="jev_url" placeholder="http://127.0.0.1:8007/v1/systemone"></label><label>模型名称<input name="jev_model" required></label><label>API Key <small id="jevKeyHint"></small><input name="jev_api_key" type="password" autocomplete="new-password" placeholder="留空保留已有密钥"></label><label class="check"><input name="jev_trust_env" type="checkbox">使用系统网络代理</label></section><section><h3><span class="model-dot vlm"></span>VLM / Chat Completions</h3><label>服务地址<input name="vlm_url" placeholder="https://…/v1/chat/completions"></label><label>模型名称<input name="vlm_model" required></label><label>API Key <small id="vlmKeyHint"></small><input name="vlm_api_key" type="password" autocomplete="new-password" placeholder="留空保留已有密钥"></label><label class="check"><input name="vlm_trust_env" type="checkbox">使用系统网络代理</label><label class="check"><input name="vlm_json_mode" type="checkbox">JSON 基线发送 response_format</label><label>思考参数协议<select name="vlm_thinking_mode" class="select" aria-label="思考参数协议"><option value="dashscope" data-description="通过 enable_thinking 字段控制是否启用思考。">阿里云 DashScope</option><option value="chat_template" data-description="通过 chat_template_kwargs 传递思考开关。">vLLM 模板参数</option><option value="omit" data-description="适合不接受厂商扩展参数的兼容服务。">通用接口 · 省略思考参数</option></select></label><label class="check"><input name="vlm_enable_thinking" type="checkbox">启用思考（会影响时延）</label></section></div>
+<div class="policy-fields"><label>调用超时 / 秒<input name="timeout" type="number" min="1" max="300" required></label><label>Jev 接受阈值<input name="threshold" type="number" min="0.5" max="1" step="0.05" required></label><label>Top1 − Top2 差值<input name="margin" type="number" min="0" max="1" step="0.05" required></label></div><p class="hint">概率用于观察与弃权策略，不能直接解释为正确率。当前机器的 VLM 替代模型与正式 27B 模型需分别报告。</p><div class="dialog-actions"><span id="settingsError" class="error-text"></span><button type="button" class="button secondary" data-close="settingsDialog">取消</button><button class="button primary" type="submit">应用设置</button></div></form></dialog>
+<dialog id="imageDialog" class="image-dialog"><button class="image-close" data-close="imageDialog" aria-label="关闭图片">×</button><img alt="放大的场景截图" id="expandedImage"></dialog>
+<script src="/static/jev-select.js?v=zh3" defer></script>
+<script src="/static/jev-compare.js?v=zh3" defer></script>
+</body></html>

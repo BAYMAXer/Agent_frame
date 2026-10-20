@@ -9,7 +9,12 @@ htmlcov/
 
 # Local environments and credentials
 .venv/
+.venv-mcp/
+.venv-mac/
+.venv312/
 venv/
+viz/studio_settings.json
+config/mcp.local.json
 .env
 .env.*
 !.env.example
@@ -19,7 +24,11 @@ venv/
 *.log
 logs/
 runs/
+local_runs/
 outputs/
+workspace/
+downloads/
+human_runs/
 
 # Editor and operating system files
 .idea/
@@ -27,12 +36,41 @@ outputs/
 .DS_Store
 Thumbs.db
 
-# Test files are excluded from published source
-test/
-tests/
+# Local diagnostics and exported conversations
+.runtime/
+_session*
+*.pending-update
+
+# Unused local UI/server snapshots
+viz/server_old.py
+viz/static/index_old.html
+
+# Development-only files excluded from published source
+/test/
+/tests/
 test_*.py
 *_test.py
 conftest.py
 pytest.ini
 *.test.*
 *.spec.*
+/requirements-test.txt
+/requirements-dev.txt
+/docs/
+/skills/ilearning/README.md
+
+# Source-package inventories and unpacking notes
+/PACKAGE_INFO.txt
+/PACKAGE_MANIFEST.json
+/UNPACK_PARTS_README.txt
+/mac_bootstrap.command
+
+# Additional local environments and build output
+.venv*/
+env/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+coverage.xml

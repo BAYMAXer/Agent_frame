@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -15,7 +17,44 @@ from typing import Any, Dict, Optional
 CONFIG_DIR = Path(__file__).parent
 ACTION_YAML = CONFIG_DIR / "action.yaml"
 SKILLS_YAML = CONFIG_DIR / "skills.yaml"
-DEFAULT_AX_MAX_CHARS = 12000
+_ENV_REFERENCE = re.compile(r"^(?:env:([A-Za-z_][A-Za-z0-9_]*)|\$\{([A-Za-z_][A-Za-z0-9_]*)\})$")
+
+
+def resolve_secret(value: str) -> str:
+    """Resolve ``env:NAME``/``${NAME}`` without putting credentials in tracked YAML.
+
+    Process environment variables take precedence.  For local development the
+    repository's ignored ``.env`` file is used as a small fallback, so the web
+    UI and subprocess runners can share one credential without exposing it in
+    command lines or model preset responses.
+    """
+    if not isinstance(value, str):
+        raise TypeError("secret reference must be a string")
+    match = _ENV_REFERENCE.fullmatch(value.strip())
+    if match is None:
+        return value
+    name = match.group(1) or match.group(2)
+    secret = os.getenv(name)
+    if secret:
+        return secret
+    dotenv = CONFIG_DIR.parent / ".env"
+    try:
+        lines = dotenv.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, candidate = line.split("=", 1)
+        if key.strip() != name:
+            continue
+        candidate = candidate.strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "\"'":
+            candidate = candidate[1:-1]
+        if candidate:
+            return candidate
+    raise RuntimeError(f"缺少环境变量 {name}（也未在本地 .env 中配置）")
 
 
 def load_yaml(path: Path) -> Dict[str, Any]:
@@ -33,56 +72,57 @@ def load_yaml(path: Path) -> Dict[str, Any]:
 @dataclass
 class ModelConfig:
     """决策模型的连接配置。"""
-    name: str = "Qwen3.5-9B"
-    url: str = "http://7.246.80.189:9028/v1"
+    name: str = "Qwen3.6-27B"
+    url: str = "http://10.44.101.62:8094/v1"
     api_key: str = "EMPTY"
     temperature: float = 0.3
     max_tokens: int = 2048
-    timeout: float = 60.0
-    request_retries: int = 0         # SDK 隐式重试关闭；显式重试也受该上限约束
+    timeout: float = 180.0
     vision: bool = True              # 是否把截图喂给决策模型（纯文本模型设 false）
     disable_thinking: bool = True    # 关闭 Qwen 思考模式（避免模型生成大段 chain-of-thought 陷入循环）
+    capture_rollout: bool = False    # Request real server token IDs/logprobs; never reconstruct them.
+    policy_revision: str = ""        # Expected immutable behavior revision, checked against server metadata.
+    tokenizer_revision: str = ""
+    processor_revision: str = ""
+    chat_template_revision: str = ""
 
 
 @dataclass
 class GroundingConfig:
     """视觉定位模型的连接配置。"""
-    name: str = "UI-Venus-2-9B"
+    name: str = "ui_venus2_9b"
     url: str = "http://7.246.80.189:8001/v1"
     api_key: str = "EMPTY"
     width: int = 1920
     height: int = 1080
-    timeout: float = 60.0
-    type: str = "ui-venus2"
+    timeout: float = 180.0
 
 
 @dataclass
 class AgentConfig:
     """智能体循环的超参。"""
-    max_steps: int = 20
+    max_steps: int = 40
     max_retries: int = 3
     enable_reflection: bool = True
     early_stop_repeat: int = 3
-    step_timeout: float = 120.0
+    max_replans: int = 3
+    wait_config: Dict[str, Any] = field(default_factory=dict)
+    progress_config: Dict[str, Any] = field(default_factory=dict)
+    decision_judge: Dict[str, Any] = field(default_factory=dict)
+    knowledge_method: str = "all"
+    knowledge_jev_url: str = ""
 
 
 @dataclass
 class EnvConfig:
-    """本地 Windows 环境；用户可选普通或无痕，默认独立无痕实例。"""
+    """环境（OSWorld）的配置。"""
+    provider: str = "osworld"
+    os: str = "linux"               # 目标机操作系统：linux / mac / windows（决定终端命令的 shell）
+    vm_path: str = "/data/osworld-agent-s/vm/uploaded/Ubuntu.qcow2"
+    sleep_after_execution: float = 1.5
+    headless: bool = False
     screen_width: int = 1920
     screen_height: int = 1080
-    execution_mode: str = "browser_first"
-    browser_mode: str = "incognito"
-    browser_port: int = 9222
-    chrome_path: str = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    downloads_dir: Optional[str] = None
-    action_settle_seconds: float = 0.3
-
-    def __post_init__(self):
-        if not isinstance(self.execution_mode, str) or self.execution_mode not in {"desktop", "browser_first"}:
-            raise ValueError("execution_mode 必须是 desktop 或 browser_first")
-        if not isinstance(self.browser_mode, str) or self.browser_mode not in {"incognito", "normal"}:
-            raise ValueError("browser_mode 必须是 incognito 或 normal")
 
 
 @dataclass
@@ -97,16 +137,9 @@ class ContextConfig:
     structured_max_images: int = 1
     memory_tokens: int = 2200
     auxiliary_tokens: int = 1200
-    structure_tokens: int = 5000
-    ax_max_chars: int = DEFAULT_AX_MAX_CHARS  # 浏览器精简 AX 的字符上限，与 structure_tokens 的 token 预算独立
-    screenshot_max_edge: int = 1280  # 浏览器模型输入截图最长边；保留原始坐标用于操作
+    structure_tokens: int = 23000
     tokenizer_path: str = ""  # 本地 tokenizer；不填则按 UTF-8 字节保守预算
-
-    def __post_init__(self):
-        for name in ("ax_max_chars", "screenshot_max_edge"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} 必须是正整数")
+    require_current_image: bool = True
 
 
 @dataclass
@@ -117,6 +150,10 @@ class Config:
     agent: AgentConfig = field(default_factory=AgentConfig)
     env: EnvConfig = field(default_factory=EnvConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    completion: Optional[Dict[str, Any]] = None
+    private_completion: Optional[Dict[str, Any]] = None
+    planner_model: Optional[ModelConfig] = None
+    event_path: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Config":
@@ -127,6 +164,10 @@ class Config:
             agent=AgentConfig(**(data.get("agent") or {})),
             env=EnvConfig(**(data.get("env") or {})),
             context=ContextConfig(**(data.get("context") or {})),
+            completion=data.get("completion"),
+            private_completion=data.get("private_completion"),
+            planner_model=ModelConfig(**data["planner_model"]) if data.get("planner_model") else None,
+            event_path=data.get("event_path"),
         )
 
     @classmethod

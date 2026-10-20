@@ -17,24 +17,27 @@ from typing import Any, Dict, Tuple
 # 每个动作类型保留的意图参数（按序），其余（坐标等）丢弃。
 # 注意：不含 x/y/x1/y1/x2/y2 等 grounding 坐标。
 _SEMANTIC_ARGS: Dict[str, Tuple[str, ...]] = {
-    "click": ("target", "target_ref"),
-    "double_click": ("target", "target_ref"),
-    "right_click": ("target", "target_ref"),
-    "type": ("target", "text", "overwrite", "target_ref"),
-    "scroll": ("target", "direction", "amount", "target_ref"),
+    "click": ("target",),
+    "double_click": ("target",),
+    "right_click": ("target",),
+    "type": ("target", "text", "overwrite"),
+    "scroll": ("target", "direction", "amount"),
     "press": ("key",),
     "hotkey": ("keys",),
     "goto": ("url",),
-    "select": ("target", "option", "target_ref"),
+    "download": ("url", "filename"),
+    "rename_artifact": ("artifact_source", "filename"),
+    "select": ("target", "option"),
     "drag_and_drop": ("from_target", "to_target"),
+    "set_cell_values": ("new_cell_values", "app_name", "sheet_name"),
     "save": ("app_name",),
     "switch_applications": ("app_code",),
     "wait": ("seconds",),
     "run_in_terminal": ("command",),
     "call_code_agent": ("task",),
-    "request_finish": ("answer",),
+    "request_finish": (),
     "fail": (),
-    "get_page_source": ("target_ref",),
+    "get_page_source": (),
 }
 
 # grounding 坐标类参数（一律丢弃）

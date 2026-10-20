@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import math
 
 from .semantic import semantic_action
 
@@ -40,12 +41,37 @@ class TreeNode:
         return sum(st["n"] for st in self.edge_stats.values())
 
 
+def _validate_group(rollouts):
+    """Never infer a failed episode from unavailable evaluation or mix initial states."""
+    groups = set()
+    for rollout in rollouts:
+        score = getattr(rollout, "score", None)
+        if (not getattr(rollout, "evaluation_available", False)
+                or not getattr(rollout, "reward_valid", False)
+                or not isinstance(score, (int, float)) or isinstance(score, bool)
+                or not math.isfinite(score)):
+            raise ValueError("Credit assignment requires valid independent rewards; unknown is not failure")
+        initial_state = getattr(rollout, "initial_state_id", "")
+        revision = getattr(rollout, "policy_revision", "")
+        instruction = getattr(rollout, "instruction", "")
+        task_spec_hash = getattr(rollout, "task_spec_hash", "")
+        if not initial_state or not revision or not instruction or not task_spec_hash:
+            raise ValueError("Credit grouping needs instruction, task_spec_hash, initial_state_id and fixed policy_revision")
+        groups.add((instruction, task_spec_hash, initial_state, revision,
+                    getattr(rollout, "runtime_config_hash", ""),
+                    getattr(rollout, "goal_binding_hash", "")))
+    if len(groups) > 1:
+        raise ValueError("Split rollouts by task, initial_state_id, policy_revision, runtime configuration and goal binding before assigning credit")
+    return next(iter(groups), None)
+
+
 def build_tree(rollouts: List) -> TreeNode:
     """用 N 条 rollout 构建语义轨迹树。
 
     rollouts: List[RolloutResult]（含 semantic_actions + score）。
     """
     root = TreeNode()
+    root.group_key = _validate_group(rollouts)
     for r in rollouts:
         node = root
         success = 1.0 if r.score >= 1.0 else 0.0
@@ -79,22 +105,24 @@ def state_value(node: TreeNode, alpha: float = ALPHA, beta: float = BETA) -> flo
     return v
 
 
-def step_credits(root: TreeNode, rollouts: List) -> List[List[float]]:
+def step_credits(root: TreeNode, rollouts: List, alpha=ALPHA, beta=BETA) -> List[List[float]]:
     """对每条 rollout 计算每步的 credit C_t = Q(h_t, a_t) - V(h_t)。
 
     返回与 rollouts 对齐的 credit 列表（每条一个 list，长度 = 该条步数）。
     """
+    if _validate_group(rollouts) != getattr(root, "group_key", None):
+        raise ValueError("Credit tree belongs to a different rollout group")
     all_credits: List[List[float]] = []
     for r in rollouts:
         node = root
         credits: List[float] = []
         for a in r.semantic_actions:
-            q = action_value(node, a)
-            v = state_value(node)
+            q = action_value(node, a, alpha, beta)
+            v = state_value(node, alpha, beta)
             credits.append(q - v)
             node = node.children.get(a)
             if node is None:  # 理论上不会发生（树已构建）
-                break
+                raise ValueError("Rollout prefix is not present in credit tree")
         all_credits.append(credits)
     return all_credits
 
@@ -111,8 +139,10 @@ def assign_step_level_credit(rollouts: List, alpha: float = ALPHA, beta: float =
 
     供训练侧：L = -Σ_t w_t log π(a_t|h_t)，w_t>0 提高、w_t<0 降低动作概率。
     """
+    if alpha <= 0 or beta <= 0:
+        raise ValueError("Beta prior parameters must be positive")
     root = build_tree(rollouts)
-    credits = step_credits(root, rollouts)
+    credits = step_credits(root, rollouts, alpha, beta)
     if normalize:
         return [normalize_credits(c) for c in credits]
     return credits

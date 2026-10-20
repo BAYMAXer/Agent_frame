@@ -15,6 +15,7 @@ from .grounding import (
     Grounding,
     GroundingResult,
     UItarsGrounding,
+    UIVenus2Grounding,
     NullGrounding,
     resolve_coords,
     mark_coordinate,
@@ -25,6 +26,6 @@ from .grounding import (
 __all__ = [
     "ChatModel", "ChatMessage", "MODEL_REGISTRY", "resolve_model_name",
     "build_decision_model",
-    "Grounding", "GroundingResult", "UItarsGrounding", "NullGrounding",
+    "Grounding", "GroundingResult", "UItarsGrounding", "UIVenus2Grounding", "NullGrounding",
     "resolve_coords", "mark_coordinate", "GROUNDING_REGISTRY", "build_grounding_model",
 ]

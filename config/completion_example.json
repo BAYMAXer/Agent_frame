@@ -1,0 +1,16 @@
+{
+  "checks": [
+    {
+      "id": "paper_a",
+      "kind": "download",
+      "url": "https://example.org/paper-a.pdf",
+      "min_bytes": 1
+    },
+    {
+      "id": "paper_b",
+      "kind": "download",
+      "url": "https://example.org/paper-b.pdf",
+      "min_bytes": 1
+    }
+  ]
+}

@@ -6,8 +6,6 @@
 #   description:  中文描述，会原样写进 system prompt 给模型看
 #   kind:         执行方式：
 #                   env      —— 交给环境执行（可带坐标定位）
-#                   shell    —— 终端命令（run_in_terminal），在目标机终端执行
-#                   subagent —— 子 Agent（call_code_agent），独立跑批量代码/文件操作
 #                   browser  —— 浏览器操作（DOM 定位，走 CDP，不经视觉定位模型）
 #                   terminal —— 终止动作（done / fail），结束整个任务
 #   resolve:      （仅 kind=env 需要）坐标解析方式：
@@ -18,6 +16,12 @@
 # =============================================================
 
 actions:
+  cli:
+    kind: cli
+    resolve: none
+    params: [operation]
+    description: "后台文件/终端操作。operation=list/stat/read/write/mkdir/copy/move/rename/open/shell/compare；文件操作带path，copy/move/rename另带destination，write带content，shell带command。可选cwd、timeout_s(1~120)、overwrite(默认false)。相对路径基于默认工程目录。"
+
   click:
     params: [target]
     description: "点击某个元素。优先用 DOM 定位：若 browser_ax 里该元素带 id，加可选参数 element_id（直接复制该 HTML id）；若带 ref，加可选参数 target_ref（复制完整 ref）。两者都走 DOM 确定性定位、无需视觉定位模型。找不到 id/ref 时，target 用英文描述整个元素，程序会退回视觉定位模型定位坐标"
@@ -38,6 +42,9 @@ actions:
 
   type:
     params: [target, text]
+    # Optional submit_key: Enter, only with overwrite: true and a current DOM
+    # reference. Executor validates a single-line text/search input and focus,
+    # records both primitive inputs, and reviews their combined result once.
     description: "点击并聚焦目标输入框/区域（target），然后输入文字（text）。默认是【追加】到光标处；若要【覆盖】原有内容（修改已有值，如把 80 改成 50），加可选参数 overwrite: true，会先清空原内容再输入新文字。优先用 DOM 定位：加可选参数 element_id（HTML id）或 target_ref（完整 ref）直接引用，走 DOM 确定性定位；都找不到时用英文 target 走视觉定位"
     kind: env
     resolve: point
@@ -62,7 +69,7 @@ actions:
 
   goto:
     params: [url]
-    description: "仅当任务需要访问网站时，浏览器打开网址（url）；Windows 本机按需启动或激活浏览器"
+    description: "浏览器打开网址（url）"
     kind: env
     resolve: none
 
@@ -80,7 +87,7 @@ actions:
 
   switch_applications:
     params: [app_code]
-    description: "切换活动应用窗口（app_code 如 libreoffice_calc / chrome / libreoffice_writer）"
+    description: "激活已打开的目标应用窗口；Windows 支持 app_code=file_explorer/chrome 或进程名。未打开时请用系统启动器或快捷键；不支持精确切换的环境会明确拒绝"
     kind: env
     resolve: none
 
@@ -90,31 +97,55 @@ actions:
     kind: env
     resolve: none
 
-  run_in_terminal:
-    params: [command]
-    description: "在终端里执行一条命令（command），命令输出会在下一步返回给你（按当前操作系统写命令）"
-    kind: shell
-    resolve: none
-
   get_page_source:
     params: []
     description: "按需读取当前浏览器页面的精简 DOM（脚本/样式/隐藏字段已剔除），可加可选参数 target_ref 只读该节点。只在 AX 信息不足时使用"
     kind: browser
     resolve: none
 
-  call_code_agent:
+  run_browser_js:
+    params: [js]
+    description: "在任务浏览器里执行一段 JavaScript 代码（js 是函数体，可用 return 返回数据，或只做副作用如点击选项/填值/读题）。用于需要注入 JS 的场景，如 ilearning 考试自动读题、自动点选答案、轮询进度。可加可选参数 max_chars 限制返回长度"
+    kind: browser
+    resolve: none
+
+  handle_dialog:
+    params: [accept]
+    description: "处理观察中报告的 JavaScript 对话框，accept 为 true/false；prompt 可加 prompt_text，多弹窗时指定 dialog_id"
+    kind: browser
+    resolve: none
+
+  list_tabs:
     params: []
-    description: "委托子 Agent 执行批量代码/文件操作（task 可省略，省略则处理整个任务；如 openpyxl 批量填表、unzip 解压、pdftotext 提取文本）"
-    kind: subagent
+    description: "列出当前任务浏览器的标签页及 tab_id，新弹窗不会自动接管当前任务页"
+    kind: browser
+    resolve: none
+
+  switch_tab:
+    params: [tab_id]
+    description: "切换到观察中已存在的 tab_id 标签页"
+    kind: browser
+    resolve: none
+
+  close_tab:
+    params: []
+    description: "关闭当前标签页并回到其父页，可选 tab_id 关闭指定任务标签页"
+    kind: browser
+    resolve: none
+
+  observe_desktop:
+    params: []
+    description: "切到桌面截图和桌面操作面，用于浏览器工具栏、权限气泡或系统文件对话框"
+    kind: browser
+    resolve: none
+
+  observe_browser:
+    params: []
+    description: "切回网页截图、AX 树和页面坐标操作面"
+    kind: browser
     resolve: none
 
   # ---- 终止动作 ----
-  complete_subtask:
-    params: [step_id, result, evidence]
-    description: "申请完成当前子任务。step_id 必须等于当前子任务；result 保存结果，evidence 描述实际观察。浏览器任务另带当前 snapshot_id 和 evidence_refs（观察中的节点引用数组）。程序核验通过后才下发下一子任务；该响应不能同时执行其他动作"
-    kind: memory
-    resolve: none
-
   request_finish:
     params: [answer]
     description: "请求结束任务并给出最终答案（answer 直接写找到的结果）；程序会验证是否真的完成，未完成会被拒绝"
@@ -129,16 +160,6 @@ actions:
 
 
 # =============================================================
-# 额外动作（扩展区）
-# =============================================================
-# 测试 / 新任务想给模型增加一个可输出的动作，就在这里按上面的字段格式注册，
-# 会与上面的 actions 自动合并。例如：
-#
-# extra_actions:
-#   hover:
-#     params: [target]
-#     description: "鼠标悬停在某个元素上"
-#     kind: env
-#     resolve: point
+# 扩展需同时经 actions.BASIC_ACTIONS 登记；CLI 仅由绑定目标机的执行器派发。
 # =============================================================
 extra_actions: {}
