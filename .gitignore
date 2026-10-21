@@ -15,6 +15,7 @@ htmlcov/
 venv/
 viz/studio_settings.json
 config/mcp.local.json
+config/mcp.remote.local.json
 .env
 .env.*
 !.env.example
@@ -74,3 +75,8 @@ build/
 dist/
 *.egg-info/
 coverage.xml
+
+# Ship the requested MCP deployment guide alongside its README link.
+!/docs/
+/docs/*
+!/docs/mcp-integration.md

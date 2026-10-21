@@ -38,16 +38,36 @@ python3.12 -m venv .venv
 
 ## MCP 接入
 
-在上述环境中安装并检查入口：
+支持将 Yaero 部署在服务器 A，由电脑 B 上的其他 Agent 调用：**A 负责规划、决策、grounding 和验收，B 只负责浏览器观察与动作执行。** B 无需部署 Yaero 的推理模型。远程模式只支持浏览器页面、标签页、网页对话框和下载，不提供 B 的终端或系统桌面控制。
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-mcp.txt
-Copy-Item config\mcp.example.json config\mcp.local.json
-.\.venv\Scripts\python.exe launch_mcp.py --help
+A 安装 `requirements-remote-agent.txt`，将 `config/mcp.remote.example.json` 复制为 `config/mcp.remote.local.json`，填入模型配置。该样例的 `default-browser` profile 使用 `execution_mode="remote_browser"`，绑定 `browser-b` 和 `http://127.0.0.1:9876`。
+
+以下命令中的 `python` 应使用各机器已安装对应依赖的 Python 3.12 环境。A 启动 MCP：
+
+```sh
+python launch_mcp.py --config config/mcp.remote.local.json --transport streamable-http --host 127.0.0.1 --port 8765
 ```
 
-编辑 `config/mcp.local.json` 配置模型与执行环境。MCP 宿主使用 Python 解释器和 `launch_mcp.py` 的绝对路径，并传入 `--config` 与本地配置文件路径；默认使用 stdio。
+B 安装 `requirements-executor.txt` 和 Chromium：
 
-配套技能位于 [`integrations/skills/yaero-computer-task`](integrations/skills/yaero-computer-task/SKILL.md)。技能说明与运行必需的参考文件随源码保留。
+```powershell
+python -m pip install -r requirements-executor.txt
+python -m playwright install chromium
+python launch_browser_executor.py --host 127.0.0.1 --port 8766 --device-id browser-b --token-env YAERO_BROWSER_TOKEN --workspace-root "D:\Yaero Browser Workspace"
+```
 
-本版本仅包含运行源码、界面资源、依赖清单、示例配置及必要技能文件。测试、开发文档、虚拟环境、缓存、运行记录和打包清单均排除在发布范围之外。
+启动前，在 A 与 B 的进程环境中设置同一个随机 `YAERO_BROWSER_TOKEN`（至少 16 字符）。模型服务密钥只留在 A；浏览器工作区与原始下载文件在 B，A 只接收验收所需的证据镜像。B 为 macOS/Linux 时，将工作区换成本机绝对路径。
+
+在 B 的另一个终端建立双向 SSH 转发，将 `user@A` 替换为实际登录地址：
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 8765:127.0.0.1:8765 -R 9876:127.0.0.1:8766 user@A
+```
+
+B 的上层 Agent 通过 Streamable HTTP 连接 **`http://127.0.0.1:8765/mcp`**。五个工具为 `get_capabilities`、`start_task`、`get_task`、`get_result`、`cancel_task`；提交目标后按 `run_id` 查询结果。模型不能通过任务参数更换执行设备或地址。
+
+把整个 [`integrations/skills/yaero-computer-task`](integrations/skills/yaero-computer-task/SKILL.md) 文件夹放入上层 Agent 的技能目录，保留 `references/`。MCP 注册与 Skill 加载需要分别完成。详细安装、配置和 Python 客户端示例见 [A/B MCP 接入说明](docs/mcp-integration.md)。
+
+原有本地浏览器/桌面模式继续使用 `config/mcp.example.json` 和平台依赖；`launch_mcp.py` 默认使用 stdio，本地模式操作 MCP 所在机器。
+
+本版本包含运行源码、界面资源、依赖清单、示例配置、接入说明及必要技能文件。测试、开发用虚拟环境、缓存、运行记录和打包清单均排除在发布范围之外。

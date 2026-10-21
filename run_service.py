@@ -307,6 +307,10 @@ def _artifact_inventory(root, verification, limit=200):
                 "artifact_id": evidence.get("artifact_id"),
                 "sha256_at_run_end": evidence.get("sha256"),
             }
+            if evidence.get('path_scope') == 'controller_evidence_mirror':
+                item.update({key: evidence[key] for key in
+                    ('device_id', 'session_id', 'remote_path', 'local_mirror_path', 'path_scope', 'delivery_location')
+                    if key in evidence})
         artifacts.append(item)
 
     add(root / "trajectory.json")
@@ -556,6 +560,10 @@ class RunService:
                        "max_steps", "timeout_s", "result_dir", "success", "exit_code",
                        "termination_reason", "error")
         result = {key: meta[key] for key in public_keys if key in meta}
+        launch_metadata = meta.get('metadata') or {}
+        result.update({key: launch_metadata[key] for key in
+            ('execution_mode', 'planning_location', 'execution_device_id', 'artifact_access')
+            if key in launch_metadata})
         result["cancel_requested"] = (self._path(meta["run_id"]) / "cancel.json").exists()
         result["progress"] = self._progress(meta)
         result["poll_after_s"] = 2 if meta["status"] not in TERMINAL_STATUSES else None

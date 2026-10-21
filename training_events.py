@@ -29,7 +29,9 @@ def externalize_images(value, root):
         path = folder / (digest + suffix)
         if not path.exists():
             # Unique staging paths permit independent writers to share assets.
-            temporary = folder / (digest + "." + uuid.uuid4().hex + ".tmp")
+            # The final digest filename is sufficient for addressing; keeping
+            # the temporary name short also fits nested Windows run stores.
+            temporary = folder / (uuid.uuid4().hex + ".tmp")
             try:
                 with temporary.open("xb") as handle:
                     handle.write(data)

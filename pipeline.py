@@ -1304,6 +1304,12 @@ class Pipeline:
         return execution
 
     def _set_download_deadline(self) -> None:
+        remote_policy = getattr(self.env, 'set_download_policy', None)
+        if callable(remote_policy):
+            remote_policy(timeout_s=max(0.001, min(self.wait_config.operation_timeout_s,
+                                                  self._task_time_remaining())),
+                          max_bytes=self.wait_config.download_max_bytes)
+            return
         # Do not create a browser session for desktop-only tasks.
         session = getattr(self.env, "_browser_session", None)
         options = getattr(session, "options", None)

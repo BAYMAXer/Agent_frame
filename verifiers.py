@@ -172,6 +172,9 @@ def _infer_spec(task):
 def _read_artifact(path):
     """Read real bytes on every evaluation; do not trust executor verified/bytes."""
     try:
+        from .remote_artifacts import ensure_remote_current
+        if not ensure_remote_current(path):
+            return {"status": "failed", "reason": "remote download is unavailable or changed"}
         if not stat.S_ISREG(os.stat(path).st_mode):
             return {"status": "failed", "reason": "download path is not a regular file"}
         with open(path, "rb") as handle:
@@ -183,6 +186,8 @@ def _read_artifact(path):
                 digest.update(chunk)
             after = os.fstat(handle.fileno())
         current = os.stat(path)
+        if not ensure_remote_current(path):
+            return {"status": "failed", "reason": "remote download changed during verification"}
         signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
         if signature(before) != signature(after) or signature(after) != signature(current):
             return {"status": "unknown", "reason": "download changed while being verified"}
@@ -428,6 +433,7 @@ class CompletionVerifier:
                 'bytes': current.get('bytes'), 'sha256': current.get('sha256'),
                 'file_identity': list(current['identity']) if current.get('identity') else None,
                 'status': status, 'reason': reason}
+            fact.update(copy.deepcopy(record.get('remote_provenance', {})))
             if status == 'passed':
                 from .artifact_download import inspect_download_format
                 fact.update(inspect_download_format(path))
@@ -455,7 +461,8 @@ class CompletionVerifier:
             if (now['status'] != 'passed' or initial['status'] != 'passed'
                     or (now['identity'], now['sha256']) != (initial['identity'], initial['sha256'])):
                 continue
-            valid.append((record, {'path': path, 'artifact_id': ident, 'bytes': now['bytes'], 'sha256': now['sha256']}))
+            valid.append((record, {'path': path, 'artifact_id': ident, 'bytes': now['bytes'],
+                                  'sha256': now['sha256'], **record.get('remote_provenance', {})}))
         reports = []
         for check in self._public_spec['checks']:
             if check['kind'] not in {'download', 'paper_download'}:
@@ -603,6 +610,8 @@ class CompletionVerifier:
                 return
             self._artifacts.pop(previous_path, None)
             old.update(path=path, version=event['version'], rename_history=copy.deepcopy(history))
+            old['remote_provenance'] = {key: copy.deepcopy(event[key]) for key in
+                ('device_id', 'session_id', 'remote_path', 'local_mirror_path', 'path_scope', 'delivery_location') if key in event}
             old.pop('migration_error', None)
             self._artifacts[path] = old
             self._artifact_ids[identifier] = path
@@ -619,7 +628,9 @@ class CompletionVerifier:
             self._retired_artifact_ids.add(previous_owner['artifact_id'])
         self._artifacts[path] = {'urls': resources, 'source_urls': sources, 'path': path,
             'initial': evidence, 'download_id': identifier, 'artifact_id': identifier,
-            'version': event.get('version', 1), 'rename_history': copy.deepcopy(history)}
+            'version': event.get('version', 1), 'rename_history': copy.deepcopy(history),
+            'remote_provenance': {key: copy.deepcopy(event[key]) for key in
+                ('device_id', 'session_id', 'remote_path', 'local_mirror_path', 'path_scope', 'delivery_location') if key in event}}
         # Legacy artifact checks retain their existing compatibility behavior.
         # The public durable-facts channel is stricter: only an actual completed
         # browser receipt with a matching original file baseline enters it.
@@ -802,6 +813,7 @@ class CompletionVerifier:
                                     artifact_id=record.get('artifact_id'), version=record.get('version', 1),
                                     urls=sorted(record["urls"]), source_urls=sorted(record["source_urls"]),
                                     sha256=evidence.get("sha256"), **extra)
+                item.update(copy.deepcopy(record.get('remote_provenance', {})))
                 if status == "passed":
                     # Copies of one paper must not count as several papers. For
                     # plain byte downloads preserve the physical-file contract.

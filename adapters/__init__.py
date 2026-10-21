@@ -9,13 +9,30 @@
 """
 from __future__ import annotations
 
-from .vmware_env import VMwareEnvironment, to_pyautogui
-from .windows_env import WindowsEnvironment
-from .uitars_grounding import RealUItarsGrounding
-from .uivenus2_grounding import UIVenus2Grounding
-from .task_loader import load_task_config
+from importlib import import_module
+
+# Importing the remote environment on a headless A must not load local GUI or
+# VM adapters. Preserve the package's public imports through lazy attributes.
+_EXPORTS = {
+    'VMwareEnvironment': ('vmware_env', 'VMwareEnvironment'),
+    'to_pyautogui': ('vmware_env', 'to_pyautogui'),
+    'WindowsEnvironment': ('windows_env', 'WindowsEnvironment'),
+    'RemoteBrowserEnvironment': ('remote_browser_env', 'RemoteBrowserEnvironment'),
+    'RealUItarsGrounding': ('uitars_grounding', 'RealUItarsGrounding'),
+    'UIVenus2Grounding': ('uivenus2_grounding', 'UIVenus2Grounding'),
+    'load_task_config': ('task_loader', 'load_task_config'),
+}
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    module, attribute = _EXPORTS[name]
+    value = getattr(import_module('.' + module, __name__), attribute)
+    globals()[name] = value
+    return value
 
 __all__ = [
     "VMwareEnvironment", "WindowsEnvironment", "to_pyautogui",
-    "RealUItarsGrounding", "UIVenus2Grounding", "load_task_config",
+    "RealUItarsGrounding", "UIVenus2Grounding", "load_task_config", "RemoteBrowserEnvironment",
 ]

@@ -234,6 +234,9 @@ def verified_download(artifacts, *, format="any", consumed=()):
         if not path or not expected_hash or not identity:
             continue
         try:
+            from .remote_artifacts import ensure_remote_current
+            if not ensure_remote_current(path):
+                continue
             if os.path.islink(path) or not os.path.isfile(path):
                 continue
             stat = os.stat(path, follow_symlinks=False)
@@ -257,6 +260,8 @@ def verified_download(artifacts, *, format="any", consumed=()):
             after = os.stat(path, follow_symlinks=False)
             signature = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
             if os.path.islink(path) or signature(after) != signature(stat):
+                continue
+            if not ensure_remote_current(path):
                 continue
             return artifact
         except (OSError, ValueError, zipfile.BadZipFile):

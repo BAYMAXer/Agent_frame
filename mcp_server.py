@@ -17,6 +17,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .local_runtime import build_local_launch
+from .remote_runtime import build_remote_launch, validate_remote_profile
 from .run_service import RunService, RunServiceError
 
 
@@ -63,6 +64,11 @@ def load_config(path: str | Path) -> ServerConfig:
         for field in REQUIRED_PROFILE_FIELDS:
             if not isinstance(profile.get(field), str) or not profile[field].strip():
                 raise ValueError(f"Profile {name!r} needs a nonempty {field}")
+        mode = profile.get('execution_mode', 'local')
+        if mode not in {'local', 'remote_browser'}:
+            raise ValueError(f'Profile {name!r} has an unsupported execution_mode')
+        if mode == 'remote_browser':
+            profile['browser_executor'] = validate_remote_profile(profile)
         for field in ("workspace_dir", "browser_profile_dir"):
             if profile.get(field):
                 profile[field] = resolve_path(profile[field])
@@ -75,6 +81,13 @@ def load_config(path: str | Path) -> ServerConfig:
 
 
 def _profile_problem(profile: dict) -> str | None:
+    if profile.get('execution_mode', 'local') == 'remote_browser':
+        try:
+            remote = validate_remote_profile(profile)
+        except ValueError as exc:
+            return str(exc)
+        if len(os.environ.get(remote['token_env'], '')) < 16:
+            return 'Executor token environment variable on the server host must contain at least 16 characters'
     for field in REQUIRED_PROFILE_FIELDS:
         value = profile.get(field)
         if not isinstance(value, str) or not value.strip() or value.startswith("YOUR_"):
@@ -95,7 +108,7 @@ def create_server(
     config: ServerConfig,
     *,
     service: RunService | None = None,
-    launch_builder=build_local_launch,
+    launch_builder=None,
     host: str = "127.0.0.1",
     port: int = 8765,
 ) -> FastMCP:
@@ -103,6 +116,16 @@ def create_server(
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("This version serves HTTP on loopback only; use an authenticated tunnel remotely")
     service = service or RunService(runs_root=config.runs_root)
+    # All IDs remain in one durable registry; exclusion is keyed by the bound
+    # executor device, so A's local desktop is never leased by a remote run.
+    profile_services = {}
+    for name, profile in config.profiles.items():
+        if profile.get('execution_mode', 'local') == 'remote_browser':
+            remote = validate_remote_profile(profile)
+            profile_services[name] = RunService(runs_root=service.runs_root,
+                                                desktop_id='remote:' + remote['device_id'])
+        else:
+            profile_services[name] = service
 
     @asynccontextmanager
     async def lifespan(_server):
@@ -111,12 +134,16 @@ def create_server(
         finally:
             # Independent supervisors retain execution and the desktop lease.
             service.close()
+            for selected in profile_services.values():
+                if selected is not service:
+                    selected.close()
 
     mcp = FastMCP(
         "yaero",
         instructions=(
-            "Delegate complete browser/desktop goals to Yaero. Start returns a run_id; "
-            "poll that ID and read get_result. Do not operate the same desktop concurrently. "
+            "Delegate complete goals to the selected Yaero profile. Remote browser profiles "
+            "keep planning and verification on the server and operate only their bound executor device. "
+            "Start returns a run_id; poll that ID and read get_result. Do not operate that browser concurrently. "
             "Reuse request_id when retrying the same submission. Completed process status is "
             "not proof of success: inspect success and verification. Check ok before using results."
         ),
@@ -146,17 +173,26 @@ def create_server(
         profiles = []
         for name, profile in config.profiles.items():
             problem = _profile_problem(profile)
+            mode = profile.get('execution_mode', 'local')
             profiles.append({"name": name, "configured": problem is None,
-                             "configuration_issue": problem})
+                             "configuration_issue": problem, 'execution_mode': mode,
+                             'device_id': profile.get('browser_executor', {}).get('device_id') if mode == 'remote_browser' else None,
+                             'browser_only': mode == 'remote_browser',
+                             'execution_location': 'bound_executor' if mode == 'remote_browser' else 'server_host',
+                             'availability': profile_services[name].capabilities(),
+                             'executor_connectivity_checked': False})
+        modes = {p['execution_mode'] for p in profiles}
+        representative = next(iter(profile_services.values()), service)
         return invoke(lambda: {
-            **service.capabilities(),
+            **representative.capabilities(),
             "service": "yaero",
             "platform": sys.platform,
             "profiles": profiles,
             "limits": {"max_steps": MAX_STEPS, "max_timeout_s": MAX_TIMEOUT_S},
             "poll_after_s": 3,
-            "execution_location": "server_host",
-            "artifact_access": "paths_on_server_host",
+            "planning_location": "server_host",
+            "execution_location": "bound_executor" if modes == {'remote_browser'} else "server_host" if modes <= {'local'} else "profile_dependent",
+            "artifact_access": "executor_originals_and_server_evidence" if 'remote_browser' in modes else "paths_on_server_host",
             "model_connectivity_checked": False,
         })
 
@@ -190,10 +226,11 @@ def create_server(
             problem = _profile_problem(cfg)
             if problem:
                 raise ValueError(problem)
-            return launch_builder(cfg, result_dir, python_executable=config.runner_python)
+            builder = launch_builder or (build_remote_launch if cfg.get('execution_mode') == 'remote_browser' else build_local_launch)
+            return builder(cfg, result_dir, python_executable=config.runner_python)
 
         return invoke(
-            service.start,
+            profile_services[profile].start,
             task=cfg["task"],
             request_id=request_id,
             max_steps=max_steps,
@@ -209,7 +246,7 @@ def create_server(
 
     @mcp.tool(annotations=read_only)
     def get_result(run_id: str) -> dict[str, Any]:
-        """Read final verdict, verification and server-local artifacts. Check success; exit code zero is insufficient."""
+        """Read verdict and artifacts; distinguish B delivery originals from A evidence paths. Check success and verification."""
         return invoke(service.get_result, run_id)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True))

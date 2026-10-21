@@ -1,0 +1,19 @@
+{
+  "profiles": {
+    "default-browser": {
+      "execution_mode": "remote_browser",
+      "browser_executor": {
+        "endpoint": "http://127.0.0.1:9876",
+        "device_id": "browser-b",
+        "token_env": "YAERO_BROWSER_TOKEN"
+      },
+      "model": "YOUR_DECISION_MODEL",
+      "model_url": "http://127.0.0.1:8000/v1",
+      "model_api_key": "env:YAERO_MODEL_API_KEY",
+      "ground_model": "YOUR_GROUNDING_MODEL",
+      "ground_type": "ui-venus2",
+      "ground_url": "http://127.0.0.1:8001/v1",
+      "ground_api_key": "env:YAERO_GROUND_API_KEY"
+    }
+  }
+}
